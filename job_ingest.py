@@ -3,18 +3,25 @@
 job_ingest.py — fetch job-alert digest emails over IMAP,
 write raw/*.txt files for screening. Uses IMAP UIDs for stable filenames
 that survive deletions/moves.
+
+Digests whose Date header is older than recency_days (pipeline_config)
+are skipped: header probe only, no body download, no file written. The
+server folder is never touched (read-only guarantee), so old emails
+cost one cheap header fetch per run until manually archived.
 """
 import os
 import sys
 import imaplib
 import email
 from email.header import decode_header
+from email.utils import parsedate_to_datetime
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timezone
 import hashlib
 import re
-import html as html_mod
 import json
+
+from html_text import html_to_text
 
 # Configuration
 CONFIG_FILE = Path("pipeline_config.json")
@@ -38,6 +45,10 @@ IMAP_PORT = int(CFG.get("imap_port", os.getenv("EMAIL_IMAP_PORT", "993")))
 # False (default) uses implicit TLS
 IMAP_STARTTLS = CFG.get("imap_starttls", False)
 IMAP_TIMEOUT = 60  # seconds per socket operation
+# Same knob jobs_screen.py reads: digests older than this are not
+# ingested. 0 or missing ingests everything.
+RECENCY_DAYS = int(CFG.get("recency_days", 0))
+
 def env_name(key, default):
     """Config names the env var that holds a credential; the credential
     itself stays out of the file. A value that isn't a valid variable
@@ -79,15 +90,54 @@ def decode_mime_header(header):
             decoded_parts.append(str(part))
     return "".join(decoded_parts)
 
+def fetch_payload(data):
+    """The message bytes from an imaplib FETCH response, or None.
+
+    The payload arrives as a (header, bytes) tuple, but it isn't always
+    data[0]: an unsolicited FETCH (another client changing flags) comes
+    as plain bytes, and so does a field the server returns quoted or
+    NIL instead of as a literal. Those entries are skipped.
+    """
+    for item in data or []:
+        if isinstance(item, tuple) and len(item) == 2 \
+                and isinstance(item[1], bytes):
+            return item[1]
+    return None
+
+def digest_is_stale(mail, uid):
+    """
+    True when the email's Date header is older than RECENCY_DAYS.
+    Header-only fetch (BODY.PEEK, so no Seen flag): the body is never
+    downloaded for old digests. Unreadable/missing dates return False —
+    age can't be verified, so the email is fetched and the screener's
+    undated-digest path decides what happens to it.
+    """
+    if not RECENCY_DAYS:
+        return False
+    typ, data = mail.uid('fetch', uid, '(BODY.PEEK[HEADER.FIELDS (DATE)])')
+    header = fetch_payload(data) if typ == "OK" else None
+    if header is None:
+        return False
+    raw_date = email.message_from_bytes(header).get("Date", "")
+    try:
+        dt = parsedate_to_datetime(raw_date)
+    except (TypeError, ValueError):
+        return False
+    if dt is None:
+        return False
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return (datetime.now(timezone.utc) - dt).days > RECENCY_DAYS
+
 def extract_job_text(email_content):
     """
-    Convert email body to text. For plaintext emails, preserves line structure
-    (tabs may appear as spaces per Python's text parsing, but the 4-line
-    quadruple format survives intact). For HTML, strips tags and unescapes.
-    
-    IMPORTANT: This script always prefers text/plain over text/html, so
-    HTML extraction path is fallback-only. Plaintext quad format is what
-    jobs_screen.py expects.
+    Convert an email body to text, one field per line: the 4-line
+    title / employer / location / View quadruple jobs_screen.py parses.
+
+    This script prefers text/plain over text/html, so the HTML path is
+    fallback-only. Both go through the shared html_to_text: plain text
+    keeps its lines, and HTML table cells and block tags become line
+    breaks, so an HTML-only digest still yields one field per line.
     """
     if isinstance(email_content, bytes):
         try:
@@ -96,24 +146,7 @@ def extract_job_text(email_content):
             text = email_content.decode("latin-1", errors="replace")
     else:
         text = email_content
-
-    # Kill style/script blocks entirely (keeps CSS out of output)
-    text = re.sub(r"(?is)<style.*?</style>", " ", text)
-    text = re.sub(r"(?is)<script.*?</script>", " ", text)
-
-    # Structural tags become delimiters BEFORE stripping remaining tags
-    text = re.sub(r"(?i)<br\s*/?>", "\n", text)
-    text = re.sub(r"(?i)</td>", "\t", text)
-    text = re.sub(r"(?i)</tr>", "\n", text)
-    text = re.sub(r"(?i)</(p|div|h[1-6]|table)>", "\n", text)
-
-    # Strip remaining tags, unescape entities (&amp; -> &)
-    text = re.sub(r"<[^>]+>", " ", text)
-    text = html_mod.unescape(text)
-
-    # Collapse intra-line whitespace; keep the newlines we just made
-    lines = [re.sub(r"[ \t]+", " ", ln).strip() for ln in text.splitlines()]
-    return "\n".join(ln for ln in lines if ln)
+    return html_to_text(text)
 
 def uid_to_filename(uid):
     """Convert IMAP UID to safe filename (stable across email deletions)."""
@@ -175,20 +208,35 @@ def main():
         return 0
 
     print(f"Found {len(uid_list)} emails to process.")
-    processed = fetch_failures = 0
+    processed = duplicates = stale_skipped = fetch_failures = 0
 
     for uid_bytes in uid_list:
         uid = uid_bytes.decode()
 
+        # Duplicate check first: a UID whose file exists costs nothing
+        # (no header probe, no body fetch)
+        filepath = RAW_DIR / uid_to_filename(uid)
+        if is_duplicate(filepath):
+            duplicates += 1
+            continue
+
+        # Old digests are skipped before their bodies are downloaded.
+        # Re-probed every run (header-only fetch) until the email is
+        # manually archived on the server — deliberately cheap rather
+        # than writing skip-tombstones to raw/
+        if digest_is_stale(mail, uid):
+            stale_skipped += 1
+            continue
+
         # Fetch by UID — one namespace end to end (uid search -> uid fetch).
         # BODY.PEEK[] returns the full message without setting \Seen.
         status, data = mail.uid('fetch', uid, '(BODY.PEEK[])')
-        if status != "OK" or not data or not data[0]:
+        raw_email = fetch_payload(data) if status == "OK" else None
+        if raw_email is None:
             print(f"Failed to fetch UID {uid}: {status}")
             fetch_failures += 1
             continue
 
-        raw_email = data[0][1]
         msg_obj = email.message_from_bytes(raw_email)
 
         # Extract metadata
@@ -201,13 +249,6 @@ def main():
         # Build job ID from subject+sender+date for cross-digest
         # uniqueness (Bug #2 fix from CLAUDE.md known-issues)
         job_id = job_id_hash(subject, sender, date_raw)
-
-        filename = uid_to_filename(uid)
-        filepath = RAW_DIR / filename
-
-        if is_duplicate(filepath):
-            print(f"Skipping duplicate UID {uid} ({subject[:50]}...)")
-            continue
 
         # Extract body text (prefers text/plain, falls back to text/html)
         body = None
@@ -252,9 +293,11 @@ def main():
             f.write(clean_text)
 
         processed += 1
-        print(f"Ingested UID {uid}: {subject[:60]}... ({filename})")
+        print(f"Ingested UID {uid}: {subject[:60]}... ({filepath.name})")
 
-    print(f"Processed {processed} emails.")
+    print(f"Processed {processed} new, skipped {duplicates} duplicate(s) "
+          f"and {stale_skipped} stale digest(s) "
+          f"(recency_days={RECENCY_DAYS}).")
 
     mail.close()
     mail.logout()

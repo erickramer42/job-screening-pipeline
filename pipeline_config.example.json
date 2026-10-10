@@ -12,5 +12,9 @@
   "excluded_employers": ["CompanyA", "CompanyB"],
   "included_title_patterns": ["role1", "role2"],
   "excluded_title_patterns": ["\\bpattern1\\b", "pattern2"],
-  "excluded_keywords": ["keyword1", "keyword2"]
+  "excluded_keywords": ["keyword1", "keyword2"],
+  "recency_days": 60,
+  "rerank_top_n": 15,
+  "rerank_batch": 5,
+  "excerpt_chars": 1500
 }

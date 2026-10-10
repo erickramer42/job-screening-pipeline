@@ -29,13 +29,41 @@ Setup, usage, and the configuration reference are in [README.md](README.md). Thi
 | Component | Status | Notes |
 |-----------|--------|-------|
 | Email ingest (`job_ingest.py`) | ✅ Operational | Fetches digest emails over IMAP into `raw/job_uid_<UID>.txt`. Read-only (EXAMINE + `BODY.PEEK[]`). |
-| Board fetch (`board_fetch.py`) | ✅ Operational | Pulls `boards.json` companies into `raw_boards/` and filters by title, metro-area/US-remote location, and pay floor. Closed postings move to `raw_boards/archive/`. |
+| Board fetch (`board_fetch.py`) | ✅ Operational | Pulls `boards.json` companies into `raw_boards/` and filters by title, metro-area/US-remote location, and pay floor. Stores each posting's description (Greenhouse, Ashby, SmartRecruiters; not Lever). Closed postings move to `raw_boards/archive/`; files from an older format are rewritten automatically. |
 | Slug discovery (`slug_probe.py`) | ✅ Operational | Guesses board slugs for company names (e.g. `targets.txt`) and prints `boards.json` lines for slugs that return jobs |
-| Job parsing (`jobs_screen.py` parser) | ✅ Operational | Reads title/employer/location quadruples from `raw/` and `raw_boards/` |
+| Job parsing (`jobs_screen.py` parser) | ✅ Operational | Reads title/employer/location quadruples from `raw/` and `raw_boards/`. Keeps one copy per listing (board copy first, then newest digest) and cuts digests older than `recency_days`. |
 | Hard filters | ✅ Operational | Blocks the employers and title patterns listed in `pipeline_config.json` |
-| LLM ranking | ✅ Operational | Uses Ollama (default model: `SCREEN_MODEL`) to score survivors 0–100. Stops after 3 consecutive batch failures. |
-| Output generation | ✅ Operational | Produces `out/shortlist_YYYY-MM-DD.md` and JSON. Board rows include direct posting links. |
+| LLM ranking | ✅ Operational | Pass 1 scores every survivor 0–100 from title/employer/location. Pass 2 re-scores the top `rerank_top_n` listings that have a description, using a role-section excerpt. Malformed responses are retried; 3 consecutive failed batches stop a pass. |
+| Output generation | ✅ Operational | Produces `out/shortlist_YYYY-MM-DD.md` and JSON. Board rows include direct posting links; ▲ marks pass-2 scores. |
 | Scheduled runs | 🟡 Being verified | Task Scheduler runs ingest at 01:00 and 05:00, and board fetch + screening at 06:00. Tasks wake the computer, run after a missed start, and the wrappers retry (see [Automation](#automation)). First runs on 2026-10-09. |
+
+### Recent Changes (2026-10-10)
+- **Descriptions and recency (new):**
+  - `board_fetch.py` stores each posting's description below a `--- DESCRIPTION ---` marker, which the screener's listing parser stops at.
+  - `recency_days` makes ingest skip old digests after checking only the Date header, and makes the screener cut digest listings whose newest copy is older than the window.
+  - The screener re-scores the top listings that have a description in a second pass (`rerank_top_n`, `rerank_batch`, `excerpt_chars`).
+- **Review fixes, scoring:**
+  - Every problem with a model response's content (wrong JSON shape, `null` scores, a body without message content, unalignable indices) is retried instead of crashing the run. Only connection failures fail a batch, and a cut-off response (`IncompleteRead`) is now one of those.
+  - Responses numbered from 1 are shifted onto the right listings, and numbering that can't be determined is rejected. Scores are clamped to 0–100.
+  - The most complete retry is kept, not the last one.
+  - Both passes share one batch loop with the 3-failure abort, and pass 2 is skipped when pass 1 had to stop.
+- **Review fixes, dedup:** a listing that appears in several files keeps its board copy (link, pay, description), otherwise its newest digest copy. Staleness is judged on that copy, so an older digest can no longer age out a listing that is still advertised.
+- **Review fixes, text:**
+  - New shared `html_text.py`. Block tags become line breaks, entities are decoded after tags are stripped, and all whitespace, including non-breaking spaces, is normalized.
+  - Greenhouse's double-encoded HTML is decoded correctly; 1,215 leftover entities in 185 descriptions dropped to 0.
+  - An HTML-only digest now parses one field per line. This is checked against a sample table but hasn't yet met a real HTML-only digest.
+  - Pass-2 excerpts:
+    - start at a section heading (including curly-apostrophe "What you’ll do", "Job description", "Who you are");
+    - ignore marker words inside closing EEO or pay text;
+    - use running-text matches only from the first half.
+    - On the current 185 postings, excerpts starting in EEO or pay text went from 6 to 0, and those starting at a heading from 50 to 174.
+  - Board files carry a `Format:` line; older files are rewritten on the next run, and a failed SmartRecruiters description fetch is retried.
+- **Review fixes, ingest:** header and body fetches find the message bytes even when the server sends an unsolicited FETCH line or a non-literal field first.
+- **Cleanup:**
+  - Removed dead error handlers and a duplicated abort block.
+  - Fixed a missing space in the pass-1 instructions (">= 75.Include").
+  - Board fetch converts descriptions only for postings it writes.
+  - The bare `hardware`, `electrical`, `civil` and `mechanical` title patterns are anchored with `\b`, so `civil` no longer matches "Civilian".
 
 ### Recent Changes (2026-10-09)
 - **Ingest:**
@@ -47,11 +75,10 @@ Setup, usage, and the configuration reference are in [README.md](README.md). Thi
   - Credentials come from environment variables named in the config (`email_user_env`, `email_password_env`). Ingest refuses a value that isn't a variable name, without printing it.
   - IMAP connections time out after 60 seconds, so an unresponsive server fails the run instead of hanging it.
 - **Screener:**
-  - No shortlist is written and it exits 1 if no batch scores (e.g. Ollama down).
+  - No shortlist is written if no batch scores (e.g. Ollama down). It exits 2 in that case, so the scheduled wrapper can retry safely.
   - Partial failures write the shortlist with a WARNING banner and `failed_batches` in the JSON, and exit 1.
   - The ranking prompt is loaded from the file at `prompt_path`.
   - Employer exclusions match whole words, so a short name can't cut an unrelated employer whose name contains it.
-  - Exits 2 (instead of 1) when no batch could be scored. Nothing is written in that case, so the scheduled wrapper can retry safely.
 - **Board fetch (new):**
   - Ashby pay is read from `compensation.summaryComponents` (USD salary only; hourly rates ×2080).
   - Title blocks are word-bounded, so "Internal Tools" and "Sales Platform" roles survive.
@@ -70,19 +97,18 @@ Setup, usage, and the configuration reference are in [README.md](README.md). Thi
 ### Pending / Known Issues
 | Issue | Priority | Impact | Planned Fix |
 |-------|----------|--------|-------------|
-| Every run re-parses and re-scores the full digest history | Medium | ~3,500 listings / ~118 batches daily, though digests arrive weekly. Months-old postings rank alongside new ones. | Score cache keyed by listing, plus a recency window using the Date header |
-| LLM output not validated | Medium | A null `reason` crashes before the shortlist is written. A null index or score drops the rest of the batch. 1-based indices shift every score to the neighbouring job. | Verify the index set is exactly 0..n-1 and coerce types |
-| Dedup key ignores location; digest rows read before board rows | Medium | Same title+employer in another city is dropped (35 pairs). A matching board row (with link and pay) loses to the digest copy. | Add location to the key, or prefer rows with a URL |
-| Ranking prompt says "no salary" | Medium | Board rows carry a pay range in the location field that `screening_prompt.txt` tells the model doesn't exist | Mention pay-in-parentheses in the prompt |
+| Pass-2 scores share a ranking with pass-1 scores | Medium | Pass 2 scores in 5-listing batches without pass 1's "at most 2 ≥ 75" cap, and with more evidence. Only listings with a description (board rows) can be re-scored, so re-scored rows can crowd strong digest rows out of the top 25. | Design decision pending: separate shortlist sections, a matching cap, or re-scoring a fixed number of digest rows too |
+| Every run re-scores everything in the recency window | Medium | Each day re-scores all digest listings from the last `recency_days` plus every live board posting, though most were scored the day before | Score cache keyed by listing |
+| Dedup key ignores location | Medium | Same title+employer in another city is dropped. The kept copy is the board row when there is one, otherwise the newest digest. | Add location to the key where the location strings are comparable |
+| Ranking prompt says "no salary" | Medium | Board rows carry a pay range in the location field that `screening_prompt.txt` tells the model doesn't exist in pass 1 | Mention pay-in-parentheses in the prompt |
 | Bad `boards.json` entry crashes `board_fetch.py` | Medium | An unknown platform or missing slug raises `KeyError` outside the per-board `try`, stopping all boards | Validate each entry and skip it with a message |
 | `board_fetch.py` exits 0 when fetches fail | Medium | A scheduled run can't tell "all boards down" from success. `run_screen.bat` logs a non-zero exit, but fetch failures never produce one. | Exit 1 when any board fetch fails |
 | UIDVALIDITY not tracked | Medium | If the server resets UIDVALIDITY (e.g. a local mail server rebuilds its cache), UIDs restart at 1 and new digests are silently skipped as duplicates | Record UIDVALIDITY; warn or re-ingest when it changes |
-| HTML fallback in `extract_job_text()` | Medium | `</td>` becomes a tab and is collapsed to a space, so an HTML-only digest parses to 0 jobs. The docstring was changed but the code wasn't. | Map `</td>` to `\n` |
 | Silent parser failure on format change | Medium | Screener finds 0 jobs without warning | Canary check: count `View` lines per file |
-| Per-batch "at most 2 ≥ 75" rule | Low | Scores depend on which batch a listing lands in, then get sorted globally | Absolute rubric, or a re-rank pass over the top N |
+| Per-batch "at most 2 ≥ 75" rule | Low | Pass-1 scores depend on which batch a listing lands in, then get sorted globally. Pass 2 corrects this only for listings with a description. | Absolute rubric |
+| Lever descriptions not captured | Low | Lever postings never reach pass 2. No Lever boards are configured today. | Probe the Lever schema when a Lever board is added |
 | `slug_probe.py` "VERIFIED" only means the slug has jobs | Low | A generic name (e.g. "Google") can match a different company's board | Check the company on the board before adding to `boards.json` |
 | Remote-by-timezone locations dropped | Low | e.g. Greenhouse "Eastern or Central Timezone" fails the location filter | Add timezone phrases to the remote check if needed |
-| Existing `raw_boards/` files keep their old format | Low | Files written before the location fix lack the "(Remote)" tag | Delete `raw_boards/*.txt` once; the next fetch regenerates them |
 
 ---
 
@@ -95,7 +121,9 @@ jobScreensApplications/
 ├── board_fetch.py               # Public board APIs -> raw_boards/<platform>_<id>.txt
 │                                #   Filters: title patterns/keywords, metro cities,
 │                                #   remote/US check, pay floor
-├── jobs_screen.py               # Parser + hard filters + LLM ranker -> out/
+├── jobs_screen.py               # Parser + recency/hard filters + two-pass
+│                                #   LLM ranker -> out/
+├── html_text.py                 # Shared HTML-to-text conversion (ingest + boards)
 ├── slug_probe.py                # Finds board slugs for company names
 │                                #   (python slug_probe.py targets.txt)
 ├── pipeline_config.json         # All personal settings (gitignored)
@@ -109,7 +137,8 @@ jobScreensApplications/
 ├── README.md                    # Setup, usage, and config reference
 ├── STATUS.md                    # This file: project state and roadmap
 ├── raw/                         # Ingested email digests (gitignored)
-├── raw_boards/                  # One file per live board posting (gitignored)
+├── raw_boards/                  # One file per live board posting, with its
+│                                #   description (gitignored)
 │   └── archive/                 #   Closed/filtered-out postings; not screened
 ├── out/                         # Ranked shortlists, JSON + Markdown (gitignored)
 ├── processed/                   # Created by ingest; unused so far (gitignored)
@@ -229,10 +258,13 @@ IMAP host, port, STARTTLS, and folder live in `pipeline_config.json`, along with
   - Pay floor: `pay_floor` in `pipeline_config.json` (a posting is cut only when the top of its range is below the floor; unknown pay is kept)
   - Re-running after a filter change archives postings that no longer pass.
 - **Boards:** edit `boards.json`; use `slug_probe.py` to find slugs
-- **Ranking prompt:** edit the file at `prompt_path` (default `screening_prompt.txt`)
+- **Ranking prompt:** edit the file at `prompt_path` (default `screening_prompt.txt`). The pass-2 addendum (`RERANK_ADDENDUM` in `jobs_screen.py`) is appended to it for re-scoring.
+- **Recency window:** `recency_days` in `pipeline_config.json` (ingest and screener both read it; `0` disables)
+- **Pass 2:** `rerank_top_n` (`0` disables), `rerank_batch`, and `excerpt_chars` in `pipeline_config.json`. Excerpt selection uses `ROLE_MARKERS` and `FOOTER_MARKERS` in `jobs_screen.py`.
 - **Batch size:** lower `BATCH = 30` to 20 or 15 if JSON parse failures appear
 - **Model choice:** swap `SCREEN_MODEL` for a smaller model (speed) or larger one (quality)
-- **Cost control:** the full corpus is ~3,500 email listings (~118 batches) plus ~90 board postings. For steady state, plan a score cache or recency window (see Known Issues) and a deterministic pre-rank cap (~top 200–300) before LLM scoring.
+- **Board file format:** bump `FILE_FORMAT` in `board_fetch.py` after changing what it writes; every live posting is rewritten on the next run.
+- **Cost control:** with a 30-day window, the data on disk on 2026-10-10 parsed to 634 unique listings, with 151 cut and 483 ranked (17 pass-1 batches plus 3 pass-2 batches). A score cache would cut daily scoring to new listings (see Known Issues).
 
 ---
 
@@ -255,11 +287,11 @@ IMAP host, port, STARTTLS, and folder live in `pipeline_config.json`, along with
 ## Next Milestones
 
 1. Verify 3–5 unattended overnight cycles (01:00 + 05:00 ingest, 06:00 screening)
-2. Score cache + recency window so daily runs only score new listings
-3. Validate LLM output (index set, null fields)
+2. Decide how pass-2 scores rank against pass-1 scores (see Known Issues)
+3. Score cache so daily runs only score new listings
 4. Parser canary warning on format drift
 5. `board_fetch.py` robustness: skip bad `boards.json` entries; exit non-zero on fetch failures
 
 Success metric for automation: zero manual intervention; shortlist present in `out/` by 7:00 AM each weekday.
 
-*Last updated: October 9, 2026*
+*Last updated: October 10, 2026*
