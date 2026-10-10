@@ -1,0 +1,16 @@
+{
+  "email_user_env": "EMAIL_USER",
+  "email_password_env": "EMAIL_PASSWORD",
+  "imap_host": "imap.example.com",
+  "imap_port": 993,
+  "imap_starttls": false,
+  "mail_folder": "path/to/email/alerts/inbox",
+  "digest_noise_lines": ["saved search name", "manage alerts"],
+  "metro_cities": ["city1", "city2", "city3"],
+  "remote_regions": ["state name", "ST"],
+  "pay_floor": 100000,
+  "excluded_employers": ["CompanyA", "CompanyB"],
+  "included_title_patterns": ["role1", "role2"],
+  "excluded_title_patterns": ["\\bpattern1\\b", "pattern2"],
+  "excluded_keywords": ["keyword1", "keyword2"]
+}

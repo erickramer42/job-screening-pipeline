@@ -1,0 +1,16 @@
+raw/
+raw_boards/
+processed/
+out/
+logs/
+
+pipeline_config.json
+boards.json
+screening_prompt.txt
+targets.txt
+.env
+
+__pycache__/
+*.pyc
+
+*.bat

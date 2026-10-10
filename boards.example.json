@@ -1,0 +1,6 @@
+[
+  {"platform": "greenhouse", "slug": "companya", "company": "Company A"},
+  {"platform": "lever", "slug": "companyb", "company": "Company B"},
+  {"platform": "ashby", "slug": "companyc", "company": "Company C"},
+  {"platform": "smartrecruiters", "slug": "companyd", "company": "Company D"}
+]
