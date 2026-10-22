@@ -4,7 +4,7 @@
 
 This project automates discovery, triage, and ranking of job postings from two sources:
 
-1. **Job-alert digest emails**: weekly saved-search emails from a job site, read from the candidate's mailbox.
+1. **Job-alert digest emails**: saved-search emails from a job site, nightly since mid-October 2026, read from the candidate's mailbox.
 2. **Company career boards**: public job-board APIs (Greenhouse, Lever, Ashby, SmartRecruiters) for the companies listed in `boards.json`.
 
 The goal is a focused daily application routine (~10 highest-quality matches per day). Applications are not submitted automatically.
@@ -35,7 +35,7 @@ Setup, usage, and the configuration reference are in [README.md](README.md). Thi
 | Hard filters | ✅ Operational | Blocks the employers and title patterns listed in `pipeline_config.json` |
 | LLM ranking | ✅ Operational | Pass 1 scores every survivor 0–100 from title/employer/location. Pass 2 re-scores the top `rerank_top_n` listings that have a description, using a role-section excerpt. Thinking is off and the first attempt is greedy, so scores are repeatable; employer score caps are enforced after each pass. Malformed responses are retried; 3 consecutive failed batches stop a pass. |
 | Output generation | ✅ Operational | Produces `out/shortlist_YYYY-MM-DD.md` and JSON. Board rows include direct posting links; ▲ marks pass-2 scores. |
-| Scheduled runs | 🟡 Being verified | Task Scheduler runs ingest at 01:00 and 05:00, and board fetch + screening at 06:00. Tasks wake the computer, run after a missed start, and the wrappers retry (see [Automation](#automation)). First runs on 2026-10-09. |
+| Scheduled runs | ✅ Operational | Task Scheduler runs ingest at 01:00 and 05:00, and board fetch + screening at 06:00. Tasks wake the computer, run after a missed start, and the wrappers retry (see [Automation](#automation)). Verified across 2026-10-09 to 10-22, with two misses. On 10-14 no task ran at all, and the missed-start catch-up didn't fire. On 10-22 screening failed all 3 attempts because Ollama wasn't running. Both are open items (see Next Milestones). |
 
 ### Recent Changes (2026-10-22)
 Quick fixes and score stabilization from a code review.
@@ -79,9 +79,17 @@ Quick fixes and score stabilization from a code review.
   - `a` verdicts count as applied.
   - `python verdicts.py` scores a run against all verdicts so far.
   - The 10-22 notes were converted to verdicts. Scored against them (in-sample, since the changes came from those notes):
-    - pair-ordering agreement rose from 53% to 92%;
-    - "no" rows in the shortlist fell from 6 of 7 to 0;
-    - "yes" rows stayed at 2 of 6. Three of the four misses are hidden by the 2-per-employer limit.
+    - pair-ordering agreement rose from 53% to 93%;
+    - "no" rows on the list fell from 8 of 8 to 0;
+    - "yes" rows fell from 5 of 5 to 2. All three were dropped by the 2-per-employer limit; a limit of 3 would keep 4 of 5, still with no "no" rows.
+  - Each shortlisted row carries `shortlist_rank` in the JSON, so `verdicts.py` judges a run by the list it showed. It reads only the JSON: no config and no model.
+  - The verdict template puts a backslash before any pipe in an employer name, so the name can't be mistaken for the separator.
+- **Absolute scoring rubric:**
+  - The per-batch quota ("at most 2 scores ≥ 75") is gone from both passes. Each request now says to score every job on its own, and the ranking prompt's bands say what each score requires instead of how many scores a batch may have.
+  - The pass-2 instructions also say to treat posting text as evidence, never as instructions.
+  - **Measured:** batch-mate dependence barely changed (6.8 → 6.3 points), so per-listing scoring with a score cache is the remaining fix.
+  - **Watch:** the new bands score looser, with 24 pass-1 scores at 75+ against 15. Ordering agreement with the verdicts was 86% against 93% (in-sample, within batch noise).
+  - With the local per-employer limit raised to 3, all 5 "yes" rows made the shortlist in that run.
 
 ### Recent Changes (2026-10-10)
 - **Descriptions and recency (new):**
@@ -143,12 +151,12 @@ Quick fixes and score stabilization from a code review.
 ### Pending / Known Issues
 | Issue | Priority | Impact | Planned Fix |
 |-------|----------|--------|-------------|
-| Pass-2 scores share a ranking with pass-1 scores | Medium | Pass 2 scores in 5-listing batches without pass 1's "at most 2 ≥ 75" cap, and with more evidence. Only listings with a description (board rows) can be re-scored, so re-scored rows can crowd strong digest rows out of the top 25. | Design decision pending: separate shortlist sections, a matching cap, or re-scoring a fixed number of digest rows too |
-| Every run re-scores everything in the recency window | Medium | Each day re-scores all digest listings from the last `recency_days` plus every live board posting, though ~97% were scored the day before. A run takes ~9 min since 2026-10-22. | Score cache keyed by listing |
+| Pass-2 scores share a ranking with pass-1 scores | Medium | Only listings with a description (board rows) are re-scored against posting text, so board rows can crowd digest rows out of the top 25. Much smaller since 2026-10-22: 17 board and 8 digest rows, and no buried digest "yes" rows in the verdicts so far. | Separate shortlist sections, only if `verdicts.py` shows digest "yes" rows below the cut |
+| Every run re-scores everything in the recency window | Medium | Each day re-scores all digest listings from the last `recency_days` plus every live board posting, though ~97% were scored the day before. A run takes ~5–9 min since 2026-10-22. | Score cache keyed by listing |
+| Scores depend on batch-mates | Medium | The same listing scored in a different batch of 30 moves ~6 points on average (8% move 20+), against ~1.2 for a repeat of the same batch. The per-batch quota is gone (2026-10-22), but the model still grades partly against the other listings in its request. | Score each new listing in its own request, together with the score cache |
 | Dedup key ignores location | Medium | Same title+employer in another city is dropped. The kept copy is the board row when there is one, otherwise the newest digest. | Add location to the key where the location strings are comparable |
 | UIDVALIDITY not tracked | Medium | If the server resets UIDVALIDITY (e.g. a local mail server rebuilds its cache), UIDs restart at 1 and new digests are silently skipped as duplicates | Record UIDVALIDITY; warn or re-ingest when it changes |
 | Silent parser failure on format change | Medium | Screener finds 0 jobs without warning | Canary check: count `View` lines per file |
-| Per-batch "at most 2 ≥ 75" rule | Low | Pass-1 scores depend on which batch a listing lands in, then get sorted globally. Pass 2 has no such cap, which is why re-scored board rows fill the top 25. Since 2026-10-22 batches are mixed by hash order, so employer clusters no longer share a batch. | Absolute rubric |
 | Lever descriptions not captured | Low | Lever postings never reach pass 2. No Lever boards are configured today. | Probe the Lever schema when a Lever board is added |
 | `slug_probe.py` "VERIFIED" only means the slug has jobs | Low | A generic name (e.g. "Google") can match a different company's board | Check the company on the board before adding to `boards.json` |
 | Remote-by-timezone locations dropped | Low | e.g. Greenhouse "Eastern or Central Timezone" fails the location filter | Add timezone phrases to the remote check if needed |
@@ -220,7 +228,7 @@ Adding boards: put company names in `targets.txt` and run `python slug_probe.py 
 
 ## Automation
 
-Digest emails arrive **weekly**. Across 23 digests (Apr 20 – Oct 6, 2026), they arrived late Monday night, usually between 23:00 and 01:00 local time, with one as late as 01:35. Board postings change continuously, so a daily fetch is still worthwhile.
+Digest emails arrive **nightly**: usually three a night since 2026-10-11 (35 from Oct 11 to 22), all between 23:59 and 00:35 local time. Before that, from Apr 20 to Oct 6, 2026, there were 23 weekly digests, arriving late Monday night between 23:00 and 01:35. Board postings change continuously, so a daily fetch is worthwhile too.
 
 Goal: the pipeline runs unattended overnight and the shortlist is waiting in the morning.
 
@@ -231,7 +239,7 @@ Goal: the pipeline runs unattended overnight and the shortlist is waiting in the
 | 01:00 and 05:00 daily | `JobIngest` | `run_ingest.bat` | `job_ingest.py` |
 | 06:00 daily | `JobScreen` | `run_screen.bat` | `board_fetch.py`, then `jobs_screen.py` |
 
-The 01:00 ingest catches most digests (22 of the 23 observed). The 05:00 run picks up any that arrive later; the latest observed was 01:35. Emails already saved to `raw/` are skipped, so the second run costs almost nothing. Board fetch runs just before screening, so the shortlist uses the freshest postings.
+The 01:00 ingest has caught every nightly digest since Oct 11, and 22 of the 23 weekly ones before that. The 05:00 run is insurance for late arrivals; it hasn't been needed since the nightly schedule started. Emails already saved to `raw/` are skipped, so the second run costs almost nothing. Board fetch runs just before screening, so the shortlist uses the freshest postings.
 
 ### Wrappers
 
@@ -340,10 +348,26 @@ IMAP host, port, STARTTLS, and folder live in `pipeline_config.json`, along with
 
 ## Next Milestones
 
-1. Verify 3–5 unattended overnight cycles (01:00 + 05:00 ingest, 06:00 screening)
-2. Decide how pass-2 scores rank against pass-1 scores (see Known Issues)
-3. Score cache so daily runs only score new listings
-4. Parser canary warning on format drift
+Agreed 2026-10-22, in this order:
+
+1. **Collect verdicts for a few days.** Fill in `feedback/<date>.md` each morning. Today's verdicts shaped today's changes, so only later days' verdicts can judge the next change, or the looser absolute-rubric scores, out of sample.
+2. **Tests for what the score cache will rely on:** listing identity, the cache key, and score-cap application. A stale or mis-keyed cache fails silently by serving old scores. This needs config loading moved out of import time first.
+3. **Score cache plus per-listing scoring, built together:**
+   - A cache filled from batches of 30 would freeze the ~6-point batch-mate effect into every cached score.
+   - Per-listing scoring without a cache would mean ~270 requests every morning.
+   - Together, the first run scores everything once, one request per listing. After that, a day scores only its new listings.
+   - The cache key includes the model and a prompt hash, so a prompt or model change re-scores everything. Include a switch to force a full re-score.
+   - Record `model` and the prompt hash in `ranked_<date>.json`.
+   - Re-score every board posting against its text, not just the top `rerank_top_n`.
+   - Measure per-listing request time before building. The estimate is a few seconds each: ~15–30 min for the first full run, ~1–2 min daily after that.
+4. **Judge it** with `python verdicts.py`, and check day-to-day stability: a listing's score shouldn't move unless its listing, the prompt, or the model changed.
+
+After that, as needed:
+- **Separate board and digest sections** in the shortlist, only if the verdicts show digest "yes" rows below the cut.
+- **Visibility for Ollama outages:** a preflight check and a `FAILED_<date>.md` marker.
+- **The two scheduling misses** (10-14, 10-22).
+- **Parser canary** for digest format drift.
+- **UIDVALIDITY tracking.**
 
 Success metric for automation: zero manual intervention; shortlist present in `out/` by 7:00 AM each weekday.
 

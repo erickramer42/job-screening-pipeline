@@ -9,7 +9,14 @@ Replace ? with y (would apply), m (maybe), n (no) or a (applied) and
 put notes after "::". The row number is only a convenience; the title
 and employer identify the listing, so verdicts stay valid across runs.
 Lines in any other shape (free notes, headings) are ignored, and a
-later file's verdict on the same listing replaces an earlier one.
+later file's verdict on the same listing replaces an earlier one. The
+title/employer split is at the LAST " | ", so a pipe in a title is fine,
+and the template puts a backslash before any pipe in an employer name
+so it can't be mistaken for the separator.
+
+The evaluation reads only the ranked JSON: no config, no model. Each
+run is judged by the shortlist it showed (its rows' shortlist_rank);
+runs written before that field existed showed their top 25.
 
     python verdicts.py                              # latest run in out/
     python verdicts.py out/ranked_2026-10-22.json
@@ -44,6 +51,7 @@ def load_verdicts(folder=None):
             if not m or m.group(2) == "?" or " | " not in m.group(3):
                 continue
             title, employer = m.group(3).rsplit(" | ", 1)
+            employer = employer.replace("\\|", "|")
             verdicts[listing_key(title, employer)] = {
                 "verdict": m.group(2).lower(),
                 "note": (m.group(4) or "").strip(),
@@ -58,17 +66,17 @@ def template_lines(stamp, rows):
              "# a (applied), and add notes after ::. Keep \"title | employer\"",
              "# as written: it identifies the listing. Other lines are free notes.",
              ""]
-    lines += [f"{i} [?] {j['title']} | {j['employer']} ::"
-              for i, j in enumerate(rows, 1)]
+    for i, j in enumerate(rows, 1):
+        employer = j["employer"].replace("|", "\\|")
+        lines.append(f"{i} [?] {j['title']} | {employer} ::")
     return lines
 
 def evaluate(ranked_path, verdicts):
     """Print how a ranked run treats the listings that have verdicts."""
-    import jobs_screen  # the shortlist rules; loads config, so imported late
     data = json.loads(Path(ranked_path).read_text(encoding="utf-8"))
     ranked = data["ranked"]
-    rows, _ = jobs_screen.shortlist_rows(ranked)
-    in_list = {listing_key(j["title"], j["employer"]) for j in rows}
+    shown = [j for j in ranked if "shortlist_rank" in j] or ranked[:25]
+    in_list = {listing_key(j["title"], j["employer"]) for j in shown}
     rank = {listing_key(j["title"], j["employer"]): (i, j)
             for i, j in enumerate(ranked, 1)}
     cut = {listing_key(j["title"], j["employer"]): j["reject_reason"]

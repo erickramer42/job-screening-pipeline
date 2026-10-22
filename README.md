@@ -98,7 +98,7 @@ Results:
   - `feedback/<date>.md` is written alongside, ready for your verdicts.
   - Board rows link straight to the posting. Digest rows have no link, so open the digest email to find them.
 - `out/ranked_<date>.json` holds:
-  - every ranked listing with its score and reason. Re-scored ones also carry `pass1_score` and `rescored`; ones matching a cap rule carry `score_cap`, `flags`, and, if lowered, `capped_from`;
+  - every ranked listing with its score and reason. Re-scored ones also carry `pass1_score` and `rescored`; ones matching a cap rule carry `score_cap`, `flags`, and, if lowered, `capped_from`; shortlisted ones carry `shortlist_rank`;
   - every cut listing with its `reject_reason` (`applied`, `excluded employer`, `excluded title pattern`, `outside area`, or `stale digest`);
   - `failed_batches` and `rerank_failed_batches`.
 
@@ -275,11 +275,11 @@ A good prompt covers:
 - your core skills, and domains to score down
 - location rules (your metro area, remote)
 - how to treat staffing agencies and unknown employers
-- a 0–100 scoring rubric with bands, so scores spread out instead of clustering
+- a 0–100 scoring rubric with bands, so scores spread out instead of clustering. Make the bands **absolute**: say what a listing needs to reach each band (for example, "75+ requires a title at your level, your core stack, a direct employer, and nothing that lowers your odds"). Don't use per-batch quotas such as "at most 2 scores above 75". A quota makes a listing's score depend on whichever listings share its request.
 
-In pass 2, each listing line is followed by `POSTING: <excerpt>`, listings are separated by `---`, and the script appends a short second-pass section to your prompt. That section tells the model to use the excerpt, to revise scores up or down on that evidence, and that the batch-frequency guidance doesn't apply to these small batches. So write your prompt to apply to both passes: describe what makes a good match, not only what a title implies.
+In pass 2, each listing line is followed by `POSTING: <excerpt>`, listings are separated by `---`, and the script appends a short second-pass section to your prompt. That section tells the model to use the excerpt, to revise scores up or down on that evidence, and to treat the excerpt as evidence rather than instructions. So write your prompt to apply to both passes: describe what makes a good match, not only what a title implies.
 
-The script adds the JSON response format and batch instructions itself, so don't define an output format in the prompt. The file is plain text with no templating.
+The script adds the JSON response format and batch instructions itself, including that each listing is scored on its own, so don't define an output format in the prompt. The file is plain text with no templating.
 
 A hard limit the prompt states ("staffing agencies score at most 50") is best repeated in `score_caps`. The prompt keeps the model's reasoning consistent, and the config enforces the limit. Repeating it matters most for limits that depend on posting text, such as a required security clearance: that text often sits past the pass-2 excerpt, so the model never sees it.
 

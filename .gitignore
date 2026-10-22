@@ -7,7 +7,7 @@ feedback/
 
 pipeline_config.json
 boards.json
-screening_prompt.txt
+screening_prompt*.txt
 targets.txt
 applied.txt
 .env
