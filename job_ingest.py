@@ -9,17 +9,18 @@ are skipped: header probe only, no body download, no file written. The
 server folder is never touched (read-only guarantee), so old emails
 cost one cheap header fetch per run until manually archived.
 """
-import os
-import sys
-import imaplib
 import email
+import imaplib
+import ipaddress
+import json
+import os
+import re
+import ssl
+import sys
+from datetime import datetime, timezone
 from email.header import decode_header
 from email.utils import parsedate_to_datetime
 from pathlib import Path
-from datetime import datetime, timezone
-import hashlib
-import re
-import json
 
 from html_text import html_to_text
 
@@ -44,6 +45,13 @@ IMAP_PORT = int(CFG.get("imap_port", os.getenv("EMAIL_IMAP_PORT", "993")))
 # True for servers that expect a plain connect upgraded with STARTTLS;
 # False (default) uses implicit TLS
 IMAP_STARTTLS = CFG.get("imap_starttls", False)
+# The server certificate is verified against the system CA store, or
+# only against imap_cafile when that is set (e.g. a local bridge's
+# exported certificate). imap_tls_verify=false skips verification and
+# is accepted for loopback hosts only, where traffic never leaves the
+# machine
+IMAP_TLS_VERIFY = CFG.get("imap_tls_verify", True)
+IMAP_CAFILE = CFG.get("imap_cafile")
 IMAP_TIMEOUT = 60  # seconds per socket operation
 # Same knob jobs_screen.py reads: digests older than this are not
 # ingested. 0 or missing ingests everything.
@@ -68,12 +76,36 @@ EMAIL_USER = os.getenv(USER_ENV, "")
 PASSWORD = os.getenv(PASSWORD_ENV, "")
 MAIL_FOLDER = CFG.get("mail_folder", "")
 RAW_DIR = Path("raw")
-PROCESSED_DIR = Path("processed")
 
 if not IMAP_HOST or not EMAIL_USER or not PASSWORD or not MAIL_FOLDER:
     print("[ERROR] imap_host/mail_folder (pipeline_config.json) and "
           f"{USER_ENV}/{PASSWORD_ENV} (environment) must all be set.")
     sys.exit(1)
+
+def is_loopback(host):
+    if host.lower() == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+if not IMAP_TLS_VERIFY and not is_loopback(IMAP_HOST):
+    print("[ERROR] imap_tls_verify=false is only accepted for a loopback "
+          "imap_host (localhost, 127.0.0.1, ::1). To trust a self-signed "
+          "certificate, set imap_cafile instead.")
+    sys.exit(1)
+
+def tls_context():
+    """TLS settings for the IMAP connection. Always passed explicitly:
+    imaplib's own default (no context) does NOT verify certificates."""
+    if IMAP_TLS_VERIFY:
+        return ssl.create_default_context(cafile=IMAP_CAFILE)
+    # Loopback only (checked at startup)
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    return ctx
 
 def decode_mime_header(header):
     """Decode MIME encoded headers."""
@@ -84,7 +116,7 @@ def decode_mime_header(header):
         if isinstance(part, bytes):
             try:
                 decoded_parts.append(part.decode(enc or "utf-8", errors="replace"))
-            except:
+            except LookupError:  # unknown charset name
                 decoded_parts.append(part.decode("utf-8", errors="replace"))
         else:
             decoded_parts.append(str(part))
@@ -129,55 +161,22 @@ def digest_is_stale(mail, uid):
         dt = dt.replace(tzinfo=timezone.utc)
     return (datetime.now(timezone.utc) - dt).days > RECENCY_DAYS
 
-def extract_job_text(email_content):
-    """
-    Convert an email body to text, one field per line: the 4-line
-    title / employer / location / View quadruple jobs_screen.py parses.
-
-    This script prefers text/plain over text/html, so the HTML path is
-    fallback-only. Both go through the shared html_to_text: plain text
-    keeps its lines, and HTML table cells and block tags become line
-    breaks, so an HTML-only digest still yields one field per line.
-    """
-    if isinstance(email_content, bytes):
-        try:
-            text = email_content.decode("utf-8", errors="replace")
-        except Exception:
-            text = email_content.decode("latin-1", errors="replace")
-    else:
-        text = email_content
-    return html_to_text(text)
-
-def uid_to_filename(uid):
-    """Convert IMAP UID to safe filename (stable across email deletions)."""
-    return f"job_uid_{uid}.txt"
-
-def is_duplicate(filepath):
-    """Check if we already processed this UID."""
-    return filepath.exists()
-
-def job_id_hash(subject, sender, date_str):
-    """Build stable ID from subject+sender+date so different digests
-    get different IDs even if title/sender are identical."""
-    data = f"{subject}|{sender}|{date_str}"
-    return hashlib.md5(data.encode()).hexdigest()[:12]
-
 def main():
     RAW_DIR.mkdir(exist_ok=True)
-    PROCESSED_DIR.mkdir(exist_ok=True)
 
     print(f"Connecting to {IMAP_HOST}:{IMAP_PORT}...")
 
     # Socket timeout so an unresponsive server fails the run instead of
     # hanging it (the scheduled wrapper retries failed runs)
+    ctx = tls_context()
     if IMAP_STARTTLS:
         # Connect plain, upgrade to TLS before sending credentials
         mail = imaplib.IMAP4(IMAP_HOST, IMAP_PORT, timeout=IMAP_TIMEOUT)
-        mail.starttls()
-        mail.login(EMAIL_USER, PASSWORD)
+        mail.starttls(ssl_context=ctx)
     else:
-        mail = imaplib.IMAP4_SSL(IMAP_HOST, IMAP_PORT, timeout=IMAP_TIMEOUT)
-        mail.login(EMAIL_USER, PASSWORD)
+        mail = imaplib.IMAP4_SSL(IMAP_HOST, IMAP_PORT, ssl_context=ctx,
+                                 timeout=IMAP_TIMEOUT)
+    mail.login(EMAIL_USER, PASSWORD)
 
     print(f"Selecting folder: {MAIL_FOLDER}")
     # readonly=True issues EXAMINE: no flag changes, and close() can't
@@ -214,9 +213,10 @@ def main():
         uid = uid_bytes.decode()
 
         # Duplicate check first: a UID whose file exists costs nothing
-        # (no header probe, no body fetch)
-        filepath = RAW_DIR / uid_to_filename(uid)
-        if is_duplicate(filepath):
+        # (no header probe, no body fetch). UIDs, unlike sequence
+        # numbers, stay stable across deletions and moves
+        filepath = RAW_DIR / f"job_uid_{uid}.txt"
+        if filepath.exists():
             duplicates += 1
             continue
 
@@ -246,10 +246,6 @@ def main():
         subject = decode_mime_header(subject_raw)
         sender = decode_mime_header(from_raw)
 
-        # Build job ID from subject+sender+date for cross-digest
-        # uniqueness (Bug #2 fix from CLAUDE.md known-issues)
-        job_id = job_id_hash(subject, sender, date_raw)
-
         # Extract body text (prefers text/plain, falls back to text/html)
         body = None
         if msg_obj.is_multipart():
@@ -278,18 +274,19 @@ def main():
             print(f"No body found: {subject[:50]}...")
             continue
 
-        # Clean and extract job text
-        clean_text = extract_job_text(body)
+        # One field per line: the title / employer / location / View
+        # quadruple jobs_screen.py parses. Plain text keeps its lines;
+        # in the HTML fallback, table cells and block tags become line
+        # breaks, so an HTML-only digest still yields one field per line
+        clean_text = html_to_text(body)
 
-        # Write to file
         with open(filepath, "w", encoding="utf-8") as f:
-            f.write(f"# Metadata\n")
+            f.write("# Metadata\n")
             f.write(f"Subject: {subject}\n")
             f.write(f"Sender: {sender}\n")
             f.write(f"Date: {date_raw}\n")
-            f.write(f"Job_ID: {job_id}\n")
             f.write(f"UID: {uid}\n")
-            f.write(f"---\n\n")
+            f.write("---\n\n")
             f.write(clean_text)
 
         processed += 1

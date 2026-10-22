@@ -3,14 +3,17 @@ raw_boards/
 processed/
 out/
 logs/
+feedback/
 
 pipeline_config.json
 boards.json
 screening_prompt.txt
 targets.txt
+applied.txt
 .env
 
 __pycache__/
 *.pyc
 
 *.bat
+diff.log

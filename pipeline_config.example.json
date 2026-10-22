@@ -4,6 +4,7 @@
   "imap_host": "imap.example.com",
   "imap_port": 993,
   "imap_starttls": false,
+  "imap_tls_verify": true,
   "mail_folder": "path/to/email/alerts/inbox",
   "digest_noise_lines": ["saved search name", "manage alerts"],
   "metro_cities": ["city1", "city2", "city3"],
@@ -16,5 +17,12 @@
   "recency_days": 60,
   "rerank_top_n": 15,
   "rerank_batch": 5,
-  "excerpt_chars": 1500
+  "excerpt_chars": 1500,
+  "model_thinking": false,
+  "shortlist_per_employer": 2,
+  "score_caps": [
+    {"employers": ["StaffingFirmA", "StaffingFirmB"], "max_score": 50},
+    {"title_patterns": ["\\bpattern3\\b"], "max_score": 35},
+    {"description_patterns": ["phrase in posting"], "max_score": 40, "flag": "flagname"}
+  ]
 }

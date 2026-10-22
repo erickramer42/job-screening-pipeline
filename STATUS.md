@@ -33,9 +33,47 @@ Setup, usage, and the configuration reference are in [README.md](README.md). Thi
 | Slug discovery (`slug_probe.py`) | ✅ Operational | Guesses board slugs for company names (e.g. `targets.txt`) and prints `boards.json` lines for slugs that return jobs |
 | Job parsing (`jobs_screen.py` parser) | ✅ Operational | Reads title/employer/location quadruples from `raw/` and `raw_boards/`. Keeps one copy per listing (board copy first, then newest digest) and cuts digests older than `recency_days`. |
 | Hard filters | ✅ Operational | Blocks the employers and title patterns listed in `pipeline_config.json` |
-| LLM ranking | ✅ Operational | Pass 1 scores every survivor 0–100 from title/employer/location. Pass 2 re-scores the top `rerank_top_n` listings that have a description, using a role-section excerpt. Malformed responses are retried; 3 consecutive failed batches stop a pass. |
+| LLM ranking | ✅ Operational | Pass 1 scores every survivor 0–100 from title/employer/location. Pass 2 re-scores the top `rerank_top_n` listings that have a description, using a role-section excerpt. Thinking is off and the first attempt is greedy, so scores are repeatable; employer score caps are enforced after each pass. Malformed responses are retried; 3 consecutive failed batches stop a pass. |
 | Output generation | ✅ Operational | Produces `out/shortlist_YYYY-MM-DD.md` and JSON. Board rows include direct posting links; ▲ marks pass-2 scores. |
 | Scheduled runs | 🟡 Being verified | Task Scheduler runs ingest at 01:00 and 05:00, and board fetch + screening at 06:00. Tasks wake the computer, run after a missed start, and the wrappers retry (see [Automation](#automation)). First runs on 2026-10-09. |
+
+### Recent Changes (2026-10-22)
+Quick fixes and score stabilization from a code review.
+- **Ingest:**
+  - IMAP TLS certificates are now verified. `imaplib` doesn't verify them unless it's given a context.
+  - `imap_tls_verify: false` turns verification off for a local bridge with a self-signed certificate. It's refused for any host that isn't loopback.
+  - `imap_cafile` trusts a specific certificate instead of the system store.
+  - Ingest no longer writes the unused `Job_ID` line or creates the unused `processed/` folder.
+- **Board fetch:** a malformed `boards.json` entry, or a board whose response doesn't have the expected shape, is reported and skipped instead of stopping the run. A failed board's files aren't archived. The script exits 1 when any board failed.
+- **Screener:**
+  - Every shortlist cell is escaped, so a `|` in a location ("United States | Remote") no longer breaks the table row.
+  - A row's link is read only from the file's metadata block.
+  - The ranking prompt now explains the pay range in parentheses on board locations.
+- **Slug discovery:**
+  - Auto mode reads the latest dated `ranked_<date>.json`. It had been picking an older `ranked_v1_…` file, which sorts last.
+  - Probes start with the plain company name, and only whole corporate words are stripped. Before, "Cisco" was probed as `cis` first.
+- **Scoring stability:**
+  - **Thinking off:** model thinking is now off for every request (`model_thinking`, default `false`).
+    - With thinking on, the default model reasoned past the 8k context and returned nothing. That caused the "empty"/"truncated response" retries on 9 of 11 runs.
+    - With it off, a pass-1 batch takes ~18 s instead of 60–90 s.
+  - **Greedy first attempt:** the first request for each batch is greedy (temperature 0, seed 42), and retries sample with a seed per attempt. On the same input, two runs now differ by 1.2 points on average; day to day it used to be 6.0.
+  - **Score caps:** with thinking off, the model follows the prompt's caps less reliably. The new `score_caps` (first added as employer-only `employer_score_caps`) enforces the mechanical ones in code, and `capped_from` keeps the model's own score.
+  - **Area filter:** digest listings outside the search area are cut before ranking (`outside area`), with the same rule board fetch uses, now shared as `location_filter.py`. On Oct 22 data that's 62 rows, which the model had been scoring 0.
+  - **Mixed batches:** pass-1 batches are cut in a fixed hash order, so one employer's listings no longer fill a batch. The largest single-employer cluster in a batch went from 26 to 10.
+  - **Runtime:** a full screening run on Oct 22 data took 9.4 min, down from ~25.
+- **Shortlist feedback (first review, on the 10-22 list):**
+  - **Ranking prompt:**
+    - Side-project AI work is no longer treated as professional experience.
+    - Getting hired quickly is the stated priority.
+    - Some role types are named as stretches.
+    - Security-clearance requirements and notoriously hard interview loops are discounted.
+  - **`score_caps`** replaces the employer-only caps. A rule can match employer, title, or posting text, and can carry a flag shown in a new Flags column. New rules: required clearance (flag `clearance`), staff/principal titles, and reach employers (flag `reach`).
+  - **`shortlist_per_employer`** limits the rows from one employer, with a "More from" count under the table.
+  - **`applied.txt`:** listed jobs are skipped when ranking and shown in an "Already applied, still posted" section.
+  - **`feedback/`** (gitignored) holds per-day notes.
+  - **Measured** on the same data:
+    - 15 of the 16 listings the feedback named moved as intended. The exception is a "decent" listing that fell behind two near-identical postings from the same employer.
+    - In the top 25, reasons citing agent/LLM work fell from 15 to 2, employers rose from 10 to 16, and digest rows from 2 to 8.
 
 ### Recent Changes (2026-10-10)
 - **Descriptions and recency (new):**
@@ -98,14 +136,11 @@ Setup, usage, and the configuration reference are in [README.md](README.md). Thi
 | Issue | Priority | Impact | Planned Fix |
 |-------|----------|--------|-------------|
 | Pass-2 scores share a ranking with pass-1 scores | Medium | Pass 2 scores in 5-listing batches without pass 1's "at most 2 ≥ 75" cap, and with more evidence. Only listings with a description (board rows) can be re-scored, so re-scored rows can crowd strong digest rows out of the top 25. | Design decision pending: separate shortlist sections, a matching cap, or re-scoring a fixed number of digest rows too |
-| Every run re-scores everything in the recency window | Medium | Each day re-scores all digest listings from the last `recency_days` plus every live board posting, though most were scored the day before | Score cache keyed by listing |
+| Every run re-scores everything in the recency window | Medium | Each day re-scores all digest listings from the last `recency_days` plus every live board posting, though ~97% were scored the day before. A run takes ~9 min since 2026-10-22. | Score cache keyed by listing |
 | Dedup key ignores location | Medium | Same title+employer in another city is dropped. The kept copy is the board row when there is one, otherwise the newest digest. | Add location to the key where the location strings are comparable |
-| Ranking prompt says "no salary" | Medium | Board rows carry a pay range in the location field that `screening_prompt.txt` tells the model doesn't exist in pass 1 | Mention pay-in-parentheses in the prompt |
-| Bad `boards.json` entry crashes `board_fetch.py` | Medium | An unknown platform or missing slug raises `KeyError` outside the per-board `try`, stopping all boards | Validate each entry and skip it with a message |
-| `board_fetch.py` exits 0 when fetches fail | Medium | A scheduled run can't tell "all boards down" from success. `run_screen.bat` logs a non-zero exit, but fetch failures never produce one. | Exit 1 when any board fetch fails |
 | UIDVALIDITY not tracked | Medium | If the server resets UIDVALIDITY (e.g. a local mail server rebuilds its cache), UIDs restart at 1 and new digests are silently skipped as duplicates | Record UIDVALIDITY; warn or re-ingest when it changes |
 | Silent parser failure on format change | Medium | Screener finds 0 jobs without warning | Canary check: count `View` lines per file |
-| Per-batch "at most 2 ≥ 75" rule | Low | Pass-1 scores depend on which batch a listing lands in, then get sorted globally. Pass 2 corrects this only for listings with a description. | Absolute rubric |
+| Per-batch "at most 2 ≥ 75" rule | Low | Pass-1 scores depend on which batch a listing lands in, then get sorted globally. Pass 2 has no such cap, which is why re-scored board rows fill the top 25. Since 2026-10-22 batches are mixed by hash order, so employer clusters no longer share a batch. | Absolute rubric |
 | Lever descriptions not captured | Low | Lever postings never reach pass 2. No Lever boards are configured today. | Probe the Lever schema when a Lever board is added |
 | `slug_probe.py` "VERIFIED" only means the slug has jobs | Low | A generic name (e.g. "Google") can match a different company's board | Check the company on the board before adding to `boards.json` |
 | Remote-by-timezone locations dropped | Low | e.g. Greenhouse "Eastern or Central Timezone" fails the location filter | Add timezone phrases to the remote check if needed |
@@ -124,6 +159,7 @@ jobScreensApplications/
 ├── jobs_screen.py               # Parser + recency/hard filters + two-pass
 │                                #   LLM ranker -> out/
 ├── html_text.py                 # Shared HTML-to-text conversion (ingest + boards)
+├── location_filter.py           # Shared search-area rule (boards + digest filter)
 ├── slug_probe.py                # Finds board slugs for company names
 │                                #   (python slug_probe.py targets.txt)
 ├── pipeline_config.json         # All personal settings (gitignored)
@@ -132,6 +168,8 @@ jobScreensApplications/
 ├── boards.example.json          # Placeholder board list to copy
 ├── screening_prompt.txt         # System prompt for LLM ranking (gitignored; prompt_path)
 ├── targets.txt                  # Company names to probe (gitignored)
+├── applied.txt                  # Jobs already applied to (gitignored)
+├── feedback/                    # Daily shortlist notes (gitignored)
 ├── run_ingest.bat               # Task Scheduler wrappers (gitignored)
 ├── run_screen.bat
 ├── README.md                    # Setup, usage, and config reference
@@ -141,7 +179,6 @@ jobScreensApplications/
 │                                #   description (gitignored)
 │   └── archive/                 #   Closed/filtered-out postings; not screened
 ├── out/                         # Ranked shortlists, JSON + Markdown (gitignored)
-├── processed/                   # Created by ingest; unused so far (gitignored)
 └── logs/                        # Logs from scheduled runs (gitignored)
 ```
 
@@ -162,7 +199,10 @@ Review `out/shortlist_<today>.md`:
 - Board rows have direct posting links.
 - Digest rows need the original email for their "View" links.
 
-Apply manually at company career pages.
+Apply manually at company career pages. Afterwards:
+- Add each job you applied to to `applied.txt` (URL, or `Title | Employer` for digest rows).
+- Note what the list got wrong in `feedback/<date>.md`, by row number.
+- Turn repeated notes into config rules or prompt changes (see README, "Reviewing the shortlist").
 
 Adding boards: put company names in `targets.txt` and run `python slug_probe.py targets.txt`. Check that each VERIFIED board really belongs to that company, then paste the lines into `boards.json`.
 
@@ -202,7 +242,7 @@ The wrappers are gitignored. Both run under `cmd` (no Git Bash) and contain no m
 - **Trigger:** daily at the times above. **Action:** the wrapper, which sets its own working directory.
 - **Wake the computer to run this task:** on. **Run as soon as possible after a missed start:** on, so a run missed while the PC was off or logged out happens at the next opportunity.
 - **Can start on battery and keeps running on battery:** on.
-- **Time limit:** 2 h for ingest, 8 h for screening. A full re-score of ~3,500 listings takes about 2.5 h at ~75 s per batch. The limit stops a hung run before the next day's run, which would otherwise be skipped ("do not start a new instance").
+- **Time limit:** 2 h for ingest, 8 h for screening. A full run on 2026-10-22 data (275 ranked listings, 22 batches) took 9.4 min. The limit stops a hung run before the next day's run, which would otherwise be skipped ("do not start a new instance").
 - **Runs only while the user is logged on.** This is deliberate: the local mail server and Ollama run in the user's session, so a logged-off run couldn't reach them. With catch-up on, a missed run starts once the user logs on.
 
 ### Prerequisites for unattended runs
@@ -211,7 +251,7 @@ The wrappers are gitignored. Both run under `cmd` (no Git Bash) and contain no m
 3. `EMAIL_USER` and `EMAIL_PASSWORD` must be set as Windows user environment variables (see below)
 4. Check Task Scheduler's **Last Run Result** and `logs/` after the first automated nights:
    - `logs/errors.log` gets one timestamped line per failed step (`ingest FAILED`, `board fetch FAILED`, `screen FAILED`), after retries.
-   - The scripts exit non-zero on failure (except `board_fetch.py` fetch errors — known issue).
+   - The scripts exit non-zero on failure. `board_fetch.py` tries every board first, then exits 1 if any failed.
    - **No shortlist for today** means scoring failed completely (Ollama down or model missing; see `logs/screen.log`) or a wrapper path/env-var problem.
    - **A WARNING line at the top of the shortlist** means some batches failed and those listings are ranked 0.
 
@@ -264,13 +304,17 @@ IMAP host, port, STARTTLS, and folder live in `pipeline_config.json`, along with
 - **Batch size:** lower `BATCH = 30` to 20 or 15 if JSON parse failures appear
 - **Model choice:** swap `SCREEN_MODEL` for a smaller model (speed) or larger one (quality)
 - **Board file format:** bump `FILE_FORMAT` in `board_fetch.py` after changing what it writes; every live posting is rewritten on the next run.
-- **Cost control:** with a 30-day window, the data on disk on 2026-10-10 parsed to 634 unique listings, with 151 cut and 483 ranked (17 pass-1 batches plus 3 pass-2 batches). A score cache would cut daily scoring to new listings (see Known Issues).
+- **Model thinking:** `model_thinking` in `pipeline_config.json`. Off (the default) is fast and repeatable. On is about 4× slower, varies from run to run, and can overflow the context. See README.
+- **Score caps:** `score_caps` in `pipeline_config.json` enforces the prompt's hard limits after each pass, by employer, title, or posting text, and flags the rows it matches.
+- **Shortlist crowding:** `shortlist_per_employer` in `pipeline_config.json`.
+- **Cost control:** with a 30-day window, the data on disk on 2026-10-22 parsed to 353 unique listings, with 78 cut and 275 ranked (10 pass-1 batches plus 12 pass-2 batches, 9.4 min). A score cache would cut daily scoring to new listings (see Known Issues).
 
 ---
 
 ## Safety Guarantees
 
 - **Read-only mail:** the jobs folder is opened with EXAMINE and fetched with `BODY.PEEK[]`. No flags change and nothing is deleted or expunged.
+- **Verified TLS:** the IMAP server's certificate is checked before credentials are sent. Turning the check off is allowed only for a loopback host.
 - **Closed scope:** stops if the configured jobs folder is missing rather than scanning the inbox
 - **Compliance:**
   - Digest data comes only from emails the job site sends to this mailbox.
@@ -290,8 +334,7 @@ IMAP host, port, STARTTLS, and folder live in `pipeline_config.json`, along with
 2. Decide how pass-2 scores rank against pass-1 scores (see Known Issues)
 3. Score cache so daily runs only score new listings
 4. Parser canary warning on format drift
-5. `board_fetch.py` robustness: skip bad `boards.json` entries; exit non-zero on fetch failures
 
 Success metric for automation: zero manual intervention; shortlist present in `out/` by 7:00 AM each weekday.
 
-*Last updated: October 10, 2026*
+*Last updated: October 22, 2026*

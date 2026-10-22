@@ -10,6 +10,8 @@ role-marker excerpt from the stored posting text, so blind-pass
 ambiguity (opaque titles, non-tech employers) can be resolved with
 actual requirements. Pass-1 score is preserved as pass1_score.
 """
+import collections
+import hashlib
 import http.client
 import json
 import os
@@ -19,6 +21,8 @@ import urllib.request
 from datetime import date, datetime, timezone
 from email.utils import parsedate_to_datetime
 from pathlib import Path
+
+from location_filter import location_matcher
 
 CONFIG_FILE = Path("pipeline_config.json")
 
@@ -41,6 +45,10 @@ RECENCY_DAYS = int(CFG.get("recency_days", 0))
 RERANK_TOP_N = int(CFG.get("rerank_top_n", 15))
 RERANK_BATCH = int(CFG.get("rerank_batch", 5))
 EXCERPT_CHARS = int(CFG.get("excerpt_chars", 1500))
+SHORTLIST_SIZE = 25
+# At most this many shortlist rows from one employer (0: no limit). The
+# ones passed over are counted under the table and stay in the JSON
+SHORTLIST_PER_EMPLOYER = int(CFG.get("shortlist_per_employer", 0))
 # Glob pattern per source dir: digests are job_uid_<UID>.txt; board
 # postings are <platform>_<id>.txt (greenhouse_123, ashby_abc, ...)
 SOURCE_DIRS = [
@@ -95,17 +103,69 @@ EXCLUDED_EMPLOYER_RE = re.compile(
     re.I,
 )
 EXCLUDE_TITLE_PATTERNS = CFG["excluded_title_patterns"]
+# The search area board_fetch.py applies to postings at fetch time.
+# Digest rows arrive unfiltered, so they get it here instead of
+# reaching the model just to be scored 0 for location
+location_ok = location_matcher(CFG["metro_cities"],
+                               CFG.get("remote_regions", []))
 
-def parse_metadata(lines):
-    """Pull URL/Company from the '# Metadata' block if present."""
-    url, company = "", None
+def any_of(patterns):
+    """One case-insensitive regex matching any of patterns, or None."""
+    if not patterns:
+        return None
+    return re.compile("|".join(f"(?:{p})" for p in patterns), re.I)
+
+# Score caps (config score_caps): limits the ranking prompt states,
+# applied in code to every model score after each pass. With model
+# thinking off the model keeps them less reliably (2026-10-22: an
+# unnamed employer scored 72 against a cap of 40), and it can't see
+# clearance terms that sit past the pass-2 excerpt. An entry matches a
+# listing on any of its employers (plain names, whole words, like
+# excluded_employers), title_patterns or description_patterns (regexes);
+# all ignore case. Its optional flag is shown in the shortlist whenever
+# it matches, whether or not the cap lowered the score
+SCORE_CAPS = [
+    {"employers": any_of([rf"\b{re.escape(e)}\b"
+                          for e in c.get("employers", [])]),
+     "title": any_of(c.get("title_patterns", [])),
+     "description": any_of(c.get("description_patterns", [])),
+     "max_score": int(c["max_score"]),
+     "flag": c.get("flag")}
+    for c in CFG.get("score_caps", [])
+]
+
+# Jobs already applied to (applied_path): one per line, the posting URL,
+# or "Title | Employer" for digest rows, which have no link. "#" starts
+# a comment. They're cut before ranking and listed in their own
+# shortlist section for as long as they're still posted
+APPLIED_PATH = Path(CFG.get("applied_path", "applied.txt"))
+
+def load_applied():
+    urls, pairs = set(), set()
+    if APPLIED_PATH.exists():
+        for ln in APPLIED_PATH.read_text(encoding="utf-8").splitlines():
+            ln = re.split(r"(?:^|\s)#", ln, maxsplit=1)[0].strip()
+            if not ln:
+                continue
+            if "|" in ln and not ln.lower().startswith("http"):
+                title, employer = (x.strip().lower() for x in ln.split("|", 1))
+                pairs.add((title, employer))
+            else:
+                urls.add(ln)
+    return urls, pairs
+
+APPLIED_URLS, APPLIED_PAIRS = load_applied()
+
+def parse_metadata_url(lines):
+    """URL from the '# Metadata' block, or "" (digest files have none).
+    Stops at the block's closing '---', so body text can't supply it."""
     if lines and lines[0] == "# Metadata":
         for ln in lines:
+            if ln == "---":
+                break
             if ln.startswith("URL: "):
-                url = ln[5:].strip()
-            elif ln.startswith("Company: "):
-                company = ln[9:].strip()
-    return url, company
+                return ln[5:].strip()
+    return ""
 
 def parse_metadata_date(lines):
     """Date header from a digest file's metadata block, as an aware
@@ -190,7 +250,7 @@ def parse_jobs():
                 cut, desc = len(all_lines), ""
             raw_lines = [ln.strip() for ln in all_lines[:cut]
                          if ln.strip()]
-            url, meta_company = parse_metadata(raw_lines)
+            url = parse_metadata_url(raw_lines)
             digest_dt = (parse_metadata_date(raw_lines)
                          if src_dir.name == "raw" else None)
             for i, ln in enumerate(raw_lines):
@@ -229,12 +289,23 @@ def parse_jobs():
 def hard_filter(jobs):
     kept, rejected = [], []
     for j in jobs:
+        if (j["url"] in APPLIED_URLS
+                or (j["title"].lower(), j["employer"].lower()) in APPLIED_PAIRS):
+            j["reject_reason"] = "applied"
+            rejected.append(j)
+            continue
         if EXCLUDED_EMPLOYER_RE.search(j["employer"]):
             j["reject_reason"] = "excluded employer"
             rejected.append(j)
             continue
         if any(re.search(p, j["title"], re.I) for p in EXCLUDE_TITLE_PATTERNS):
             j["reject_reason"] = "excluded title pattern"
+            rejected.append(j)
+            continue
+        # Digest rows only: board rows passed this check at fetch time,
+        # using structured remote/country fields their text lacks
+        if j["source"] == "raw" and not location_ok(j["location"]):
+            j["reject_reason"] = "outside area"
             rejected.append(j)
             continue
         kept.append(j)
@@ -265,9 +336,25 @@ not a signal against the listing. Batches here are small (~5 listings),
 so the first-pass batch-frequency guidance does not apply — score each
 listing independently on its own merits."""
 
-# Retries per request. Model output is probabilistic; a truncated or
-# index-shifted response is usually fine on a second sample
+# Retries per request. A truncated, empty or index-shifted response is
+# usually fine on a second sample
 MAX_ATTEMPTS = 3
+# Model thinking (config "model_thinking"). A thinking model reasons for
+# thousands of tokens before the JSON. Measured 2026-10-22 on the
+# default model:
+#   on:  60-90 s per pass-1 batch; often overflows num_ctx into an empty
+#        or truncated response; at temperature 0 the reasoning never
+#        ends (31k tokens, no answer), so every request must sample.
+#        Keeps the prompt's score caps reliably.
+#   off: ~18 s per batch, no overflows, and the first attempt can be
+#        greedy (temperature 0) for repeatable scores, but the prompt's
+#        caps are broken more often.
+MODEL_THINKING = bool(CFG.get("model_thinking", False))
+# Sampling is seeded, so a repeated request can reproduce. With thinking
+# off, the first attempt is greedy; retries, and every request with
+# thinking on, sample at the model's default temperature with a seed
+# per attempt (greedy decoding would repeat a bad response on retry)
+SEED = 42
 # Failures of the connection itself (Ollama down, timeout, a response
 # cut off mid-body). These fail the batch; everything wrong with the
 # CONTENT of a response is a ValueError and gets a retry instead.
@@ -275,7 +362,12 @@ TRANSPORT_ERRORS = (OSError, http.client.HTTPException)
 # Consecutive failed batches before a pass gives up (Ollama down/wedged)
 MAX_FAIL_STREAK = 3
 
-def ollama_chat(system, user):
+def sampling_options(attempt):
+    if attempt == 1 and not MODEL_THINKING:
+        return {"temperature": 0, "seed": SEED}
+    return {"seed": SEED + attempt - 1}
+
+def ollama_chat(system, user, attempt=1):
     """One chat completion; returns the model's content string.
     Raises TRANSPORT_ERRORS on connection failure and ValueError when
     the body isn't a chat response."""
@@ -286,8 +378,9 @@ def ollama_chat(system, user):
             {"role": "user", "content": user},
         ],
         "stream": False,
+        "think": MODEL_THINKING,
         "format": "json",
-        "options": {"num_ctx": 8192},
+        "options": {"num_ctx": 8192, **sampling_options(attempt)},
     }
     req = urllib.request.Request(
         OLLAMA_URL.rstrip("/") + "/api/chat",
@@ -375,8 +468,8 @@ def request_scores(system, user, batch):
     best = {}
     for attempt in range(1, MAX_ATTEMPTS + 1):
         try:
-            scores = parse_scores(ollama_chat(system, user), len(batch),
-                                  attempt)
+            scores = parse_scores(ollama_chat(system, user, attempt),
+                                  len(batch), attempt)
         except ValueError as e:
             print(f"    [attempt {attempt}] unusable response ({e}) "
                   f"— retrying")
@@ -389,6 +482,15 @@ def request_scores(system, user, batch):
         print(f"    [attempt {attempt}] {missing} indices missing "
               f"— retrying")
     return best
+
+def batch_order(job):
+    """Sort key for cutting pass-1 batches: a hash of the listing key.
+    File order puts one digest's or one board's listings together, so
+    the per-batch "at most 2 >= 75" cap would ration a cluster rather
+    than a batch. Hash order is mixed and stable: a new listing shifts
+    later batches by one row instead of reshuffling all of them."""
+    key = f"{job['title'].lower()}|{job['employer'].lower()}"
+    return hashlib.sha1(key.encode()).hexdigest()
 
 def score_batch(batch):
     """Pass 1: blind triage on title/employer/location."""
@@ -450,18 +552,67 @@ def run_batches(label, batches, scorer, apply):
         streak = 0
     return ok, len(batches) - ok, False
 
+def attach_caps(jobs):
+    """Each listing's score_cap (the lowest matching score_caps entry)
+    and flags, set once before scoring."""
+    for j in jobs:
+        hits = [c for c in SCORE_CAPS
+                if (c["employers"] and c["employers"].search(j["employer"]))
+                or (c["title"] and c["title"].search(j["title"]))
+                or (c["description"]
+                    and c["description"].search(j.get("description", "")))]
+        if hits:
+            j["score_cap"] = min(c["max_score"] for c in hits)
+            flags = sorted({c["flag"] for c in hits if c["flag"]})
+            if flags:
+                j["flags"] = flags
+
+def set_score(job, score, reason):
+    """Record a model score, clamped to the listing's score_cap. A
+    clamped row keeps the model's own score as capped_from."""
+    job.pop("capped_from", None)
+    cap = job.get("score_cap")
+    if cap is not None and score > cap:
+        job["capped_from"] = score
+        score = cap
+    job["score"] = score
+    job["reason"] = reason
+
 def apply_pass1(batch, scores):
     for idx, s in scores.items():
-        batch[idx]["score"] = s["score"]
-        batch[idx]["reason"] = s["reason"]
+        set_score(batch[idx], s["score"], s["reason"])
 
 def apply_rerank(batch, scores):
     for idx, s in scores.items():
         j = batch[idx]
         j["pass1_score"] = j["score"]
-        j["score"] = s["score"]
-        j["reason"] = s["reason"]
+        set_score(j, s["score"], s["reason"])
         j["rescored"] = True
+
+def md_cell(text, limit=None):
+    """One Markdown table cell: whitespace collapsed (no stray line
+    breaks), cut to limit, then pipes escaped. Escaping comes last so a
+    cut can't leave a lone backslash that escapes the cell delimiter."""
+    text = " ".join(str(text).split())
+    if limit:
+        text = text[:limit]
+    return text.replace("|", r"\|")
+
+def shortlist_rows(ranked):
+    """The top SHORTLIST_SIZE rows, at most SHORTLIST_PER_EMPLOYER from
+    any one employer. Also returns how many rows each employer had
+    passed over for that limit before the list filled."""
+    rows, shown, more = [], collections.Counter(), collections.Counter()
+    for j in ranked:
+        if len(rows) == SHORTLIST_SIZE:
+            break
+        emp = j["employer"]
+        if SHORTLIST_PER_EMPLOYER and shown[emp.lower()] >= SHORTLIST_PER_EMPLOYER:
+            more[emp] += 1
+            continue
+        shown[emp.lower()] += 1
+        rows.append(j)
+    return rows, more
 
 def main():
     jobs = parse_jobs()
@@ -489,14 +640,19 @@ def main():
 
     kept, rejected_hf = hard_filter(fresh)
     rejected = stale_rows + rejected_hf
+    cuts = collections.Counter(j["reject_reason"] for j in rejected_hf)
+    other = len(rejected_hf) - cuts["outside area"] - cuts["applied"]
     print(f"Parsed {len(jobs)} unique listings; {len(rejected)} cut "
-          f"({len(stale_rows)} stale, {len(rejected_hf)} hard filters), "
+          f"({len(stale_rows)} stale, {cuts['outside area']} outside area, "
+          f"{cuts['applied']} applied, {other} hard filters), "
           f"{len(kept)} to rank.")
+    attach_caps(kept)
 
     for j in kept:
         j["score"] = 0
         j["reason"] = "unscored"
 
+    kept.sort(key=batch_order)
     BATCH = 30
     batches = [kept[s:s + BATCH] for s in range(0, len(kept), BATCH)]
     n_batches = len(batches)
@@ -533,6 +689,10 @@ def main():
                                               score_rerank, apply_rerank)
             kept.sort(key=lambda j: j["score"], reverse=True)
 
+    capped = sum("capped_from" in j for j in kept)
+    if capped:
+        print(f"Score caps lowered {capped} score(s).")
+
     OUT_DIR.mkdir(exist_ok=True)
     stamp = date.today().isoformat()
     json_path = OUT_DIR / f"ranked_{stamp}.json"
@@ -555,20 +715,38 @@ def main():
         f.write(f"{len(kept)} ranked, {len(rejected)} auto-cut. "
                 f"Board postings link directly; digest rows need the "
                 f"email. Rows marked ▲ were re-scored against the "
-                f"posting text.\n\n")
-        f.write("| # | Score | Title | Employer | Location | Link | Reason |\n")
-        f.write("|---|-------|-------|----------|----------|------|--------|\n")
-        for i, j in enumerate(kept[:25], 1):
-            title = j["title"].replace("|", "/")
+                f"posting text. Flags come from score_caps rules; "
+                f"\"capped\" means a rule lowered the model's score.\n\n")
+        rows, more = shortlist_rows(kept)
+        f.write("| # | Score | Flags | Title | Employer | Location | Link "
+                "| Reason |\n")
+        f.write("|---|-------|-------|-------|----------|----------|------"
+                "|--------|\n")
+        for i, j in enumerate(rows, 1):
             mark = "▲ " if j.get("rescored") else ""
-            reason = j["reason"].replace("|", "/")[:80]
-            link = j.get("url", "") or "-"
-            f.write(f"| {i} | {mark}{j['score']} | {title} | "
-                    f"{j['employer']} | {j['location']} | {link} | "
-                    f"{reason} |\n")
+            flags = j.get("flags", []) + (["capped"] if "capped_from" in j
+                                          else [])
+            f.write(f"| {i} | {mark}{j['score']} | {', '.join(flags)} | "
+                    f"{md_cell(j['title'])} | {md_cell(j['employer'])} | "
+                    f"{md_cell(j['location'])} | "
+                    f"{md_cell(j.get('url') or '-')} | "
+                    f"{md_cell(j['reason'], 80)} |\n")
+        if more:
+            f.write("\nMore from: "
+                    + ", ".join(f"{md_cell(e)} (+{n})"
+                                for e, n in more.most_common())
+                    + f". At most {SHORTLIST_PER_EMPLOYER} per employer are "
+                      f"shown; the rest are in the JSON.\n")
+        applied = [j for j in rejected if j["reject_reason"] == "applied"]
+        if applied:
+            f.write("\n## Already applied, still posted\n\n")
+            for j in applied:
+                f.write(f"- {md_cell(j['title'])} · {md_cell(j['employer'])}"
+                        f" · {md_cell(j['location'])} · "
+                        f"{j.get('url') or 'digest listing'}\n")
 
     print(f"\nWrote {json_path}")
-    print(f"Wrote {md_path} (top 25 of {len(kept)})")
+    print(f"Wrote {md_path} (top {len(rows)} of {len(kept)})")
     if failed:
         print(f"[ERROR] {failed} of {n_batches} batches failed; "
               f"shortlist is incomplete.")

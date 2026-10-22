@@ -4,8 +4,9 @@ slug_probe.py — guess-and-verify board slugs for a list of company
 names against the four public job-board APIs. Prints verified entries
 ready to paste into boards.json.
 
-Input: candidates.txt — one company name per line (or pulled from
-out/ranked_*.json automatically when no candidates file is given).
+Input: a file with one company name per line, e.g. targets.txt (or,
+when no file is given, employers pulled from the latest
+out/ranked_<date>.json).
 """
 import json
 import re
@@ -30,18 +31,20 @@ SUFFIXES = ["", "-inc", "inc", "-technologies", "technologies",
             "-labs", "labs", "-hq"]
 
 def slug_variants(name):
+    """Candidate slugs, most likely first: the plain name, then the name
+    without a trailing corporate word, then common suffixes. main() stops
+    at the first hit, so order matters."""
     base = re.sub(r"[^a-z0-9]", "", name.lower())
     base_dash = re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")
-    variants = {base, base_dash}
-    # Drop trailing corporate words before suffixing
-    stem = re.sub(
-        r"(inc|llc|corp|corporation|co|company|technologies|systems)$",
-        "", base).strip("-")
-    if stem and stem != base:
-        variants.add(stem)
-    for s in SUFFIXES:
-        variants.add(stem + s)
-    return sorted(variants)
+    # Drop a trailing corporate WORD before suffixing. Matched on the
+    # dashed form, so "Cisco" and "Costco" keep their "co"
+    stem_dash = re.sub(
+        r"-(inc|llc|corp|corporation|co|company|technologies|systems)$",
+        "", base_dash)
+    stem = stem_dash.replace("-", "")
+    variants = [base, base_dash, stem, stem_dash]
+    variants += [stem + s for s in SUFFIXES]
+    return list(dict.fromkeys(v for v in variants if v))
 
 def probe(slug, platform):
     """True if the endpoint returns live JSON with job data."""
@@ -66,13 +69,16 @@ def probe(slug, platform):
 def candidates():
     if len(sys.argv) > 1 and Path(sys.argv[1]).exists():
         return [ln.strip() for ln in
-                Path(sys.argv[1]).read_text().splitlines() if ln.strip()]
-    # Auto mode: top employers from the latest ranked_*.json
-    out = sorted(Path("out").glob("ranked_*.json"))
+                Path(sys.argv[1]).read_text(encoding="utf-8").splitlines()
+                if ln.strip()]
+    # Auto mode: top employers from the latest ranked_<date>.json. The
+    # dated pattern skips other files in out/ (a "ranked_v1_..." name
+    # would sort after every date and be picked as the latest)
+    out = sorted(Path("out").glob("ranked_????-??-??.json"))
     if not out:
-        print("No candidates file and no ranked_*.json — pass a file.")
+        print("No candidates file and no ranked_<date>.json — pass a file.")
         sys.exit(1)
-    ranked = json.load(open(out[-1]))["ranked"]
+    ranked = json.loads(out[-1].read_text(encoding="utf-8"))["ranked"]
     names = [j["employer"] for j in ranked[:200]
              if j.get("score", 0) >= 60]
     # Dedupe, preserve order, drop staffing noise and unknowns

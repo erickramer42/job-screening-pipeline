@@ -34,6 +34,7 @@ import urllib.request
 from pathlib import Path
 
 from html_text import html_to_text, normalize_text
+from location_filter import REMOTE_RE, location_matcher
 
 CONFIG = Path("boards.json")
 OUT_DIR = Path("raw_boards")
@@ -68,7 +69,6 @@ SMARTRECRUITERS_DETAIL = ("https://api.smartrecruiters.com/v1/"
 # is mostly EEO/legal filler.
 SMARTRECRUITERS_SECTION_KEYS = ("jobDescription", "qualifications")
 
-# --- top of file, replacing METRO_RE and PAY_FLOOR declarations ---
 CONFIG_FILE = Path("pipeline_config.json")
 
 def load_config():
@@ -79,21 +79,13 @@ def load_config():
     return json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
 
 CFG = load_config()
-PAY_FLOOR = CFG.get("pay_floor", 0)  # base salary floor; cut only
-                                          # when range MAX < floor
-# Metro city list lives in config (PII routing)
-METRO_RE = re.compile("|".join(CFG["metro_cities"]), re.I)
-
-REMOTE_RE = re.compile(r"\bremote\b|\banywhere\b", re.I)
-# Only consulted for remote postings without a structured country field.
-# remote_regions (config) adds your own region, e.g. a state name and
-# its abbreviation, so "Remote - <region>" postings count as well
-US_RE = re.compile(
-    r"\bus\b|\busa\b|\bu\.s\.|united states|north america"
-    + "".join(rf"|\b{re.escape(r)}\b" for r in CFG.get("remote_regions", [])),
-    re.I,
-)
-US_COUNTRIES = {"us", "usa", "united states", "united states of america"}
+# Annual base salary floor: a posting is cut only when the top of its
+# published range is below it
+PAY_FLOOR = CFG.get("pay_floor", 0)
+# Postings in a configured metro city, or remote postings open to the
+# US (the screener applies the same rule to digest rows)
+location_ok = location_matcher(CFG["metro_cities"],
+                               CFG.get("remote_regions", []))
 # A posting is fetched only if its title matches one of these regexes
 # (config); an empty list fetches every title
 TITLE_RE = re.compile(
@@ -190,24 +182,6 @@ def needs_write(fname, platform):
     if f"Format: {FILE_FORMAT}" not in metadata.splitlines():
         return True
     return platform == "smartrecruiters" and DESC_MARKER not in text
-
-def location_ok(location, remote, country):
-    """Postings in a configured metro city, or remote postings open
-    to the US.
-
-    remote/country come from structured API fields where the platform
-    has them (None otherwise); the location text is the fallback.
-    """
-    if METRO_RE.search(location):
-        return True
-    if not (remote or REMOTE_RE.search(location)):
-        return False
-    if country:
-        return country.strip().lower() in US_COUNTRIES
-    # No country field: keep bare "Remote" or US-marked text, drop
-    # "Remote - Canada", "Remote (EMEA)", ...
-    rest = REMOTE_RE.sub("", location)
-    return bool(US_RE.search(location)) or not re.search(r"[a-z]", rest, re.I)
 
 def extract_greenhouse_pay(content_html):
     """Parse base salary range from a Greenhouse description.
@@ -330,90 +304,112 @@ def archive_stale(platform, slug, live_names):
         moved += 1
     return moved
 
+def sync_board(board_cfg):
+    """Fetch one boards.json entry, write its passing postings, and
+    archive its files that no longer pass. Returns the number of new
+    postings. Raises on a malformed entry or any fetch/schema failure;
+    the caller skips the board, so nothing of it is archived on
+    incomplete information."""
+    if not isinstance(board_cfg, dict):
+        raise ValueError("entry is not a JSON object")
+    platform, slug = board_cfg.get("platform"), board_cfg.get("slug")
+    if platform not in API_TEMPLATES or not slug:
+        raise ValueError("entry needs a slug and a platform of "
+                         + ", ".join(API_TEMPLATES))
+    company = board_cfg.get("company", slug)
+    data = fetch_board(platform, slug)
+
+    new = rewritten = cut_pay = 0
+    live = set()
+    for (jid, title, location, jurl, pay, lo, hi, remote,
+         country, raw_desc) in flatten(data, platform, slug):
+        location = location or ""
+        if not TITLE_RE.search(title) or TITLE_BLOCK_RE.search(title):
+            continue
+        if not location_ok(location, remote, country):
+            continue
+        # Make structured remote flags visible to the LLM, which
+        # sees only title/employer/location
+        if remote and not REMOTE_RE.search(location):
+            location = f"{location} (Remote)"
+        # Deterministic pay floor: cut only when the RANGE MAX is
+        # below floor (with a $100k floor, a $90k-$110k range clears
+        # the bar; unknown pay stays in and defers to LLM judgment)
+        if lo is not None and hi is not None and hi < PAY_FLOOR:
+            cut_pay += 1
+            continue
+        fname = OUT_DIR / f"{platform}_{jid}.txt"
+        live.add(fname.name)
+        existed = fname.exists()
+        if not needs_write(fname, platform):
+            continue
+        desc = description_text(platform, raw_desc)
+        # SmartRecruiters: description needs one extra request per
+        # posting written. Failure here costs the text, not the
+        # posting: it still writes and ranks, and the detail fetch
+        # is retried next run.
+        if platform == "smartrecruiters" and not desc and jid:
+            try:
+                desc = extract_smartrecruiters_description(
+                    fetch_smartrecruiters_detail(slug, jid))
+            except Exception as e:
+                print(f"    {company}: detail fetch failed for "
+                      f"{jid} ({e}) — written without description")
+                desc = ""
+        loc_line = f"{location} ({pay})" if pay else location
+        with open(fname, "w", encoding="utf-8") as f:
+            f.write("# Metadata\n")
+            f.write(f"Source: {platform}/{slug}\n")
+            f.write(f"Company: {company}\n")
+            f.write(f"URL: {jurl}\n")
+            f.write(f"Title: {title}\n")
+            if pay:
+                f.write(f"Pay: {pay}\n")
+            f.write(f"Format: {FILE_FORMAT}\n")
+            f.write("---\n\n")
+            f.write(f"{title}\n{company}\n{loc_line}\nView\n")
+            # Stored in full for audit/replay; truncation happens
+            # only at prompt time (pass 2), never on disk
+            if desc:
+                f.write(f"\n{DESC_MARKER}\n")
+                f.write(desc + "\n")
+        if existed:
+            rewritten += 1
+        else:
+            new += 1
+    archived = archive_stale(platform, slug, live)
+    print(f"  {company}: {new} new, {rewritten} rewritten, "
+          f"{len(live)} live, {cut_pay} cut by pay floor, "
+          f"{archived} archived")
+    return new
+
 def main():
     if not CONFIG.exists():
         print("No boards.json found — copy boards.example.json and "
               "add your boards.")
-        sys.exit(1)
+        return 1
     OUT_DIR.mkdir(exist_ok=True)
 
     boards = json.loads(CONFIG.read_text(encoding="utf-8"))
-    new_jobs = 0
+    new_jobs = failed = 0
+    # One bad entry or board never stops the others; any failure makes
+    # the exit code non-zero so the scheduled run logs it
     for board_cfg in boards:
-        platform, slug = board_cfg["platform"], board_cfg["slug"]
-        company = board_cfg.get("company", slug)
         try:
-            data = fetch_board(platform, slug)
+            new_jobs += sync_board(board_cfg)
         except Exception as e:
-            print(f"  {company}: FETCH FAILED ({e}) — check slug/platform")
-            continue
-
-        kept = rewritten = cut_pay = 0
-        live = set()
-        for (jid, title, location, jurl, pay, lo, hi, remote,
-             country, raw_desc) in flatten(data, platform, slug):
-            location = location or ""
-            if not TITLE_RE.search(title) or TITLE_BLOCK_RE.search(title):
-                continue
-            if not location_ok(location, remote, country):
-                continue
-            # Make structured remote flags visible to the LLM, which
-            # sees only title/employer/location
-            if remote and not REMOTE_RE.search(location):
-                location = f"{location} (Remote)"
-            # Deterministic pay floor: cut only when the RANGE MAX is
-            # below floor (with a $100k floor, a $90k-$110k range clears
-            # the bar; unknown pay stays in and defers to LLM judgment)
-            if lo is not None and hi is not None and hi < PAY_FLOOR:
-                cut_pay += 1
-                continue
-            fname = OUT_DIR / f"{platform}_{jid}.txt"
-            live.add(fname.name)
-            existed = fname.exists()
-            if not needs_write(fname, platform):
-                continue
-            desc = description_text(platform, raw_desc)
-            # SmartRecruiters: description needs one extra request per
-            # posting written. Failure here costs the text, not the
-            # posting: it still writes and ranks, and the detail fetch
-            # is retried next run.
-            if platform == "smartrecruiters" and not desc and jid:
-                try:
-                    desc = extract_smartrecruiters_description(
-                        fetch_smartrecruiters_detail(slug, jid))
-                except Exception as e:
-                    print(f"    {company}: detail fetch failed for "
-                          f"{jid} ({e}) — written without description")
-                    desc = ""
-            loc_line = f"{location} ({pay})" if pay else location
-            with open(fname, "w", encoding="utf-8") as f:
-                f.write("# Metadata\n")
-                f.write(f"Source: {platform}/{slug}\n")
-                f.write(f"Company: {company}\n")
-                f.write(f"URL: {jurl}\n")
-                f.write(f"Title: {title}\n")
-                if pay:
-                    f.write(f"Pay: {pay}\n")
-                f.write(f"Format: {FILE_FORMAT}\n")
-                f.write("---\n\n")
-                f.write(f"{title}\n{company}\n{loc_line}\nView\n")
-                # Stored in full for audit/replay; truncation happens
-                # only at prompt time (pass 2), never on disk
-                if desc:
-                    f.write(f"\n{DESC_MARKER}\n")
-                    f.write(desc + "\n")
-            if existed:
-                rewritten += 1
-            else:
-                new_jobs += 1
-                kept += 1
-        archived = archive_stale(platform, slug, live)
-        print(f"  {company}: {kept} new, {rewritten} rewritten, "
-              f"{len(live)} live, {cut_pay} cut by pay floor, "
-              f"{archived} archived")
+            name = ((board_cfg.get("company") or board_cfg.get("slug"))
+                    if isinstance(board_cfg, dict) else None)
+            print(f"  {name or repr(board_cfg)}: FAILED ({e}) — check "
+                  f"slug/platform")
+            failed += 1
 
     print(f"\nBoards: wrote {new_jobs} new postings to {OUT_DIR}/")
+    if failed:
+        print(f"[ERROR] {failed} of {len(boards)} board(s) failed.")
+        return 1
+    return 0
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
     
