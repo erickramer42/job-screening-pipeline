@@ -36,7 +36,7 @@ jobs_screen.py   raw/ + raw_boards/     ->  recency + hard filters -> pass 1 -> 
    - **Already applied:** listings in `applied.txt` are cut before ranking and listed in their own shortlist section.
    - **Pass 2:** re-scores the top `rerank_top_n` listings that have a description, in small batches, with an excerpt from the posting's role section added.
 
-`html_text.py` holds the HTML-to-text conversion that ingest and board fetch share. `location_filter.py` holds the search-area rule that board fetch and the screener share.
+`html_text.py` holds the HTML-to-text conversion that ingest and board fetch share. `location_filter.py` holds the search-area rule that board fetch and the screener share. `verdicts.py` reads your verdicts on shortlist rows and scores a run against them (see [Reviewing the shortlist](#reviewing-the-shortlist)).
 
 ## Requirements
 
@@ -95,6 +95,7 @@ Results:
   - Flags come from `score_caps` rules; `capped` means a rule lowered the model's score.
   - With `shortlist_per_employer` set, a line under the table counts the postings left out for that limit.
   - Jobs in `applied.txt` that are still posted are listed after the table.
+  - `feedback/<date>.md` is written alongside, ready for your verdicts.
   - Board rows link straight to the posting. Digest rows have no link, so open the digest email to find them.
 - `out/ranked_<date>.json` holds:
   - every ranked listing with its score and reason. Re-scored ones also carry `pass1_score` and `rescored`; ones matching a cap rule carry `score_cap`, `flags`, and, if lowered, `capped_from`;
@@ -113,15 +114,28 @@ When something fails:
 
 ## Reviewing the shortlist
 
-A short daily loop keeps the ranking honest:
+A short daily loop keeps the ranking honest, and gives it something to be measured against:
 
-1. **Record applications** in `applied.txt`, one per line:
+1. **Give each row a verdict.** With each shortlist, the screener writes `feedback/<date>.md`, one line per row:
+   ```
+   12 [?] Senior Backend Engineer | Acme ::
+   ```
+   - Replace `?` with `y` (would apply), `m` (maybe), `n` (no), or `a` (applied), and add notes after `::`.
+   - Keep `title | employer` as written: it identifies the listing, so a verdict stays valid on later days.
+   - Other lines are free notes, ignored by the parser.
+   - The file is never overwritten, so a rerun the same day keeps what you've filled in. The `feedback/` folder is gitignored.
+2. **Record applications.** An `a` verdict cuts that listing from future rankings. For jobs you applied to outside the shortlist, add a line to `applied.txt`:
    - the posting's URL for a board row;
    - `Title | Employer` for a digest row, since those have no link.
 
-   Lines starting with `#`, and anything after ` #`, are comments. These jobs are skipped when ranking (saving model time) and listed under "Already applied, still posted" while the posting stays up.
-2. **Note what's wrong** with the day's list in `feedback/<date>.md`, by row number: "AI-heavy role scored too high", "needs a clearance", "same company four times". The folder is gitignored.
-3. **Turn repeated notes into rules:**
+   Lines starting with `#`, and anything after ` #`, are comments. Applied jobs are skipped when ranking and listed under "Already applied, still posted" while the posting stays up.
+3. **Measure:** `python verdicts.py` scores the latest run (or `python verdicts.py out/ranked_<date>.json`) against every verdict so far. It reports:
+   - how often the run orders a pair of your verdicts the way you did: 50% is random, 100% is your order;
+   - how many y/m/n listings made the shortlist;
+   - the "yes" listings it missed and the "no" listings it let in.
+
+   Verdicts that shaped a change score that change in-sample; the next days' verdicts show whether it generalizes.
+4. **Turn repeated notes into rules:**
    - A pattern that's mechanical (a title word, a phrase in the posting, an employer) belongs in config: `excluded_title_patterns` to drop it, `score_caps` to limit it, `shortlist_per_employer` for crowding.
    - A judgment call belongs in the ranking prompt.
    - Check a change on the next shortlist, or by running the screener with `OUT_DIR` pointed somewhere else.

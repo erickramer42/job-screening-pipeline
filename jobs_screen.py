@@ -22,6 +22,7 @@ from datetime import date, datetime, timezone
 from email.utils import parsedate_to_datetime
 from pathlib import Path
 
+import verdicts
 from location_filter import location_matcher
 
 CONFIG_FILE = Path("pipeline_config.json")
@@ -136,8 +137,9 @@ SCORE_CAPS = [
 
 # Jobs already applied to (applied_path): one per line, the posting URL,
 # or "Title | Employer" for digest rows, which have no link. "#" starts
-# a comment. They're cut before ranking and listed in their own
-# shortlist section for as long as they're still posted
+# a comment. Rows marked "a" in the feedback files count as well. They're
+# cut before ranking and listed in their own shortlist section for as
+# long as they're still posted
 APPLIED_PATH = Path(CFG.get("applied_path", "applied.txt"))
 
 def load_applied():
@@ -155,6 +157,8 @@ def load_applied():
     return urls, pairs
 
 APPLIED_URLS, APPLIED_PAIRS = load_applied()
+APPLIED_PAIRS |= {key for key, v in verdicts.load_verdicts().items()
+                  if v["verdict"] == "a"}
 
 def parse_metadata_url(lines):
     """URL from the '# Metadata' block, or "" (digest files have none).
@@ -745,8 +749,19 @@ def main():
                         f" · {md_cell(j['location'])} · "
                         f"{j.get('url') or 'digest listing'}\n")
 
+    # Verdict template for the owner (verdicts.py). Never overwritten: a
+    # rerun the same day keeps whatever was already filled in
+    feedback_path = verdicts.FEEDBACK_DIR / f"{stamp}.md"
+    if not feedback_path.exists():
+        verdicts.FEEDBACK_DIR.mkdir(exist_ok=True)
+        feedback_path.write_text(
+            "\n".join(verdicts.template_lines(stamp, rows)) + "\n",
+            encoding="utf-8")
+
     print(f"\nWrote {json_path}")
     print(f"Wrote {md_path} (top {len(rows)} of {len(kept)})")
+    if feedback_path.exists():
+        print(f"Verdicts go in {feedback_path}")
     if failed:
         print(f"[ERROR] {failed} of {n_batches} batches failed; "
               f"shortlist is incomplete.")

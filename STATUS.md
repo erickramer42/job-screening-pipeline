@@ -74,6 +74,14 @@ Quick fixes and score stabilization from a code review.
   - **Measured** on the same data:
     - 15 of the 16 listings the feedback named moved as intended. The exception is a "decent" listing that fell behind two near-identical postings from the same employer.
     - In the top 25, reasons citing agent/LLM work fell from 15 to 2, employers rose from 10 to 16, and digest rows from 2 to 8.
+- **Verdicts (`verdicts.py`):**
+  - The screener writes `feedback/<date>.md` with one `N [?] title | employer ::` line per shortlist row, for a y/m/n/a verdict. It never overwrites an existing file.
+  - `a` verdicts count as applied.
+  - `python verdicts.py` scores a run against all verdicts so far.
+  - The 10-22 notes were converted to verdicts. Scored against them (in-sample, since the changes came from those notes):
+    - pair-ordering agreement rose from 53% to 92%;
+    - "no" rows in the shortlist fell from 6 of 7 to 0;
+    - "yes" rows stayed at 2 of 6. Three of the four misses are hidden by the 2-per-employer limit.
 
 ### Recent Changes (2026-10-10)
 - **Descriptions and recency (new):**
@@ -160,6 +168,7 @@ jobScreensApplications/
 │                                #   LLM ranker -> out/
 ├── html_text.py                 # Shared HTML-to-text conversion (ingest + boards)
 ├── location_filter.py           # Shared search-area rule (boards + digest filter)
+├── verdicts.py                  # Reads shortlist verdicts; scores a run against them
 ├── slug_probe.py                # Finds board slugs for company names
 │                                #   (python slug_probe.py targets.txt)
 ├── pipeline_config.json         # All personal settings (gitignored)
@@ -169,7 +178,7 @@ jobScreensApplications/
 ├── screening_prompt.txt         # System prompt for LLM ranking (gitignored; prompt_path)
 ├── targets.txt                  # Company names to probe (gitignored)
 ├── applied.txt                  # Jobs already applied to (gitignored)
-├── feedback/                    # Daily shortlist notes (gitignored)
+├── feedback/                    # Daily verdict files, feedback/<date>.md (gitignored)
 ├── run_ingest.bat               # Task Scheduler wrappers (gitignored)
 ├── run_screen.bat
 ├── README.md                    # Setup, usage, and config reference
@@ -200,8 +209,9 @@ Review `out/shortlist_<today>.md`:
 - Digest rows need the original email for their "View" links.
 
 Apply manually at company career pages. Afterwards:
-- Add each job you applied to to `applied.txt` (URL, or `Title | Employer` for digest rows).
-- Note what the list got wrong in `feedback/<date>.md`, by row number.
+- Fill in `feedback/<date>.md`: a y/m/n/a verdict per row, with notes after `::`. `a` marks the job as applied.
+- Add jobs applied to outside the shortlist to `applied.txt` (URL, or `Title | Employer` for digest rows).
+- Run `python verdicts.py` after changing the prompt or config, to see whether the ranking moved toward your verdicts.
 - Turn repeated notes into config rules or prompt changes (see README, "Reviewing the shortlist").
 
 Adding boards: put company names in `targets.txt` and run `python slug_probe.py targets.txt`. Check that each VERIFIED board really belongs to that company, then paste the lines into `boards.json`.
