@@ -29,13 +29,40 @@ Setup, usage, and the configuration reference are in [README.md](README.md). Thi
 | Component | Status | Notes |
 |-----------|--------|-------|
 | Email ingest (`job_ingest.py`) | ✅ Operational | Fetches digest emails over IMAP into `raw/job_uid_<UID>.txt`. Read-only (EXAMINE + `BODY.PEEK[]`). |
-| Board fetch (`board_fetch.py`) | ✅ Operational | Pulls `boards.json` companies into `raw_boards/` and filters by title, metro-area/US-remote location, and pay floor. Stores each posting's description (Greenhouse, Ashby, SmartRecruiters; not Lever). Closed postings move to `raw_boards/archive/`; files from an older format are rewritten automatically. |
+| Board fetch (`board_fetch.py`) | ✅ Operational | Pulls `boards.json` companies into `raw_boards/` and filters by title, metro-area/US-remote location, and pay floor. Stores each posting's description (Greenhouse, Ashby, SmartRecruiters; not Lever). Closed postings move to `raw_boards/archive/`. A posting's file is rewritten whenever the posting changes or the file format is older. |
 | Slug discovery (`slug_probe.py`) | ✅ Operational | Guesses board slugs for company names (e.g. `targets.txt`) and prints `boards.json` lines for slugs that return jobs |
 | Job parsing (`jobs_screen.py` parser) | ✅ Operational | Reads title/employer/location quadruples from `raw/` and `raw_boards/`. Keeps one copy per listing (board copy first, then newest digest) and cuts digests older than `recency_days`. |
 | Hard filters | ✅ Operational | Blocks the employers and title patterns listed in `pipeline_config.json` |
 | LLM ranking | ✅ Operational | Pass 1 scores every survivor 0–100 from title/employer/location. Pass 2 re-scores the top `rerank_top_n` listings that have a description, using a role-section excerpt. Thinking is off and the first attempt is greedy, so scores are repeatable; employer score caps are enforced after each pass. Malformed responses are retried; 3 consecutive failed batches stop a pass. |
 | Output generation | ✅ Operational | Produces `out/shortlist_YYYY-MM-DD.md` and JSON. Board rows include direct posting links; ▲ marks pass-2 scores. |
 | Scheduled runs | ✅ Operational | Task Scheduler runs ingest at 01:00 and 05:00, and board fetch + screening at 06:00. Tasks wake the computer, run after a missed start, and the wrappers retry (see [Automation](#automation)). Verified across 2026-10-09 to 10-22, with two misses. On 10-14 no task ran at all, and the missed-start catch-up didn't fire. On 10-22 screening failed all 3 attempts because Ollama wasn't running. Both are open items (see Next Milestones). |
+
+### Recent Changes (2026-10-23)
+- **Ranking prompt, from the 10-23 shortlist review:** Node.js no longer counts as part of the candidate's stack. The model had cited it as a core-stack match on three shortlist rows.
+  - A required Node.js backend is now one gap. A full-stack role that otherwise fits stays in the 60–74 band, below 75+.
+  - A backend role built mainly on Node.js is plausible but flawed. Node.js listed only as a plus doesn't lower a score.
+  - **Measured** in a scratch run on the same input:
+    - The three rows fell from 78–88 to 62–68 and stayed on the shortlist, and no reason credits Node.js as the candidate's skill any more.
+    - A first wording called the requirement a "stretch". It pushed two "yes" rows to 54–55 and off the list, because the prompt uses that word for its 30–54 band.
+    - Ordering agreement with the 10-23 verdicts went from 64% to 61%, and "no" rows on the list from 11 to 7. Both moves are within the noise of re-batching pass 2: listings that don't mention Node.js moved 8.5 points on average there, against 2.3 in pass 1.
+- **First out-of-sample verdicts:**
+  - The 10-23 shortlist was the first scheduled run with the 10-22 changes. It drew 3 "yes", 10 "maybe", 11 "no" and 1 applied.
+  - Ordering agreement was 64%, against 84% in-sample on the 10-22 verdicts.
+  - Most "no" notes name a requirement in the posting text: years of a specialist tool, a required framework, or a niche domain.
+- **Board files follow the posting:**
+  - Board fetch used to write a posting's file once and rewrite it only after a `FILE_FORMAT` bump. On 10-23, 40 of 182 live files no longer matched their posting: 8 titles, 3 locations, 2 pay ranges and 32 descriptions had changed since Oct 10.
+  - Now a file is rewritten whenever its text would change. SmartRecruiters descriptions, which cost a request per posting, are fetched again only when the listing lines change.
+  - Files are written through a temporary file, so an interrupted run can't leave a truncated one.
+  - **Checked** on a scratch copy against the live APIs: the first run rewrote exactly those 40 files (plus 1 new posting) and left the rest byte-identical; a second run rewrote nothing.
+- **Tests:** `python -m unittest` runs a stdlib suite in `tests/` (26 tests): deduplication, applied jobs, batch order, hard filters, score caps, the per-employer limit, and the verdict files. It needs no personal config.
+- **Screener:**
+  - Config, prompt and applied-list loading moved from import time into `main()`, so the module can be imported and tested without personal files.
+  - Checked: with a stand-in model on today's data, the old and new code sent the same 22 requests and wrote byte-identical outputs.
+  - A scratch run now points `OUT_DIR` and the new `TEMPLATE_DIR` at a scratch folder, and still reads the `a` verdicts from `feedback/`.
+  - A missing required config key, a `score_caps` rule with no matcher or no `max_score`, and an invalid `excluded_title_patterns` regex now stop the run at startup with a message naming the problem.
+  - Listing identity is defined once, in `verdicts.py`. An `applied.txt` line whose title contains a pipe used to be split at the first pipe, so that listing was never cut; it's now split like a verdict line, at the last one.
+  - The per-employer limit's "More from" note groups employers regardless of case, as the limit already did.
+- **`verdicts.py`:** ordering agreement compares scores, with equal scores counting half. It used to compare list positions, which break score ties in an arbitrary order. On the same verdicts, the 10-23 run's figure moved by 1 point.
 
 ### Recent Changes (2026-10-22)
 Quick fixes and score stabilization from a code review.
@@ -179,6 +206,7 @@ jobScreensApplications/
 ├── verdicts.py                  # Reads shortlist verdicts; scores a run against them
 ├── slug_probe.py                # Finds board slugs for company names
 │                                #   (python slug_probe.py targets.txt)
+├── tests/                       # unittest suite (python -m unittest)
 ├── pipeline_config.json         # All personal settings (gitignored)
 ├── pipeline_config.example.json # Placeholder config to copy
 ├── boards.json                  # Boards to fetch (gitignored)
@@ -351,7 +379,7 @@ IMAP host, port, STARTTLS, and folder live in `pipeline_config.json`, along with
 Agreed 2026-10-22, in this order:
 
 1. **Collect verdicts for a few days.** Fill in `feedback/<date>.md` each morning. Today's verdicts shaped today's changes, so only later days' verdicts can judge the next change, or the looser absolute-rubric scores, out of sample.
-2. **Tests for what the score cache will rely on:** listing identity, the cache key, and score-cap application. A stale or mis-keyed cache fails silently by serving old scores. This needs config loading moved out of import time first.
+2. **Tests for what the score cache will rely on:** listing identity, the cache key, and score-cap application. A stale or mis-keyed cache fails silently by serving old scores. Done 2026-10-23 for listing identity and score caps, with config loading moved out of import time; the cache-key tests come with the cache. Board files now follow edits to their posting, which the cache's keys depend on.
 3. **Score cache plus per-listing scoring, built together:**
    - A cache filled from batches of 30 would freeze the ~6-point batch-mate effect into every cached score.
    - Per-listing scoring without a cache would mean ~270 requests every morning.
@@ -371,4 +399,4 @@ After that, as needed:
 
 Success metric for automation: zero manual intervention; shortlist present in `out/` by 7:00 AM each weekday.
 
-*Last updated: October 22, 2026*
+*Last updated: October 23, 2026*

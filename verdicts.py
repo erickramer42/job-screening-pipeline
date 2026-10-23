@@ -10,7 +10,8 @@ put notes after "::". The row number is only a convenience; the title
 and employer identify the listing, so verdicts stay valid across runs.
 Lines in any other shape (free notes, headings) are ignored, and a
 later file's verdict on the same listing replaces an earlier one. The
-title/employer split is at the LAST " | ", so a pipe in a title is fine,
+title/employer split is at the LAST unescaped "|" (split_listing, which
+jobs_screen.py uses for applied.txt too), so a pipe in a title is fine,
 and the template puts a backslash before any pipe in an employer name
 so it can't be mistaken for the separator.
 
@@ -37,8 +38,21 @@ LINE_RE = re.compile(r"^\s*(\d+|-)\.?\s*\[([ymna?])\]\s*(.+?)\s*(?:::\s*(.*))?$"
 GRADES = {"y": 2, "m": 1, "n": 0}
 
 def listing_key(title, employer):
-    """Same identity jobs_screen.py deduplicates listings on."""
+    """A listing's identity: jobs_screen.py deduplicates, batches and
+    cuts applied listings on it, and verdicts are stored under it."""
     return (title.strip().lower(), employer.strip().lower())
+
+def split_listing(text):
+    """(title, employer) from "Title | Employer", or None when there's
+    no separator or a side is empty. Splits at the last unescaped "|",
+    so a pipe in a title is fine; a "\\|" in the employer is a literal
+    pipe, as the template writes it."""
+    parts = re.split(r"(?<!\\)\|", text)
+    if len(parts) < 2:
+        return None
+    title = "|".join(parts[:-1]).strip()
+    employer = parts[-1].replace("\\|", "|").strip()
+    return (title, employer) if title and employer else None
 
 def load_verdicts(folder=None):
     """{listing key: {"verdict", "note", "file"}}; unfilled rows (?) are
@@ -48,11 +62,12 @@ def load_verdicts(folder=None):
     for f in sorted(folder.glob("*.md")) if folder.exists() else []:
         for ln in f.read_text(encoding="utf-8").splitlines():
             m = LINE_RE.match(ln)
-            if not m or m.group(2) == "?" or " | " not in m.group(3):
+            if not m or m.group(2) == "?":
                 continue
-            title, employer = m.group(3).rsplit(" | ", 1)
-            employer = employer.replace("\\|", "|")
-            verdicts[listing_key(title, employer)] = {
+            listing = split_listing(m.group(3))
+            if not listing:
+                continue
+            verdicts[listing_key(*listing)] = {
                 "verdict": m.group(2).lower(),
                 "note": (m.group(4) or "").strip(),
                 "file": f.name,
@@ -71,6 +86,21 @@ def template_lines(stamp, rows):
         lines.append(f"{i} [?] {j['title']} | {employer} ::")
     return lines
 
+def ordering_agreement(graded):
+    """(agreeing pairs, pairs) over the pairs of (grade, score) entries
+    with different grades: a pair agrees when the better grade has the
+    higher score, and an equal score counts half. Scores, not list
+    positions: the screener breaks score ties in an arbitrary (hash)
+    order, which says nothing about the model's judgment."""
+    agree = total = 0
+    for i, (g1, s1) in enumerate(graded):
+        for g2, s2 in graded[i + 1:]:
+            if g1 != g2:
+                total += 1
+                hi, lo = (s1, s2) if g1 > g2 else (s2, s1)
+                agree += 1 if hi > lo else 0.5 if hi == lo else 0
+    return agree, total
+
 def evaluate(ranked_path, verdicts):
     """Print how a ranked run treats the listings that have verdicts."""
     data = json.loads(Path(ranked_path).read_text(encoding="utf-8"))
@@ -81,28 +111,21 @@ def evaluate(ranked_path, verdicts):
             for i, j in enumerate(ranked, 1)}
     cut = {listing_key(j["title"], j["employer"]): j["reject_reason"]
            for j in data["rejected"]}
-    bottom = len(ranked) + 1  # a cut listing ranks below every ranked one
+    cut_score = -1  # a cut listing ranks below every ranked one
 
-    seen = []  # (grade, rank, key)
+    seen = []  # (grade, score, key)
     for key, v in verdicts.items():
         if v["verdict"] in GRADES and (key in rank or key in cut):
             seen.append((GRADES[v["verdict"]],
-                         rank[key][0] if key in rank else bottom, key))
+                         rank[key][1]["score"] if key in rank else cut_score,
+                         key))
     applied = sum(v["verdict"] == "a" for v in verdicts.values())
     print(f"{ranked_path}: {len(verdicts)} verdicts, {len(seen)} on listings "
           f"in this run ({applied} applied, not ranked)")
     if not seen:
         return
 
-    # Ordering agreement: over pairs with different verdicts, the share
-    # where the better verdict ranks higher (ties count half)
-    agree = total = 0
-    for i, (g1, r1, _) in enumerate(seen):
-        for g2, r2, _ in seen[i + 1:]:
-            if g1 != g2:
-                total += 1
-                hi, lo = (r1, r2) if g1 > g2 else (r2, r1)
-                agree += 1 if hi < lo else 0.5 if hi == lo else 0
+    agree, total = ordering_agreement([(g, s) for g, s, _ in seen])
     if total:
         print(f"ordering agreement: {agree / total:.0%} of {total} pairs "
               f"(50% is random, 100% is your order)")

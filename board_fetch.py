@@ -12,22 +12,24 @@ for Greenhouse and extract the range. Verified live 2026-10-10.
 Descriptions: stored below a '--- DESCRIPTION ---' marker after the
 'View' line. The screener stops quadruple parsing at that marker, so
 description prose can never be misread as a listing. Text conversion
-(html_text.py) runs only for postings that are about to be written.
+(html_text.py) runs for every posting that passes the filters.
   - Greenhouse: 'content' is HTML-escaped HTML: decoded once to get
     the markup, then html_to_text
   - Ashby: 'descriptionPlain'  (verified live 2026-10-10)
   - SmartRecruiters: not in the list response (verified 2026-10-10);
-    fetched per passing posting from the detail endpoint
-    jobAd.sections.{jobDescription,qualifications}
+    fetched from the detail endpoint jobAd.sections.{jobDescription,
+    qualifications}, one request per posting, so only when the
+    posting's listing lines changed or its file has no description
   - Lever: no boards in use; captures "" until the day one is added
     and its schema is probed
 
-Files carry a 'Format:' line. A file from an older format is rewritten
-on the next run, and so is a SmartRecruiters file whose detail fetch
-failed, so improvements and retries reach postings already on disk.
+Each posting's file is rewritten whenever its text would change: the
+employer edited the posting, FILE_FORMAT was bumped (files carry a
+'Format:' line), or a SmartRecruiters detail fetch failed last time.
 """
 import html as html_mod
 import json
+import os
 import re
 import sys
 import urllib.request
@@ -44,9 +46,10 @@ ARCHIVE_DIR = OUT_DIR / "archive"
 ANNUALIZE = {"1 YEAR": 1, "1 HOUR": 2080}
 # Same marker jobs_screen.py stops quadruple parsing at
 DESC_MARKER = "--- DESCRIPTION ---"
-# Bump when the file layout or description text changes; older files
-# are rewritten on the next run. 2: line-preserving text, entities
-# decoded after tag stripping
+# Bump when the file layout or description text changes. The Format
+# line is part of every file, so each one is then rewritten on the next
+# run, SmartRecruiters descriptions included. 2: line-preserving text,
+# entities decoded after tag stripping
 FILE_FORMAT = 2
 
 API_TEMPLATES = {
@@ -171,17 +174,30 @@ def description_text(platform, raw):
         return html_to_text(html_mod.unescape(raw))
     return normalize_text(raw)
 
-def needs_write(fname, platform):
-    """True for a new posting, a file from an older FILE_FORMAT, or a
-    SmartRecruiters file without a description (its detail fetch
-    failed last time, so it is retried)."""
-    if not fname.exists():
-        return True
-    text = fname.read_text(encoding="utf-8", errors="replace")
-    metadata = text.split("\n---\n", 1)[0]
-    if f"Format: {FILE_FORMAT}" not in metadata.splitlines():
-        return True
-    return platform == "smartrecruiters" and DESC_MARKER not in text
+def record_text(platform, slug, company, url, title, pay, loc_line, desc):
+    """A posting file's full text: metadata, the title / company /
+    location / View quadruple, then the description, if any."""
+    lines = ["# Metadata", f"Source: {platform}/{slug}",
+             f"Company: {company}", f"URL: {url}", f"Title: {title}"]
+    if pay:
+        lines.append(f"Pay: {pay}")
+    lines += [f"Format: {FILE_FORMAT}", "---", "",
+              title, company, loc_line, "View"]
+    text = "\n".join(lines) + "\n"
+    # Stored in full for audit/replay; truncation happens only at
+    # prompt time (pass 2), never on disk
+    if desc:
+        text += f"\n{DESC_MARKER}\n{desc}\n"
+    return text
+
+def write_atomic(path, text):
+    """Write through a temporary file, so an interrupted run leaves the
+    old file or the new one, never a truncated one. The .tmp name
+    matches no glob the pipeline reads."""
+    tmp = path.with_name(path.name + ".tmp")
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write(text)
+    os.replace(tmp, path)
 
 def extract_greenhouse_pay(content_html):
     """Parse base salary range from a Greenhouse description.
@@ -214,9 +230,9 @@ def flatten(board, platform, slug):
     pay_str, pay_min, pay_max, remote, country, raw_description).
     remote/country are None when the platform doesn't expose them.
     raw_description is unconverted (see description_text) or "";
-    main() converts it only for postings that pass the filters and
-    need writing. SmartRecruiters descriptions are fetched there too,
-    so detail calls happen only for postings that will be written."""
+    sync_board() converts it only for postings that pass the filters.
+    SmartRecruiters descriptions are fetched there too, only when they
+    may have changed (see sync_board)."""
     jobs = []
     if platform == "greenhouse":
         for j in board.get("jobs", []):
@@ -340,43 +356,38 @@ def sync_board(board_cfg):
             continue
         fname = OUT_DIR / f"{platform}_{jid}.txt"
         live.add(fname.name)
-        existed = fname.exists()
-        if not needs_write(fname, platform):
-            continue
-        desc = description_text(platform, raw_desc)
-        # SmartRecruiters: description needs one extra request per
-        # posting written. Failure here costs the text, not the
-        # posting: it still writes and ranks, and the detail fetch
-        # is retried next run.
-        if platform == "smartrecruiters" and not desc and jid:
-            try:
-                desc = extract_smartrecruiters_description(
-                    fetch_smartrecruiters_detail(slug, jid))
-            except Exception as e:
-                print(f"    {company}: detail fetch failed for "
-                      f"{jid} ({e}) — written without description")
-                desc = ""
+        old = (fname.read_text(encoding="utf-8", errors="replace")
+               if fname.exists() else None)
         loc_line = f"{location} ({pay})" if pay else location
-        with open(fname, "w", encoding="utf-8") as f:
-            f.write("# Metadata\n")
-            f.write(f"Source: {platform}/{slug}\n")
-            f.write(f"Company: {company}\n")
-            f.write(f"URL: {jurl}\n")
-            f.write(f"Title: {title}\n")
-            if pay:
-                f.write(f"Pay: {pay}\n")
-            f.write(f"Format: {FILE_FORMAT}\n")
-            f.write("---\n\n")
-            f.write(f"{title}\n{company}\n{loc_line}\nView\n")
-            # Stored in full for audit/replay; truncation happens
-            # only at prompt time (pass 2), never on disk
-            if desc:
-                f.write(f"\n{DESC_MARKER}\n")
-                f.write(desc + "\n")
-        if existed:
-            rewritten += 1
+        if platform == "smartrecruiters":
+            # The description costs one detail request per posting, so
+            # the stored one is kept while the listing lines are
+            # unchanged. A file without one (its fetch failed) retries.
+            # A failed fetch costs the text, not the posting: it still
+            # writes and ranks.
+            head = record_text(platform, slug, company, jurl, title, pay,
+                               loc_line, "")
+            old_head, _, old_desc = (old or "").partition(
+                f"\n{DESC_MARKER}\n")
+            desc = old_desc.removesuffix("\n") if old_head == head else ""
+            if not desc and jid:
+                try:
+                    desc = extract_smartrecruiters_description(
+                        fetch_smartrecruiters_detail(slug, jid))
+                except Exception as e:
+                    print(f"    {company}: detail fetch failed for "
+                          f"{jid} ({e}) — written without description")
         else:
+            desc = description_text(platform, raw_desc)
+        text = record_text(platform, slug, company, jurl, title, pay,
+                           loc_line, desc)
+        if text == old:
+            continue
+        write_atomic(fname, text)
+        if old is None:
             new += 1
+        else:
+            rewritten += 1
     archived = archive_stale(platform, slug, live)
     print(f"  {company}: {new} new, {rewritten} rewritten, "
           f"{len(live)} live, {cut_pay} cut by pay floor, "

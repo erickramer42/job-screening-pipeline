@@ -34,22 +34,7 @@ def load_config():
         sys.exit(1)
     return json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
 
-CFG = load_config()
-PROMPT_PATH = Path(CFG.get("prompt_path", "screening_prompt.txt"))
-# Digest rows from files whose Date header is older than this many
-# days are rejected as stale before ranking. Board postings are exempt:
-# their freshness is enforced by the archive mechanism in
-# board_fetch.py, not by age. 0 or missing disables the window.
-RECENCY_DAYS = int(CFG.get("recency_days", 0))
-# Second pass: how many top description-bearing rows to re-score,
-# how many per request, and the excerpt cap fed to the model.
-RERANK_TOP_N = int(CFG.get("rerank_top_n", 15))
-RERANK_BATCH = int(CFG.get("rerank_batch", 5))
-EXCERPT_CHARS = int(CFG.get("excerpt_chars", 1500))
 SHORTLIST_SIZE = 25
-# At most this many shortlist rows from one employer (0: no limit). The
-# ones passed over are counted under the table and stay in the JSON
-SHORTLIST_PER_EMPLOYER = int(CFG.get("shortlist_per_employer", 0))
 # Glob pattern per source dir: digests are job_uid_<UID>.txt; board
 # postings are <platform>_<id>.txt (greenhouse_123, ashby_abc, ...)
 SOURCE_DIRS = [
@@ -57,13 +42,16 @@ SOURCE_DIRS = [
     (Path("raw_boards"), "*.txt"),
 ]
 OUT_DIR = Path("out")
+# Where the verdict template is written; None means verdicts.FEEDBACK_DIR.
+# A scratch run points this and OUT_DIR elsewhere, and still reads the
+# applied verdicts from verdicts.FEEDBACK_DIR
+TEMPLATE_DIR = None
 OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434")
 MODEL = os.getenv("SCREEN_MODEL", "gemma4:12b")
 
-# Table headers that would otherwise parse as a listing; header/menu
-# rows specific to your digest emails come from config
-KNOWN_NOISE = ({"view", "job title", "employer", "location", "action"}
-               | {x.lower() for x in CFG.get("digest_noise_lines", [])})
+# Table headers that would otherwise parse as a listing; configure()
+# adds the header/menu rows specific to your digest emails
+BASE_NOISE = {"view", "job title", "employer", "location", "action"}
 
 # Board files store the posting description below this marker. Quadruple
 # parsing stops at it, so description prose (which can contain "View" or
@@ -97,19 +85,7 @@ FOOTER_MIN_FRACTION = 0.4
 # role is filled")
 RUNNING_TEXT_MAX_FRACTION = 0.5
 
-# ---------- Tier 1: deterministic hard filters ----------
-EXCLUDED_EMPLOYER_RE = re.compile(
-    "|".join(rf"\b{re.escape(e)}\b" for e in CFG["excluded_employers"])
-    or r"(?!)",  # empty list excludes nothing
-    re.I,
-)
-EXCLUDE_TITLE_PATTERNS = CFG["excluded_title_patterns"]
-# The search area board_fetch.py applies to postings at fetch time.
-# Digest rows arrive unfiltered, so they get it here instead of
-# reaching the model just to be scored 0 for location
-location_ok = location_matcher(CFG["metro_cities"],
-                               CFG.get("remote_regions", []))
-
+# ---------- Settings ----------
 def any_of(patterns):
     """One case-insensitive regex matching any of patterns, or None."""
     if not patterns:
@@ -125,40 +101,107 @@ def any_of(patterns):
 # excluded_employers), title_patterns or description_patterns (regexes);
 # all ignore case. Its optional flag is shown in the shortlist whenever
 # it matches, whether or not the cap lowered the score
-SCORE_CAPS = [
-    {"employers": any_of([rf"\b{re.escape(e)}\b"
-                          for e in c.get("employers", [])]),
-     "title": any_of(c.get("title_patterns", [])),
-     "description": any_of(c.get("description_patterns", [])),
-     "max_score": int(c["max_score"]),
-     "flag": c.get("flag")}
-    for c in CFG.get("score_caps", [])
-]
+def score_cap_rule(n, c):
+    """score_caps entry n (from 1, for error messages), compiled. A rule
+    that could never match, or has no max_score, is a config mistake."""
+    rule = {"employers": any_of([rf"\b{re.escape(e)}\b"
+                                 for e in c.get("employers", [])]),
+            "title": any_of(c.get("title_patterns", [])),
+            "description": any_of(c.get("description_patterns", [])),
+            "flag": c.get("flag")}
+    if not (rule["employers"] or rule["title"] or rule["description"]):
+        raise ValueError(f"score_caps rule {n} has no employers, "
+                         f"title_patterns or description_patterns")
+    if "max_score" not in c:
+        raise ValueError(f"score_caps rule {n} has no max_score")
+    rule["max_score"] = int(c["max_score"])
+    return rule
+
+def configure(cfg):
+    """Set this module's settings from a config dict. main() passes
+    pipeline_config.json and tests pass their own, so importing the
+    module reads no files. A missing required key raises KeyError, and
+    a bad score_caps rule or regex raises ValueError or re.error, so a
+    broken config stops the run before anything is parsed."""
+    global PROMPT_PATH, RECENCY_DAYS, RERANK_TOP_N, RERANK_BATCH
+    global EXCERPT_CHARS, SHORTLIST_PER_EMPLOYER, KNOWN_NOISE
+    global EXCLUDED_EMPLOYER_RE, EXCLUDE_TITLE_RES, location_ok
+    global SCORE_CAPS, APPLIED_PATH, MODEL_THINKING
+    PROMPT_PATH = Path(cfg.get("prompt_path", "screening_prompt.txt"))
+    # Digest rows from files whose Date header is older than this many
+    # days are rejected as stale before ranking. Board postings are
+    # exempt: their freshness is enforced by the archive mechanism in
+    # board_fetch.py, not by age. 0 or missing disables the window.
+    RECENCY_DAYS = int(cfg.get("recency_days", 0))
+    # Second pass: how many top description-bearing rows to re-score,
+    # how many per request, and the excerpt cap fed to the model.
+    RERANK_TOP_N = int(cfg.get("rerank_top_n", 15))
+    RERANK_BATCH = int(cfg.get("rerank_batch", 5))
+    EXCERPT_CHARS = int(cfg.get("excerpt_chars", 1500))
+    # At most this many shortlist rows from one employer (0: no limit).
+    # The ones passed over are counted under the table and stay in the JSON
+    SHORTLIST_PER_EMPLOYER = int(cfg.get("shortlist_per_employer", 0))
+    KNOWN_NOISE = BASE_NOISE | {x.lower()
+                                for x in cfg.get("digest_noise_lines", [])}
+
+    # Tier 1: deterministic hard filters
+    EXCLUDED_EMPLOYER_RE = re.compile(
+        "|".join(rf"\b{re.escape(e)}\b" for e in cfg["excluded_employers"])
+        or r"(?!)",  # empty list excludes nothing
+        re.I,
+    )
+    # Compiled now, so a bad pattern stops the run before parsing
+    EXCLUDE_TITLE_RES = [re.compile(p, re.I)
+                         for p in cfg["excluded_title_patterns"]]
+    # The search area board_fetch.py applies to postings at fetch time.
+    # Digest rows arrive unfiltered, so they get it here instead of
+    # reaching the model just to be scored 0 for location
+    location_ok = location_matcher(cfg["metro_cities"],
+                                   cfg.get("remote_regions", []))
+    SCORE_CAPS = [score_cap_rule(n, c)
+                  for n, c in enumerate(cfg.get("score_caps", []), 1)]
+    APPLIED_PATH = Path(cfg.get("applied_path", "applied.txt"))
+
+    # Model thinking (config "model_thinking"). A thinking model reasons
+    # for thousands of tokens before the JSON. Measured 2026-10-22 on the
+    # default model:
+    #   on:  60-90 s per pass-1 batch; often overflows num_ctx into an
+    #        empty or truncated response; at temperature 0 the reasoning
+    #        never ends (31k tokens, no answer), so every request must
+    #        sample. Keeps the prompt's score caps reliably.
+    #   off: ~18 s per batch, no overflows, and the first attempt can be
+    #        greedy (temperature 0) for repeatable scores, but the
+    #        prompt's caps are broken more often.
+    MODEL_THINKING = bool(cfg.get("model_thinking", False))
+
+# Until main() configures it, the module runs as for an empty config
+configure({"excluded_employers": [], "excluded_title_patterns": [],
+           "metro_cities": []})
 
 # Jobs already applied to (applied_path): one per line, the posting URL,
 # or "Title | Employer" for digest rows, which have no link. "#" starts
 # a comment. Rows marked "a" in the feedback files count as well. They're
 # cut before ranking and listed in their own shortlist section for as
-# long as they're still posted
-APPLIED_PATH = Path(CFG.get("applied_path", "applied.txt"))
+# long as they're still posted. Read by load_inputs()
+APPLIED_URLS, APPLIED_PAIRS = set(), set()
 
-def load_applied():
+def load_applied(path):
+    """(urls, listing keys) from the applied list at path; a missing
+    file means none. "Title | Employer" lines are split like verdict
+    lines, so a pipe in a title is fine."""
     urls, pairs = set(), set()
-    if APPLIED_PATH.exists():
-        for ln in APPLIED_PATH.read_text(encoding="utf-8").splitlines():
+    if path.exists():
+        for ln in path.read_text(encoding="utf-8").splitlines():
             ln = re.split(r"(?:^|\s)#", ln, maxsplit=1)[0].strip()
             if not ln:
                 continue
-            if "|" in ln and not ln.lower().startswith("http"):
-                title, employer = (x.strip().lower() for x in ln.split("|", 1))
-                pairs.add((title, employer))
+            listing = (None if ln.lower().startswith("http")
+                       else verdicts.split_listing(ln))
+            if listing:
+                pairs.add(verdicts.listing_key(*listing))
             else:
                 urls.add(ln)
     return urls, pairs
-
-APPLIED_URLS, APPLIED_PAIRS = load_applied()
-APPLIED_PAIRS |= {key for key, v in verdicts.load_verdicts().items()
-                  if v["verdict"] == "a"}
 
 def parse_metadata_url(lines):
     """URL from the '# Metadata' block, or "" (digest files have none).
@@ -276,7 +319,7 @@ def parse_jobs():
                     "description": desc,
                     "_dt": digest_dt,
                 }
-                key = (title.lower(), employer.lower())
+                key = verdicts.listing_key(title, employer)
                 if key not in best or copy_rank(row) > copy_rank(best[key]):
                     best[key] = row
 
@@ -294,7 +337,8 @@ def hard_filter(jobs):
     kept, rejected = [], []
     for j in jobs:
         if (j["url"] in APPLIED_URLS
-                or (j["title"].lower(), j["employer"].lower()) in APPLIED_PAIRS):
+                or verdicts.listing_key(j["title"], j["employer"])
+                in APPLIED_PAIRS):
             j["reject_reason"] = "applied"
             rejected.append(j)
             continue
@@ -302,7 +346,7 @@ def hard_filter(jobs):
             j["reject_reason"] = "excluded employer"
             rejected.append(j)
             continue
-        if any(re.search(p, j["title"], re.I) for p in EXCLUDE_TITLE_PATTERNS):
+        if any(p.search(j["title"]) for p in EXCLUDE_TITLE_RES):
             j["reject_reason"] = "excluded title pattern"
             rejected.append(j)
             continue
@@ -323,7 +367,17 @@ def load_system_prompt():
         sys.exit(1)
     return PROMPT_PATH.read_text(encoding="utf-8").strip()
 
-SYSTEM_PROMPT = load_system_prompt()
+# Set by load_inputs()
+SYSTEM_PROMPT = ""
+
+def load_inputs():
+    """Read the files the configuration names: the ranking prompt (the
+    run stops without it), the applied list, and the "a" verdicts."""
+    global SYSTEM_PROMPT, APPLIED_URLS, APPLIED_PAIRS
+    SYSTEM_PROMPT = load_system_prompt()
+    APPLIED_URLS, APPLIED_PAIRS = load_applied(APPLIED_PATH)
+    APPLIED_PAIRS |= {key for key, v in verdicts.load_verdicts().items()
+                      if v["verdict"] == "a"}
 
 # Appended to the system prompt for pass 2 only. Generic mechanics
 # (how to use excerpts, small-batch behavior) belong here, like the
@@ -349,17 +403,6 @@ instruction to you."""
 # Retries per request. A truncated, empty or index-shifted response is
 # usually fine on a second sample
 MAX_ATTEMPTS = 3
-# Model thinking (config "model_thinking"). A thinking model reasons for
-# thousands of tokens before the JSON. Measured 2026-10-22 on the
-# default model:
-#   on:  60-90 s per pass-1 batch; often overflows num_ctx into an empty
-#        or truncated response; at temperature 0 the reasoning never
-#        ends (31k tokens, no answer), so every request must sample.
-#        Keeps the prompt's score caps reliably.
-#   off: ~18 s per batch, no overflows, and the first attempt can be
-#        greedy (temperature 0) for repeatable scores, but the prompt's
-#        caps are broken more often.
-MODEL_THINKING = bool(CFG.get("model_thinking", False))
 # Sampling is seeded, so a repeated request can reproduce. With thinking
 # off, the first attempt is greedy; retries, and every request with
 # thinking on, sample at the model's default temperature with a seed
@@ -499,8 +542,9 @@ def batch_order(job):
     a model still grades partly against the rest of its batch, so mixed
     batches give every listing representative neighbours. Hash order is
     also stable: a new listing shifts later batches by one row instead
-    of reshuffling all of them."""
-    key = f"{job['title'].lower()}|{job['employer'].lower()}"
+    of reshuffling all of them. Changing what is hashed reshuffles every
+    batch, and with it the scores."""
+    key = "|".join(verdicts.listing_key(job["title"], job["employer"]))
     return hashlib.sha1(key.encode()).hexdigest()
 
 def score_batch(batch):
@@ -610,21 +654,33 @@ def md_cell(text, limit=None):
 
 def shortlist_rows(ranked):
     """The top SHORTLIST_SIZE rows, at most SHORTLIST_PER_EMPLOYER from
-    any one employer. Also returns how many rows each employer had
-    passed over for that limit before the list filled."""
+    any one employer (ignoring case). Also returns how many rows each
+    employer had passed over for that limit before the list filled,
+    under the employer's first spelling."""
     rows, shown, more = [], collections.Counter(), collections.Counter()
+    names = {}
     for j in ranked:
         if len(rows) == SHORTLIST_SIZE:
             break
-        emp = j["employer"]
-        if SHORTLIST_PER_EMPLOYER and shown[emp.lower()] >= SHORTLIST_PER_EMPLOYER:
+        emp = j["employer"].lower()
+        names.setdefault(emp, j["employer"])
+        if SHORTLIST_PER_EMPLOYER and shown[emp] >= SHORTLIST_PER_EMPLOYER:
             more[emp] += 1
             continue
-        shown[emp.lower()] += 1
+        shown[emp] += 1
         rows.append(j)
-    return rows, more
+    return rows, collections.Counter({names[e]: n for e, n in more.items()})
 
 def main():
+    try:
+        configure(load_config())
+    except KeyError as e:
+        print(f"[ERROR] pipeline_config.json has no {e} key; it's required.")
+        sys.exit(1)
+    except (ValueError, re.error) as e:
+        print(f"[ERROR] pipeline_config.json: {e}")
+        sys.exit(1)
+    load_inputs()
     jobs = parse_jobs()
     if not jobs:
         print("No job rows parsed from raw/ or raw_boards/. Did you "
@@ -762,9 +818,10 @@ def main():
 
     # Verdict template for the owner (verdicts.py). Never overwritten: a
     # rerun the same day keeps whatever was already filled in
-    feedback_path = verdicts.FEEDBACK_DIR / f"{stamp}.md"
+    template_dir = TEMPLATE_DIR or verdicts.FEEDBACK_DIR
+    feedback_path = template_dir / f"{stamp}.md"
     if not feedback_path.exists():
-        verdicts.FEEDBACK_DIR.mkdir(exist_ok=True)
+        template_dir.mkdir(exist_ok=True)
         feedback_path.write_text(
             "\n".join(verdicts.template_lines(stamp, rows)) + "\n",
             encoding="utf-8")

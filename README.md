@@ -20,7 +20,7 @@ jobs_screen.py   raw/ + raw_boards/     ->  recency + hard filters -> pass 1 -> 
 2. **Board fetch** pulls each configured board and keeps postings whose titles match your patterns and whose location is in your metro area or remote within the US.
    - It drops postings whose published pay range tops out below your floor. Postings that close or stop passing the filters move to `raw_boards/archive/`.
    - Each posting's description is stored below the listing: from Greenhouse, Ashby and SmartRecruiters, but not yet Lever.
-   - Files written by an older version of the script are rewritten on the next run.
+   - A posting's file is rewritten whenever its text would change: the employer edited the title, location, pay or description, or the file was written by an older version of the script. SmartRecruiters descriptions cost a request per posting, so they're fetched again only when the listing lines change. Files are written through a temporary file, so an interrupted run never leaves a truncated one.
 3. **Screen** reads both folders and cuts excluded employers and title patterns. It also cuts digest listings outside your area, using the same metro-or-US-remote rule that board fetch applies to postings.
    - **Duplicates and staleness:** a listing that appears in several files is kept once. The board copy (with link, pay and description) is preferred, otherwise the newest digest copy. A digest listing whose newest copy is older than `recency_days` is cut as stale.
    - **Pass 1:** sends the survivors to Ollama in batches of 30. The model scores each one 0–100 from its title, employer, and location.
@@ -87,7 +87,10 @@ Your personal files are gitignored: `pipeline_config.json`, `boards.json`, `scre
 python job_ingest.py     # save new digest emails to raw/
 python board_fetch.py    # refresh raw_boards/ from boards.json
 python jobs_screen.py    # filter, rank, and write out/
+python -m unittest       # run the tests
 ```
+
+The tests use the standard library's `unittest` and live in `tests/`. They cover listing identity (deduplication, applied jobs, batch order), score caps, the per-employer limit, and the verdict files. They write their fixtures to a temporary folder and need no personal config.
 
 Results:
 - `out/shortlist_<date>.md` is the top 25 as a table of score, flags, title, employer, location, link, and the model's one-line reason.
@@ -128,9 +131,9 @@ A short daily loop keeps the ranking honest, and gives it something to be measur
    - the posting's URL for a board row;
    - `Title | Employer` for a digest row, since those have no link.
 
-   Lines starting with `#`, and anything after ` #`, are comments. Applied jobs are skipped when ranking and listed under "Already applied, still posted" while the posting stays up.
+   Lines starting with `#`, and anything after ` #`, are comments. A `Title | Employer` line is split at the last pipe, so a title that contains one is fine. Applied jobs are skipped when ranking and listed under "Already applied, still posted" while the posting stays up.
 3. **Measure:** `python verdicts.py` scores the latest run (or `python verdicts.py out/ranked_<date>.json`) against every verdict so far. It reports:
-   - how often the run orders a pair of your verdicts the way you did: 50% is random, 100% is your order;
+   - how often the run's scores order a pair of your verdicts the way you did, with equal scores counting half: 50% is random, 100% is your order;
    - how many y/m/n listings made the shortlist;
    - the "yes" listings it missed and the "no" listings it let in.
 
@@ -138,7 +141,7 @@ A short daily loop keeps the ranking honest, and gives it something to be measur
 4. **Turn repeated notes into rules:**
    - A pattern that's mechanical (a title word, a phrase in the posting, an employer) belongs in config: `excluded_title_patterns` to drop it, `score_caps` to limit it, `shortlist_per_employer` for crowding.
    - A judgment call belongs in the ranking prompt.
-   - Check a change on the next shortlist, or by running the screener with `OUT_DIR` pointed somewhere else.
+   - Check a change on the next shortlist, or with a scratch run: import `jobs_screen`, point `jobs_screen.OUT_DIR` and `jobs_screen.TEMPLATE_DIR` (where the verdict template goes) at a scratch folder, and call `jobs_screen.main()`. A scratch run still reads your `a` verdicts from `feedback/`, so applied jobs are cut as in a real run.
 
 ## Scheduled runs (Windows)
 
@@ -230,7 +233,7 @@ The pass-2 excerpt starts at the posting's role section: a heading such as "What
 - `title_patterns`: regular expressions searched in the title;
 - `description_patterns`: regular expressions searched in the stored posting text, so they apply to board postings only.
 
-A rule matches a listing when any of its lists matches, and a listing that matches several rules gets the lowest cap. An optional `flag` names the rule in the shortlist's Flags column whenever it matches, even if the score was already under the cap. Patterns ignore case and, like other regexes in JSON, need doubled backslashes.
+A rule matches a listing when any of its lists matches, and a listing that matches several rules gets the lowest cap. A rule without a `max_score`, or with none of the three lists, stops the screener at startup, as does an invalid regular expression here or in `excluded_title_patterns`. An optional `flag` names the rule in the shortlist's Flags column whenever it matches, even if the score was already under the cap. Patterns ignore case and, like other regexes in JSON, need doubled backslashes.
 
 ```json
 "score_caps": [
