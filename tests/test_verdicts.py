@@ -2,9 +2,13 @@
 the template round trip, and ordering agreement. Run from the repo root
 with: python -m unittest
 """
+import contextlib
+import io
+import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import verdicts
 
@@ -62,6 +66,60 @@ class FeedbackFiles(unittest.TestCase):
         self.assertEqual(loaded[("senior engineer", "acme")]["verdict"], "y")
         self.assertEqual(loaded[("senior engineer", "acme")]["note"],
                          "second look")
+
+    def test_combined_flags(self):
+        (self.folder / "2026-01-01.md").write_text(
+            "1 [m,a] Senior Engineer | Acme :: maybe, applied anyway\n"
+            "2 [a] Data Engineer | Beta ::\n"
+            "3 [ Y , A ] Lead Engineer | Gamma ::\n"
+            "4 [n] Staff Engineer | Delta ::\n", encoding="utf-8")
+        loaded = verdicts.load_verdicts(self.folder)
+        self.assertEqual({k[1]: (v["verdict"], v["applied"])
+                          for k, v in loaded.items()},
+                         {"acme": ("m", True), "beta": (None, True),
+                          "gamma": ("y", True), "delta": ("n", False)})
+
+    def test_unreadable_flags_are_reported_not_dropped_silently(self):
+        (self.folder / "2026-01-01.md").write_text(
+            "1 [y,n] Senior Engineer | Acme ::\n"
+            "2 [x] Data Engineer | Beta ::\n"
+            "3 [m] Lead Engineer | Gamma ::\n", encoding="utf-8")
+        with mock.patch("builtins.print") as printed:
+            loaded = verdicts.load_verdicts(self.folder)
+        self.assertEqual(list(loaded), [("lead engineer", "gamma")])
+        warnings = [c.args[0] for c in printed.call_args_list]
+        self.assertEqual(len(warnings), 2)
+        self.assertTrue(all(":1:" in w or ":2:" in w for w in warnings))
+
+    def test_parse_flags(self):
+        self.assertEqual(verdicts.parse_flags("m,a"), ("m", True))
+        self.assertEqual(verdicts.parse_flags("a"), (None, True))
+        self.assertIsNone(verdicts.parse_flags("?"))
+        self.assertIsNone(verdicts.parse_flags(" "))
+        for bad in ("y,n", "x", "m,b"):
+            with self.subTest(flags=bad), self.assertRaises(ValueError):
+                verdicts.parse_flags(bad)
+
+class Evaluate(unittest.TestCase):
+    def test_listings_cut_as_applied_are_left_out(self):
+        run = {"ranked": [{"title": "Data Engineer", "employer": "Beta",
+                           "score": 50, "shortlist_rank": 1}],
+               "rejected": [{"title": "Senior Engineer", "employer": "Acme",
+                             "reject_reason": "applied"}]}
+        v = {("senior engineer", "acme"): {"verdict": "y", "applied": True,
+                                           "note": "", "file": "f"},
+             ("data engineer", "beta"): {"verdict": "n", "applied": False,
+                                         "note": "", "file": "f"}}
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "ranked.json"
+            path.write_text(json.dumps(run), encoding="utf-8")
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                verdicts.evaluate(path, v)
+        # Only the ranked "n" listing counts, so there's no pair to order
+        self.assertIn("1 on listings in this run (1 marked applied)",
+                      out.getvalue())
+        self.assertNotIn("ordering agreement", out.getvalue())
 
 class OrderingAgreement(unittest.TestCase):
     def test_better_verdict_with_higher_score_agrees(self):

@@ -131,6 +131,19 @@ class ListingIdentity(SourceFiles):
         self.assertEqual([j["title"] for j in kept], ["Lead"])
         self.assertEqual({j["reject_reason"] for j in rejected}, {"applied"})
 
+    def test_applied_flag_in_a_feedback_file_cuts_the_listing(self):
+        feedback = self.root / "feedback"
+        feedback.mkdir()
+        (feedback / "2026-01-01.md").write_text(
+            "1 [m,a] Senior Engineer | Acme ::\n", encoding="utf-8")
+        prompt = self.root / "prompt.txt"
+        prompt.write_text("Rank jobs.", encoding="utf-8")
+        js.configure({**CONFIG, "prompt_path": str(prompt),
+                      "applied_path": str(self.root / "none.txt")})
+        with mock.patch.object(js.verdicts, "FEEDBACK_DIR", feedback):
+            js.load_inputs()
+        self.assertIn(("senior engineer", "acme"), js.APPLIED_PAIRS)
+
     def test_hard_filters(self):
         rows = [
             {"title": "Senior Engineer", "employer": "Excluded Co Inc",

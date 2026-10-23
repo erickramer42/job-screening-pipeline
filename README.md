@@ -135,11 +135,13 @@ A short daily loop keeps the ranking honest, and gives it something to be measur
    ```
    12 [?] Senior Backend Engineer | Acme ::
    ```
-   - Replace `?` with `y` (would apply), `m` (maybe), `n` (no), or `a` (applied), and add notes after `::`.
+   - Replace `?` with `y` (would apply), `m` (maybe) or `n` (no), and add notes after `::`.
+   - Add `a` when you've applied, with a comma: `[m,a]` is a maybe you applied to anyway, and `[a]` alone records only the application.
+   - A row whose flags can't be read (an unknown letter, or two verdicts like `[y,n]`) is reported with its file and line number whenever the screener or `verdicts.py` reads the folder. It isn't skipped silently.
    - Keep `title | employer` as written: it identifies the listing, so a verdict stays valid on later days.
    - Other lines are free notes, ignored by the parser.
    - The file is never overwritten, so a rerun the same day keeps what you've filled in. The `feedback/` folder is gitignored.
-2. **Record applications.** An `a` verdict cuts that listing from future rankings. For jobs you applied to outside the shortlist, add a line to `applied.txt`:
+2. **Record applications.** An `a` flag cuts that listing from future rankings, and `verdicts.py` then leaves it out of its figures, since the ranker no longer places it. For jobs you applied to outside the shortlist, add a line to `applied.txt`:
    - the posting's URL for a board row;
    - `Title | Employer` for a digest row, since those have no link.
 
@@ -247,15 +249,30 @@ The pass-2 excerpt starts at the posting's role section: a heading such as "What
 - `title_patterns`: regular expressions searched in the title;
 - `description_patterns`: regular expressions searched in the stored posting text, so they apply to board postings only.
 
-A rule matches a listing when any of its lists matches, and a listing that matches several rules gets the lowest cap. A rule without a `max_score`, or with none of the three lists, stops the screener at startup, as does an invalid regular expression here or in `excluded_title_patterns`. An optional `flag` names the rule in the shortlist's Flags column whenever it matches, even if the score was already under the cap. Patterns ignore case and, like other regexes in JSON, need doubled backslashes.
+A rule matches a listing when any of its lists matches, and a listing that matches several rules gets the lowest cap. A rule without a `max_score`, or with none of the three lists, stops the screener at startup, as does an invalid regular expression here or in `excluded_title_patterns`. An optional `flag` names the rule in the shortlist's Flags column whenever it matches, even if the score was already under the cap. A `max_score` of 100 makes a rule a flag only. Patterns ignore case and, like other regexes in JSON, need doubled backslashes.
 
 ```json
 "score_caps": [
   {"employers": ["Not Available"], "max_score": 40},
   {"title_patterns": ["^(?!.*\\bsenior\\s*(/|or)\\s*(staff|principal)\\b).*\\b(staff|principal)\\b"], "max_score": 35},
-  {"description_patterns": ["\\bts\\s*/\\s*sci\\b", "\\bsecurity clearance\\b"], "max_score": 40, "flag": "clearance"}
+  {"description_patterns": ["\\bts\\s*/\\s*sci\\b", "\\bsecurity clearance\\b"], "max_score": 40, "flag": "clearance"},
+  {"title_patterns": ["\\bforward[- ]deploy(ed|ment)\\b"], "max_score": 100, "flag": "fde"}
 ]
 ```
+
+**Capping a skill only when it's required.** Posting text is one line per bullet, so a description pattern can look at a single line. To cap "required" mentions of a skill but not "nice to have" ones, match a line that:
+- names the skill;
+- states years or strong wording;
+- doesn't say it's optional;
+- for languages, isn't a list of alternatives.
+
+The pattern below caps lines like "5+ years of Rails" or "strong Rails experience", but not "Rails is a plus" or "one or more languages, e.g. Ruby, Java":
+
+```json
+{"description_patterns": ["(?:^|\\n)(?![^\\n]*(?:\\b(?:preferred|plus|nice[- ]to[- ]have|bonus)\\b|e\\.g\\.|such as|one or more))(?=[^\\n]*\\brails\\b)[^\\n]*\\b(?:\\d{1,2}\\s*\\+?\\s*(?:years?|yrs?)|required|strong|expert\\w*|proficien\\w*)\\b"], "max_score": 50, "flag": "rails"}
+```
+
+Bullets under a "Nice to have" heading still match, because a line can't see its heading. Check what a new rule catches with the `flags` field in `ranked_<date>.json`.
 
 The title rule caps staff and principal titles but exempts multi-level postings such as "Senior / Staff Engineer". A description pattern can't tell "clearance required" from "no clearance required", so check what a new pattern catches in `ranked_<date>.json` (the `flags` field).
 

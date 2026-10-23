@@ -17,3 +17,6 @@ __pycache__/
 
 *.bat
 diff.log
+
+# Backups of personal config
+pipeline_config.before-*.json

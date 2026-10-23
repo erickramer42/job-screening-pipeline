@@ -85,6 +85,26 @@ Setup, usage, and the configuration reference are in [README.md](README.md). Thi
   - Windows restarted for an update at 00:31–00:33, and no one signed in until 08:52.
   - The tasks run only while the user is signed in, so the 01:00, 05:00 and 06:00 starts couldn't happen, and the catch-up didn't run them after sign-in. That day's files came from manual runs.
   - Fixing it means changing Windows or Task Scheduler settings (see Next Milestones).
+- **Verdict flags combine:**
+  - A feedback row can now say `[m,a]`: a verdict plus "applied". `[a]` alone still works.
+  - The old parser expected a single letter, so it silently skipped the first combined rows. The 7 jobs applied to on 10-23 would have reappeared on the next shortlist.
+  - A row whose flags can't be read is now reported with its file and line number, instead of being skipped.
+  - `verdicts.py` leaves a listing cut as applied out of its figures. A "yes" you applied to isn't counted as ranked last.
+- **`.gitignore`** also covers `pipeline_config.before-*.json`, the backups of the personal config taken before a rule change.
+- **Tuning notes from the 10-23 review:**
+  - **Ranking prompt:** the profile's core is the backend stack. TypeScript/React is secondary, and the technologies the candidate lacks are named.
+    - A posting that requires one of those technologies is a real gap, and so is a front-end-led role.
+    - A full-stack role with a Node.js backend that otherwise fits stays in 60–74.
+  - **`score_caps`:** five new rules cap a required skill the candidate lacks: Spark/Databricks, Rails, C#/.NET and production AWS at 50, Node.js at 65.
+    - A rule matches a posting line that names the skill with years or strong wording, doesn't call it optional, and isn't a list of alternatives. README shows the pattern.
+    - On 10-23 data they caught 8 of the 11 "no" rows on the shortlist, and no "maybe" row.
+  - **Two flags, no cap:** `fde` for Forward Deployed titles, and `perm` for labor-certification-style requirements ("at least N years of prior work experience in each of the following").
+  - **"Re-check postings are still open":** already done for board rows, since board fetch runs right before screening and archives closed postings. The posting that closed on 10-23 was still open at 06:00 and closed later that day. Digest rows have no link to check.
+  - **Measured** in two scratch runs on the same input (in-sample, since these verdicts shaped the change):
+    - ordering agreement 57% → 77%;
+    - "no" rows on the shortlist 11 of 21 → 5 of 21, and "yes" 0 of 2 → 1 of 2, with "maybe" unchanged at 6 of 10;
+    - digest rows on the shortlist 7 → 10;
+    - pass-1 scores of listings the change doesn't touch moved 2.3 points on average.
 
 ### Recent Changes (2026-10-22)
 Quick fixes and score stabilization from a code review.
@@ -269,7 +289,7 @@ Review `out/shortlist_<today>.md`:
 - Digest rows need the original email for their "View" links.
 
 Apply manually at company career pages. Afterwards:
-- Fill in `feedback/<date>.md`: a y/m/n/a verdict per row, with notes after `::`. `a` marks the job as applied.
+- Fill in `feedback/<date>.md`: a y/m/n verdict per row, with notes after `::`. Add `a` when you've applied (`[m,a]`, or `[a]` alone); it cuts the job from future rankings.
 - Add jobs applied to outside the shortlist to `applied.txt` (URL, or `Title | Employer` for digest rows).
 - Run `python verdicts.py` after changing the prompt or config, to see whether the ranking moved toward your verdicts.
 - Turn repeated notes into config rules or prompt changes (see README, "Reviewing the shortlist").

@@ -173,7 +173,8 @@ configure({"excluded_employers": [], "excluded_title_patterns": [],
 
 # Jobs already applied to (applied_path): one per line, the posting URL,
 # or "Title | Employer" for digest rows, which have no link. "#" starts
-# a comment. Rows marked "a" in the feedback files count as well. They're
+# a comment. Rows flagged "a" in the feedback files ([a], [m,a], ...)
+# count as well. They're
 # cut before ranking and listed in their own shortlist section for as
 # long as they're still posted. Read by load_inputs()
 APPLIED_URLS, APPLIED_PAIRS = set(), set()
@@ -362,7 +363,7 @@ def load_inputs():
     SYSTEM_PROMPT = load_system_prompt()
     APPLIED_URLS, APPLIED_PAIRS = load_applied(APPLIED_PATH)
     APPLIED_PAIRS |= {key for key, v in verdicts.load_verdicts().items()
-                      if v["verdict"] == "a"}
+                      if v["applied"]}
 
 # Appended to the system prompt for pass 2 only. Generic mechanics
 # (how to use excerpts, small-batch behavior) belong here, like the

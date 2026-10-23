@@ -5,11 +5,14 @@ feedback files, and a check of how a ranked run orders them.
 
 jobs_screen.py writes feedback/<date>.md with one line per shortlist
 row:   12 [?] Senior Backend Engineer | Acme ::
-Replace ? with y (would apply), m (maybe), n (no) or a (applied) and
-put notes after "::". The row number is only a convenience; the title
-and employer identify the listing, so verdicts stay valid across runs.
-Lines in any other shape (free notes, headings) are ignored, and a
-later file's verdict on the same listing replaces an earlier one. The
+Replace ? with y (would apply), m (maybe) or n (no), and add a if you
+applied: [m,a] is a maybe you applied to anyway, and [a] alone records
+only the application. Put notes after "::". The row number is only a
+convenience; the title and employer identify the listing, so verdicts
+stay valid across runs. Lines in any other shape (free notes, headings)
+are ignored; a row line whose flags can't be read is reported, not
+skipped quietly. A later file's verdict on the same listing replaces an
+earlier one. The
 title/employer split is at the LAST unescaped "|" (split_listing, which
 jobs_screen.py uses for applied.txt too), so a pipe in a title is fine,
 and the template puts a backslash before any pipe in an employer name
@@ -31,11 +34,27 @@ import sys
 from pathlib import Path
 
 FEEDBACK_DIR = Path("feedback")
-LINE_RE = re.compile(r"^\s*(\d+|-)\.?\s*\[([ymna?])\]\s*(.+?)\s*(?:::\s*(.*))?$",
-                     re.I)
-# Ordering grades for the evaluation; "a" (applied) listings are cut
-# before ranking, so they have no rank to judge
+# A row line: number (or "-"), [flags], "title | employer", then an
+# optional ":: note". The flags are read by parse_flags
+LINE_RE = re.compile(r"^\s*(\d+|-)\.?\s*\[([^\]]*)\]\s*(.+?)\s*(?:::\s*(.*))?$")
+# Ordering grades for the evaluation. "a" (applied) is a separate flag:
+# applied listings are cut before ranking, so a later run can't be
+# judged on where it put them
 GRADES = {"y": 2, "m": 1, "n": 0}
+
+def parse_flags(text):
+    """(grade, applied) from a row's flags, e.g. "m,a" -> ("m", True);
+    the grade is None for "a" alone. None for an unfilled row ("?" or
+    blank). Raises ValueError for anything else: an unknown letter, or
+    two different grades."""
+    flags = {f.strip().lower() for f in text.split(",")} - {""}
+    if not flags or flags == {"?"}:
+        return None
+    unknown = flags - set(GRADES) - {"a"}
+    grades = flags & set(GRADES)
+    if unknown or len(grades) > 1:
+        raise ValueError(f"[{text}]")
+    return (grades.pop() if grades else None), "a" in flags
 
 def listing_key(title, employer):
     """A listing's identity: jobs_screen.py deduplicates, batches and
@@ -55,20 +74,33 @@ def split_listing(text):
     return (title, employer) if title and employer else None
 
 def load_verdicts(folder=None):
-    """{listing key: {"verdict", "note", "file"}}; unfilled rows (?) are
-    skipped. Files are read in name (date) order."""
+    """{listing key: {"verdict", "applied", "note", "file"}}, where
+    verdict is y, m, n or None (applied only). Unfilled rows are
+    skipped; a row line that can't be read is reported and skipped.
+    Files are read in name (date) order."""
     folder = folder or FEEDBACK_DIR
     verdicts = {}
     for f in sorted(folder.glob("*.md")) if folder.exists() else []:
-        for ln in f.read_text(encoding="utf-8").splitlines():
+        for n, ln in enumerate(f.read_text(encoding="utf-8").splitlines(), 1):
             m = LINE_RE.match(ln)
-            if not m or m.group(2) == "?":
+            if not m:
                 continue
             listing = split_listing(m.group(3))
+            try:
+                flags = parse_flags(m.group(2))
+            except ValueError as e:
+                print(f"[WARN] {f}:{n}: can't read the flags {e}; "
+                      f"line ignored. Use y, m or n, plus a: [m,a]")
+                continue
+            if flags is None:
+                continue
             if not listing:
+                print(f"[WARN] {f}:{n}: no \"title | employer\" after the "
+                      f"flags; line ignored")
                 continue
             verdicts[listing_key(*listing)] = {
-                "verdict": m.group(2).lower(),
+                "verdict": flags[0],
+                "applied": flags[1],
                 "note": (m.group(4) or "").strip(),
                 "file": f.name,
             }
@@ -77,9 +109,10 @@ def load_verdicts(folder=None):
 def template_lines(stamp, rows):
     """The feedback file the screener writes for a day's shortlist."""
     lines = [f"# Feedback on out/shortlist_{stamp}.md",
-             "# Per row, replace ? with y (would apply), m (maybe), n (no) or",
-             "# a (applied), and add notes after ::. Keep \"title | employer\"",
-             "# as written: it identifies the listing. Other lines are free notes.",
+             "# Per row, replace ? with y (would apply), m (maybe) or n (no),",
+             "# and add a if you applied: [m,a]. Notes go after ::. Keep",
+             "# \"title | employer\" as written: it identifies the listing.",
+             "# Other lines are free notes.",
              ""]
     for i, j in enumerate(rows, 1):
         employer = j["employer"].replace("|", "\\|")
@@ -109,8 +142,10 @@ def evaluate(ranked_path, verdicts):
     in_list = {listing_key(j["title"], j["employer"]) for j in shown}
     rank = {listing_key(j["title"], j["employer"]): (i, j)
             for i, j in enumerate(ranked, 1)}
+    # Listings cut as applied are left out: that cut isn't the ranker's
+    # judgment, so a "yes" you applied to shouldn't count as ranked last
     cut = {listing_key(j["title"], j["employer"]): j["reject_reason"]
-           for j in data["rejected"]}
+           for j in data["rejected"] if j["reject_reason"] != "applied"}
     cut_score = -1  # a cut listing ranks below every ranked one
 
     seen = []  # (grade, score, key)
@@ -119,9 +154,9 @@ def evaluate(ranked_path, verdicts):
             seen.append((GRADES[v["verdict"]],
                          rank[key][1]["score"] if key in rank else cut_score,
                          key))
-    applied = sum(v["verdict"] == "a" for v in verdicts.values())
+    applied = sum(v["applied"] for v in verdicts.values())
     print(f"{ranked_path}: {len(verdicts)} verdicts, {len(seen)} on listings "
-          f"in this run ({applied} applied, not ranked)")
+          f"in this run ({applied} marked applied)")
     if not seen:
         return
 
