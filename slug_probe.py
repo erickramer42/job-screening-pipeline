@@ -11,6 +11,7 @@ out/ranked_<date>.json).
 import json
 import re
 import sys
+import urllib.error
 import urllib.request
 from pathlib import Path
 
@@ -47,14 +48,21 @@ def slug_variants(name):
     return list(dict.fromkeys(v for v in variants if v))
 
 def probe(slug, platform):
-    """True if the endpoint returns live JSON with job data."""
+    """True if the endpoint returns live JSON with job data; False when
+    the platform has no such board (a 4xx answer) or it has no jobs.
+    Raises OSError when the platform can't be asked (network down,
+    timeout, a 5xx answer), so an outage isn't reported as "no board"."""
     url = PROBES[platform].format(slug=slug)
     req = urllib.request.Request(
         url, headers={"User-Agent": "job-pipeline/1.0"})
     try:
         with urllib.request.urlopen(req, timeout=20) as resp:
             data = json.load(resp)
-    except Exception:
+    except urllib.error.HTTPError as e:
+        if 400 <= e.code < 500:
+            return False
+        raise
+    except ValueError:  # not JSON: not a posting API answer
         return False
     if platform == "greenhouse":
         return bool(data.get("jobs"))
@@ -96,26 +104,38 @@ def candidates():
     return result
 
 def main():
-    hits = 0
+    hits = failed = 0
     for name in candidates():
         found = []
-        for variant in slug_variants(name):
-            for platform in PROBES:
-                if probe(variant, platform):
-                    found.append((platform, variant))
-                    break  # first platform hit is enough
-            if found:
-                break
+        try:
+            for variant in slug_variants(name):
+                for platform in PROBES:
+                    if probe(variant, platform):
+                        found.append((platform, variant))
+                        break  # first platform hit is enough
+                if found:
+                    break
+        except OSError as e:
+            print(f"  # {name}: lookup failed ({e}); try again later")
+            failed += 1
+            continue
         if found:
             platform, slug = found[0]
-            print(f'  {{"platform": "{platform}", "slug": "{slug}", '
-                  f'"company": "{name}"}},   <- VERIFIED')
+            # json.dumps, so a name with a quote still pastes as JSON
+            entry = json.dumps({"platform": platform, "slug": slug,
+                                "company": name}, ensure_ascii=False)
+            print(f"  {entry},   <- VERIFIED")
             hits += 1
         else:
             print(f"  # {name}: no board found on any platform")
     print(f"\n{hits} verifiable boards found — paste the VERIFIED "
           f"lines above into boards.json")
+    if failed:
+        print(f"[ERROR] {failed} lookup(s) failed; those companies are "
+              f"unchecked, not boardless.")
+        return 1
+    return 0
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
     

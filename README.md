@@ -23,7 +23,7 @@ jobs_screen.py   raw/ + raw_boards/     ->  recency + hard filters -> pass 1 -> 
    - A posting's file is rewritten whenever its text would change: the employer edited the title, location, pay or description, or the file was written by an older version of the script. SmartRecruiters descriptions cost a request per posting, so they're fetched again only when the listing lines change. Files are written through a temporary file, so an interrupted run never leaves a truncated one.
 3. **Screen** reads both folders and cuts excluded employers and title patterns. It also cuts digest listings outside your area, using the same metro-or-US-remote rule that board fetch applies to postings.
    - **Duplicates and staleness:** a listing that appears in several files is kept once. The board copy (with link, pay and description) is preferred, otherwise the newest digest copy. A digest listing whose newest copy is older than `recency_days` is cut as stale.
-   - **Pass 1:** sends the survivors to Ollama in batches of 30. The model scores each one 0–100 from its title, employer, and location.
+   - **Pass 1:** sends the survivors to Ollama in batches of `pass1_batch` (30). The model scores each one 0–100 from its title, employer, and location.
      - Batches are cut from a fixed, mixed order (a hash of title and employer), so one digest's or one board's listings are spread across batches instead of filling one.
    - **Repeatable scoring:**
      - Requests turn the model's thinking off (`model_thinking`).
@@ -36,7 +36,7 @@ jobs_screen.py   raw/ + raw_boards/     ->  recency + hard filters -> pass 1 -> 
    - **Already applied:** listings in `applied.txt` are cut before ranking and listed in their own shortlist section.
    - **Pass 2:** re-scores the top `rerank_top_n` listings that have a description, in small batches, with an excerpt from the posting's role section added.
 
-`html_text.py` holds the HTML-to-text conversion that ingest and board fetch share. `location_filter.py` holds the search-area rule that board fetch and the screener share. `verdicts.py` reads your verdicts on shortlist rows and scores a run against them (see [Reviewing the shortlist](#reviewing-the-shortlist)).
+`html_text.py` holds the HTML-to-text conversion that ingest and board fetch share. `location_filter.py` holds the search-area rule that board fetch and the screener share. `pipeline_common.py` holds what all three scripts share: config loading, the description marker in board files, email date parsing, and atomic writes. `verdicts.py` reads your verdicts on shortlist rows and scores a run against them (see [Reviewing the shortlist](#reviewing-the-shortlist)).
 
 ## Requirements
 
@@ -90,7 +90,13 @@ python jobs_screen.py    # filter, rank, and write out/
 python -m unittest       # run the tests
 ```
 
-The tests use the standard library's `unittest` and live in `tests/`. They cover listing identity (deduplication, applied jobs, batch order), score caps, the per-employer limit, and the verdict files. They write their fixtures to a temporary folder and need no personal config.
+The tests use the standard library's `unittest` and live in `tests/`. They cover:
+- listing identity (deduplication, applied jobs, batch order), score caps, the per-employer limit, and the verdict files;
+- the model-response handling and the pass-2 excerpt;
+- the board-file layout and when a file is rewritten, plus email decoding;
+- the contract between them: a file ingest or board fetch writes must parse into listings in the screener.
+
+They write their fixtures to a temporary folder, mock the network, and need no personal config.
 
 Results:
 - `out/shortlist_<date>.md` is the top 25 as a table of score, flags, title, employer, location, link, and the model's one-line reason.
@@ -101,16 +107,22 @@ Results:
   - `feedback/<date>.md` is written alongside, ready for your verdicts.
   - Board rows link straight to the posting. Digest rows have no link, so open the digest email to find them.
 - `out/ranked_<date>.json` holds:
-  - every ranked listing with its score and reason. Re-scored ones also carry `pass1_score` and `rescored`; ones matching a cap rule carry `score_cap`, `flags`, and, if lowered, `capped_from`; shortlisted ones carry `shortlist_rank`;
+  - every ranked listing with its score and reason. Re-scored ones also carry `pass1_score` and `rescored`, plus `pass1_capped_from` when a cap lowered the pass-1 score; ones matching a cap rule carry `score_cap`, `flags`, and, if lowered, `capped_from`; shortlisted ones carry `shortlist_rank`;
   - every cut listing with its `reject_reason` (`applied`, `excluded employer`, `excluded title pattern`, `outside area`, or `stale digest`);
   - `failed_batches` and `rerank_failed_batches`.
 
 When something fails:
 - **Ingest** exits non-zero if the config is incomplete, the server's TLS certificate can't be verified, the folder can't be opened, or a message can't be fetched. It gives up on a server that doesn't respond within 60 seconds, and it never falls back to the inbox.
+  - Email bodies are decoded with the charset they declare.
+  - A message with no text part is saved without listings, so it isn't downloaded again; the summary line counts it.
+- **Before scoring**, the screener checks Ollama.
+  - If Ollama can't be reached, it exits with code 2 and writes nothing.
+  - If it's running without the model, it exits 1 straight away, since a retry wouldn't help.
 - **The screener** retries any malformed model response, up to 3 attempts per batch.
   - Indices numbered from 1 are corrected, and numbering that can't be determined is rejected rather than guessed.
   - A batch still without usable scores, or whose connection fails, is left as 0/"unscored", and 3 failed batches in a row stop the pass.
-  - **Nothing scored:** exits with code 2 and writes nothing, which usually means Ollama isn't running or the model isn't pulled.
+  - **Nothing scored:** exits with code 2 and writes nothing, which usually means Ollama stopped during the run.
+  - Every output file is written through a temporary file, so a run killed mid-write leaves the previous file or the complete new one. Ingest and board fetch write the same way.
   - **Some pass-1 batches failed:** still writes the shortlist with a warning at the top, then exits 1.
   - **Pass 2 fails or is skipped** (it's skipped when pass 1 had to stop): those listings keep their pass-1 scores, with a note in the shortlist.
 - **Board fetch** reports a failed board and moves on to the next one. A malformed `boards.json` entry (no slug, unknown platform) is reported and skipped the same way. A failed board's files aren't archived. Once every board has been tried, it exits 1 if any board failed. A failed SmartRecruiters description fetch is retried on the next run.
@@ -219,10 +231,12 @@ Board fetch applies these to postings, using the platforms' structured remote an
 | Key | Purpose | Default |
 |-----|---------|---------|
 | `recency_days` | Digests older than this many days (by their Date header) are skipped by ingest and cut as stale by the screener. A listing still present in a newer digest stays. Board postings are exempt, because closed postings are archived instead. Digests with an unreadable date are kept, with a warning. `0` or missing disables the window. | `0` |
+| `pass1_batch` | Listings per pass-1 request. Lower it only if responses come back truncated. | `30` |
 | `rerank_top_n` | How many of the top pass-1 listings that have a description get re-scored in pass 2. `0` turns pass 2 off. | `15` |
 | `rerank_batch` | Listings per pass-2 request. | `5` |
 | `excerpt_chars` | Maximum length of the posting excerpt sent per listing in pass 2. | `1500` |
 | `model_thinking` | Let a thinking model reason before it answers. `false` (default): about 18 s per pass-1 batch, and repeatable scores, because the first request is greedy; the model follows the prompt's caps less reliably, which `score_caps` covers. `true`: about 4× slower, scores vary from run to run, and long reasoning can overflow the context into empty or truncated responses, which are retried. Greedy decoding isn't used with thinking on, because the reasoning doesn't terminate. | `false` |
+| `num_ctx` | The model's context window per request, in tokens. It must hold the prompt, the batch and the response. | `8192` |
 | `score_caps` | Upper score limits applied in code after each pass. Optional. See the note below. | `[{"employers": ["Acme Staffing"], "max_score": 50}]` |
 | `shortlist_per_employer` | At most this many shortlist rows from one employer; the rest are counted under the table and stay in the JSON. `0` or missing means no limit. | `2` |
 
@@ -294,12 +308,12 @@ Put company names in `targets.txt`, one per line, then run:
 python slug_probe.py targets.txt
 ```
 
-The script tries common slug spellings on all four platforms and prints a `boards.json` line for each slug that returns jobs. **VERIFIED only means the slug has postings**: a generic name can match a different company's board, so open the board and check it before adding the line. With no file argument, it takes employers that scored 60 or higher from the latest `out/ranked_*.json`.
+The script tries common slug spellings on all four platforms and prints a `boards.json` line for each slug that returns jobs. **VERIFIED only means the slug has postings**: a generic name can match a different company's board, so open the board and check it before adding the line. A company whose lookup fails (network down, a platform error) is reported as failed rather than as having no board, and the script then exits 1. With no file argument, it takes employers that scored 60 or higher from the latest `out/ranked_*.json`.
 
 ## Tuning tips
 
 - After changing a board filter, re-run `board_fetch.py`. Postings that no longer pass move to `raw_boards/archive/` and drop out of ranking.
 - When you change how board files are written (layout or description text), bump `FILE_FORMAT` in `board_fetch.py`. Every live posting is then rewritten on the next run, with no manual cleanup.
-- If batches fail with JSON parse errors, lower `BATCH = 30` in `jobs_screen.py`.
+- If pass-1 responses come back truncated, lower `pass1_batch` in `pipeline_config.json`.
 - To re-ingest after changing how emails are converted to text, delete `raw/job_uid_*.txt` and run ingest again. Existing files are skipped.
 - Known issues and planned work are tracked in [STATUS.md](STATUS.md).

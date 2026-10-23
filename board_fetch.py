@@ -29,7 +29,6 @@ employer edited the posting, FILE_FORMAT was bumped (files carry a
 """
 import html as html_mod
 import json
-import os
 import re
 import sys
 import urllib.request
@@ -37,6 +36,7 @@ from pathlib import Path
 
 from html_text import html_to_text, normalize_text
 from location_filter import REMOTE_RE, location_matcher
+from pipeline_common import DESC_MARKER, load_config, write_atomic
 
 CONFIG = Path("boards.json")
 OUT_DIR = Path("raw_boards")
@@ -44,8 +44,6 @@ OUT_DIR = Path("raw_boards")
 # only globs raw_boards/*.txt, so archived files drop out of ranking
 ARCHIVE_DIR = OUT_DIR / "archive"
 ANNUALIZE = {"1 YEAR": 1, "1 HOUR": 2080}
-# Same marker jobs_screen.py stops quadruple parsing at
-DESC_MARKER = "--- DESCRIPTION ---"
 # Bump when the file layout or description text changes. The Format
 # line is part of every file, so each one is then rewritten on the next
 # run, SmartRecruiters descriptions included. 2: line-preserving text,
@@ -72,37 +70,39 @@ SMARTRECRUITERS_DETAIL = ("https://api.smartrecruiters.com/v1/"
 # is mostly EEO/legal filler.
 SMARTRECRUITERS_SECTION_KEYS = ("jobDescription", "qualifications")
 
-CONFIG_FILE = Path("pipeline_config.json")
+def configure(cfg):
+    """Set the filters from a config dict. main() passes
+    pipeline_config.json and tests pass their own, so importing the
+    module reads no files. A missing required key raises KeyError, and
+    a bad title pattern re.error."""
+    global PAY_FLOOR, location_ok, TITLE_RE, TITLE_BLOCK_RE
+    # Annual base salary floor: a posting is cut only when the top of
+    # its published range is below it
+    PAY_FLOOR = cfg.get("pay_floor", 0)
+    # Postings in a configured metro city, or remote postings open to
+    # the US (the screener applies the same rule to digest rows)
+    location_ok = location_matcher(cfg["metro_cities"],
+                                   cfg.get("remote_regions", []))
+    # A posting is fetched only if its title matches one of these
+    # regexes (config); an empty list fetches every title
+    TITLE_RE = re.compile(
+        "|".join(f"(?:{p})" for p in cfg["included_title_patterns"]),
+        re.I,
+    )
+    # Blocked title keywords live in config as plain phrases (not
+    # regex). Word-bounded so "Internal Tools" / "Sales Platform"
+    # engineering roles survive; only the non-engineering role itself
+    # is blocked
+    TITLE_BLOCK_RE = re.compile(
+        "|".join(rf"\b{re.escape(k)}\b" for k in cfg["excluded_keywords"])
+        or r"(?!)",  # empty list blocks nothing
+        re.I,
+    )
 
-def load_config():
-    if not CONFIG_FILE.exists():
-        print("[ERROR] pipeline_config.json missing — copy "
-              "pipeline_config.example.json and fill in your values.")
-        sys.exit(1)
-    return json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
+# Until main() configures it, the module runs as for an empty config
+configure({"metro_cities": [], "included_title_patterns": [],
+           "excluded_keywords": []})
 
-CFG = load_config()
-# Annual base salary floor: a posting is cut only when the top of its
-# published range is below it
-PAY_FLOOR = CFG.get("pay_floor", 0)
-# Postings in a configured metro city, or remote postings open to the
-# US (the screener applies the same rule to digest rows)
-location_ok = location_matcher(CFG["metro_cities"],
-                               CFG.get("remote_regions", []))
-# A posting is fetched only if its title matches one of these regexes
-# (config); an empty list fetches every title
-TITLE_RE = re.compile(
-    "|".join(f"(?:{p})" for p in CFG["included_title_patterns"]),
-    re.I,
-)
-# Blocked title keywords live in config as plain phrases (not regex).
-# Word-bounded so "Internal Tools" / "Sales Platform" engineering roles
-# survive; only the non-engineering role itself is blocked
-TITLE_BLOCK_RE = re.compile(
-    "|".join(rf"\b{re.escape(k)}\b" for k in CFG["excluded_keywords"])
-    or r"(?!)",  # empty list blocks nothing
-    re.I,
-)
 # Pay amounts like $85,000 inside the pay-transparency block
 PAY_AMT_RE = re.compile(r"\$\s*([0-9][0-9,]{2,})")
 
@@ -189,15 +189,6 @@ def record_text(platform, slug, company, url, title, pay, loc_line, desc):
     if desc:
         text += f"\n{DESC_MARKER}\n{desc}\n"
     return text
-
-def write_atomic(path, text):
-    """Write through a temporary file, so an interrupted run leaves the
-    old file or the new one, never a truncated one. The .tmp name
-    matches no glob the pipeline reads."""
-    tmp = path.with_name(path.name + ".tmp")
-    with open(tmp, "w", encoding="utf-8") as f:
-        f.write(text)
-    os.replace(tmp, path)
 
 def extract_greenhouse_pay(content_html):
     """Parse base salary range from a Greenhouse description.
@@ -395,6 +386,14 @@ def sync_board(board_cfg):
     return new
 
 def main():
+    try:
+        configure(load_config())
+    except KeyError as e:
+        print(f"[ERROR] pipeline_config.json has no {e} key; it's required.")
+        return 1
+    except re.error as e:
+        print(f"[ERROR] pipeline_config.json: bad title pattern ({e})")
+        return 1
     if not CONFIG.exists():
         print("No boards.json found — copy boards.example.json and "
               "add your boards.")

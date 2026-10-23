@@ -200,6 +200,85 @@ class ScoreCaps(unittest.TestCase):
         self.assertEqual((j["pass1_score"], j["score"], j["capped_from"]),
                          (45, 50, 80))
         self.assertTrue(j["rescored"])
+        self.assertNotIn("pass1_capped_from", j)
+
+    def test_rerank_keeps_the_raw_pass1_score_of_a_capped_row(self):
+        batch = [self.job(employer="Acme Staffing")]
+        js.apply_pass1(batch, {0: {"score": 72, "reason": "pass 1"}})
+        js.apply_rerank(batch, {0: {"score": 80, "reason": "pass 2"}})
+        j = batch[0]
+        self.assertEqual((j["pass1_score"], j["pass1_capped_from"],
+                          j["score"], j["capped_from"]), (50, 72, 50, 80))
+
+class ModelResponses(unittest.TestCase):
+    def test_zero_based_indices_are_kept(self):
+        rows = [(0, 70, "a"), (1, 40, "b")]
+        self.assertEqual(js.align_indices(rows, 2),
+                         {0: {"score": 70, "reason": "a"},
+                          1: {"score": 40, "reason": "b"}})
+
+    def test_one_based_indices_are_shifted(self):
+        self.assertEqual(sorted(js.align_indices([(1, 70, "a"), (2, 40, "b")],
+                                                 2)), [0, 1])
+
+    def test_ambiguous_numbering_is_rejected(self):
+        with self.assertRaises(ValueError):
+            js.align_indices([(1, 70, "a")], 3)
+
+    def test_out_of_range_indices_are_dropped(self):
+        self.assertEqual(list(js.align_indices([(0, 1, ""), (5, 2, "")], 2)),
+                         [0])
+
+    def test_truncated_response_is_salvaged(self):
+        text = ('{"scores": [{"index": 0, "score": 70, "reason": "ok"}, '
+                '{"index": 1, "score": 6')
+        with mock.patch("builtins.print"):
+            self.assertEqual(js.parse_scores(text, 2, 1),
+                             {0: {"score": 70, "reason": "ok"}})
+
+    def test_salvage_never_invents_an_entry(self):
+        with self.assertRaises(ValueError):
+            js.salvage_scores('{"scores": [{"index": 0, "reason": "a } b')
+
+    def test_unusable_responses(self):
+        for text in ("", "   ", "[1, 2]", '{"scores": null}'):
+            with self.subTest(text=text), self.assertRaises(ValueError):
+                js.parse_scores(text, 1, 1)
+
+    def test_scores_are_clamped_and_bad_entries_dropped(self):
+        text = ('{"scores": [{"index": 0, "score": 150, "reason": "x"}, '
+                '{"index": 1, "score": "high"}, "junk"]}')
+        self.assertEqual(js.parse_scores(text, 2, 1),
+                         {0: {"score": 100, "reason": "x"}})
+
+    def test_model_available(self):
+        tags = {"models": [{"name": "gemma4:12b"}, {"name": "other:latest"}]}
+        self.assertTrue(js.model_available(tags, "gemma4:12b"))
+        self.assertTrue(js.model_available(tags, "other"))
+        self.assertFalse(js.model_available(tags, "gemma4"))
+        self.assertFalse(js.model_available({}, "gemma4:12b"))
+
+class RoleExcerpt(unittest.TestCase):
+    def test_starts_at_a_heading(self):
+        desc = ("Example Co builds things. We raised money.\n"
+                "About the role\nYou build things.")
+        self.assertTrue(js.role_excerpt(desc, 500).startswith(
+            "About the role"))
+
+    def test_markers_in_closing_legal_text_are_ignored(self):
+        desc = ("Example Co builds things. " * 20 + "\nEqual opportunity "
+                "employer; we consider qualifications and merit.")
+        self.assertTrue(js.role_excerpt(desc, 2000).startswith("Example Co"))
+
+    def test_a_late_marker_in_running_text_is_ignored(self):
+        desc = "Intro text. " * 20 + "We are hiring until the role is filled."
+        self.assertTrue(js.role_excerpt(desc, 2000).startswith("Intro text."))
+
+    def test_long_excerpt_is_cut_at_a_sentence_end(self):
+        desc = "About the role\n" + "One sentence here. " * 30
+        excerpt = js.role_excerpt(desc, 100)
+        self.assertLessEqual(len(excerpt), 100)
+        self.assertTrue(excerpt.endswith("."))
 
 class Configure(unittest.TestCase):
     def tearDown(self):

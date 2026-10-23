@@ -15,10 +15,12 @@
   "excluded_title_patterns": ["\\bpattern1\\b", "pattern2"],
   "excluded_keywords": ["keyword1", "keyword2"],
   "recency_days": 60,
+  "pass1_batch": 30,
   "rerank_top_n": 15,
   "rerank_batch": 5,
   "excerpt_chars": 1500,
   "model_thinking": false,
+  "num_ctx": 8192,
   "shortlist_per_employer": 2,
   "score_caps": [
     {"employers": ["StaffingFirmA", "StaffingFirmB"], "max_score": 50},

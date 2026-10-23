@@ -33,9 +33,9 @@ Setup, usage, and the configuration reference are in [README.md](README.md). Thi
 | Slug discovery (`slug_probe.py`) | ✅ Operational | Guesses board slugs for company names (e.g. `targets.txt`) and prints `boards.json` lines for slugs that return jobs |
 | Job parsing (`jobs_screen.py` parser) | ✅ Operational | Reads title/employer/location quadruples from `raw/` and `raw_boards/`. Keeps one copy per listing (board copy first, then newest digest) and cuts digests older than `recency_days`. |
 | Hard filters | ✅ Operational | Blocks the employers and title patterns listed in `pipeline_config.json` |
-| LLM ranking | ✅ Operational | Pass 1 scores every survivor 0–100 from title/employer/location. Pass 2 re-scores the top `rerank_top_n` listings that have a description, using a role-section excerpt. Thinking is off and the first attempt is greedy, so scores are repeatable; employer score caps are enforced after each pass. Malformed responses are retried; 3 consecutive failed batches stop a pass. |
+| LLM ranking | ✅ Operational | Pass 1 scores every survivor 0–100 from title/employer/location. Pass 2 re-scores the top `rerank_top_n` listings that have a description, using a role-section excerpt. Thinking is off and the first attempt is greedy, so scores are repeatable; `score_caps` (by employer, title or posting text) are enforced after each pass. Malformed responses are retried; 3 consecutive failed batches stop a pass. |
 | Output generation | ✅ Operational | Produces `out/shortlist_YYYY-MM-DD.md` and JSON. Board rows include direct posting links; ▲ marks pass-2 scores. |
-| Scheduled runs | ✅ Operational | Task Scheduler runs ingest at 01:00 and 05:00, and board fetch + screening at 06:00. Tasks wake the computer, run after a missed start, and the wrappers retry (see [Automation](#automation)). Verified across 2026-10-09 to 10-22, with two misses. On 10-14 no task ran at all, and the missed-start catch-up didn't fire. On 10-22 screening failed all 3 attempts because Ollama wasn't running. Both are open items (see Next Milestones). |
+| Scheduled runs | ✅ Operational | Task Scheduler runs ingest at 01:00 and 05:00, and board fetch + screening at 06:00. Tasks wake the computer, run after a missed start, and the wrappers retry (see [Automation](#automation)). Verified across 2026-10-09 to 10-22, with two misses. On 10-14 no task ran: a Windows Update restart at 00:33 left no one signed in until 08:52, and the missed-start catch-up didn't run the tasks after sign-in. On 10-22 screening failed all 3 attempts because Ollama wasn't running. Both are open items (see Next Milestones). |
 
 ### Recent Changes (2026-10-23)
 - **Ranking prompt, from the 10-23 shortlist review:** Node.js no longer counts as part of the candidate's stack. The model had cited it as a core-stack match on three shortlist rows.
@@ -63,6 +63,28 @@ Setup, usage, and the configuration reference are in [README.md](README.md). Thi
   - Listing identity is defined once, in `verdicts.py`. An `applied.txt` line whose title contains a pipe used to be split at the first pipe, so that listing was never cut; it's now split like a verdict line, at the last one.
   - The per-employer limit's "More from" note groups employers regardless of case, as the limit already did.
 - **`verdicts.py`:** ordering agreement compares scores, with equal scores counting half. It used to compare list positions, which break score ties in an arbitrary order. On the same verdicts, the 10-23 run's figure moved by 1 point.
+- **No script reads files at import any more:**
+  - Board fetch and ingest load config in `main()`, like the screener. Settings errors stop the run with the same messages and exit codes as before.
+  - The new `pipeline_common.py` holds config loading, the description marker, email date parsing, and atomic writes.
+- **Atomic writes everywhere:** digests, the ranked JSON, the shortlist and the verdict template are written through a temporary file, as board files already were. A killed run used to leave a truncated digest that was skipped forever as a duplicate.
+- **Ingest:**
+  - Email bodies are decoded with the charset they declare, and the two bare `except:` clauses are gone.
+  - Checked against all 38 messages in the folder, read-only: the new code reproduces every digest file on disk byte for byte, apart from the `Job_ID` line retired on 10-22. All 38 are single-part UTF-8 HTML, so nothing changes today.
+  - A message with no text part is saved without listings, so it isn't downloaded again on every run.
+- **Ollama preflight:**
+  - Before scoring, the screener checks Ollama. If it can't be reached, the run exits 2 and writes nothing; the wrapper retries that, as before.
+  - If Ollama is running without the model, the run exits 1 at once, instead of three attempts 15 minutes apart.
+- **Config:** pass 1's batch size (`pass1_batch`, 30) and the context window (`num_ctx`, 8192) moved from code into config, with the same defaults.
+- **JSON:** a re-scored row that was capped in pass 1 keeps the model's own pass-1 score as `pass1_capped_from`.
+- **`slug_probe.py`:** a network failure is reported as a failed lookup, and the script exits 1. It used to report "no board found" for every company. The `boards.json` lines it prints are now valid JSON even for a name with quotes.
+- **Tests:** 82 now. Added: model-response handling, the pass-2 excerpt, the board-file layout and rewrite rules, email decoding, the slug probe, and the contract that what ingest and board fetch write parses in the screener.
+- **Checked:**
+  - The committed and new code ran on the same data, the screener with a stand-in model and board fetch against the live APIs.
+  - The screener sent the same 22 requests and wrote identical outputs, apart from the new field. Board fetch left identical board folders.
+- **The 10-14 scheduling miss, explained:**
+  - Windows restarted for an update at 00:31–00:33, and no one signed in until 08:52.
+  - The tasks run only while the user is signed in, so the 01:00, 05:00 and 06:00 starts couldn't happen, and the catch-up didn't run them after sign-in. That day's files came from manual runs.
+  - Fixing it means changing Windows or Task Scheduler settings (see Next Milestones).
 
 ### Recent Changes (2026-10-22)
 Quick fixes and score stabilization from a code review.
@@ -203,6 +225,8 @@ jobScreensApplications/
 │                                #   LLM ranker -> out/
 ├── html_text.py                 # Shared HTML-to-text conversion (ingest + boards)
 ├── location_filter.py           # Shared search-area rule (boards + digest filter)
+├── pipeline_common.py           # Shared config loading, description marker,
+│                                #   email dates, atomic writes
 ├── verdicts.py                  # Reads shortlist verdicts; scores a run against them
 ├── slug_probe.py                # Finds board slugs for company names
 │                                #   (python slug_probe.py targets.txt)
@@ -298,7 +322,7 @@ The wrappers are gitignored. Both run under `cmd` (no Git Bash) and contain no m
 4. Check Task Scheduler's **Last Run Result** and `logs/` after the first automated nights:
    - `logs/errors.log` gets one timestamped line per failed step (`ingest FAILED`, `board fetch FAILED`, `screen FAILED`), after retries.
    - The scripts exit non-zero on failure. `board_fetch.py` tries every board first, then exits 1 if any failed.
-   - **No shortlist for today** means scoring failed completely (Ollama down or model missing; see `logs/screen.log`) or a wrapper path/env-var problem.
+   - **No shortlist for today** means scoring failed completely (Ollama down or model missing; see `logs/screen.log`) or a wrapper path/env-var problem. A missing model fails on the first attempt (`screen FAILED rc=1`); Ollama being down fails after three (`rc=2 attempts=3`).
    - **A WARNING line at the top of the shortlist** means some batches failed and those listings are ranked 0.
 
 ---
@@ -347,7 +371,7 @@ IMAP host, port, STARTTLS, and folder live in `pipeline_config.json`, along with
 - **Ranking prompt:** edit the file at `prompt_path` (default `screening_prompt.txt`). The pass-2 addendum (`RERANK_ADDENDUM` in `jobs_screen.py`) is appended to it for re-scoring.
 - **Recency window:** `recency_days` in `pipeline_config.json` (ingest and screener both read it; `0` disables)
 - **Pass 2:** `rerank_top_n` (`0` disables), `rerank_batch`, and `excerpt_chars` in `pipeline_config.json`. Excerpt selection uses `ROLE_MARKERS` and `FOOTER_MARKERS` in `jobs_screen.py`.
-- **Batch size:** lower `BATCH = 30` to 20 or 15 if JSON parse failures appear
+- **Batch size:** lower `pass1_batch` (30) in `pipeline_config.json` to 20 or 15 if pass-1 responses come back truncated
 - **Model choice:** swap `SCREEN_MODEL` for a smaller model (speed) or larger one (quality)
 - **Board file format:** bump `FILE_FORMAT` in `board_fetch.py` after changing what it writes; every live posting is rewritten on the next run.
 - **Model thinking:** `model_thinking` in `pipeline_config.json`. Off (the default) is fast and repeatable. On is about 4× slower, varies from run to run, and can overflow the context. See README.
@@ -392,8 +416,11 @@ Agreed 2026-10-22, in this order:
 
 After that, as needed:
 - **Separate board and digest sections** in the shortlist, only if the verdicts show digest "yes" rows below the cut.
-- **Visibility for Ollama outages:** a preflight check and a `FAILED_<date>.md` marker.
-- **The two scheduling misses** (10-14, 10-22).
+- **Visibility for Ollama outages:** a `FAILED_<date>.md` marker written by the wrapper after its last attempt, and possibly starting Ollama before a retry. The preflight check is done (10-23).
+- **The 10-14 scheduling miss** (an update restart with no one signed in). Two fixes, both settings rather than code:
+  - turn on Windows' "Use my sign-in info to automatically finish setting up after an update";
+  - or add an "At log on" trigger to both tasks. Ingest is safe to repeat; screening would then need a guard so it doesn't redo a finished day.
+- **The 10-22 miss** (Ollama not running): make sure Ollama starts at login.
 - **Parser canary** for digest format drift.
 - **UIDVALIDITY tracking.**
 

@@ -19,20 +19,12 @@ import re
 import sys
 import urllib.request
 from datetime import date, datetime, timezone
-from email.utils import parsedate_to_datetime
 from pathlib import Path
 
 import verdicts
 from location_filter import location_matcher
-
-CONFIG_FILE = Path("pipeline_config.json")
-
-def load_config():
-    if not CONFIG_FILE.exists():
-        print("[ERROR] pipeline_config.json missing — copy "
-              "pipeline_config.example.json and fill in your values.")
-        sys.exit(1)
-    return json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
+from pipeline_common import (DESC_MARKER, load_config, parse_email_date,
+                             write_atomic)
 
 SHORTLIST_SIZE = 25
 # Glob pattern per source dir: digests are job_uid_<UID>.txt; board
@@ -52,12 +44,6 @@ MODEL = os.getenv("SCREEN_MODEL", "gemma4:12b")
 # Table headers that would otherwise parse as a listing; configure()
 # adds the header/menu rows specific to your digest emails
 BASE_NOISE = {"view", "job title", "employer", "location", "action"}
-
-# Board files store the posting description below this marker. Quadruple
-# parsing stops at it, so description prose (which can contain "View" or
-# anything else) can never be misread as a listing. Digest files have no
-# marker and parse exactly as before.
-DESC_MARKER = "--- DESCRIPTION ---"
 
 # Role-content markers for pass-2 excerpts: postings commonly front
 # company/investor boilerplate and bury the role, so prefix-only
@@ -123,16 +109,19 @@ def configure(cfg):
     module reads no files. A missing required key raises KeyError, and
     a bad score_caps rule or regex raises ValueError or re.error, so a
     broken config stops the run before anything is parsed."""
-    global PROMPT_PATH, RECENCY_DAYS, RERANK_TOP_N, RERANK_BATCH
-    global EXCERPT_CHARS, SHORTLIST_PER_EMPLOYER, KNOWN_NOISE
+    global PROMPT_PATH, RECENCY_DAYS, PASS1_BATCH, RERANK_TOP_N
+    global RERANK_BATCH, EXCERPT_CHARS, SHORTLIST_PER_EMPLOYER, KNOWN_NOISE
     global EXCLUDED_EMPLOYER_RE, EXCLUDE_TITLE_RES, location_ok
-    global SCORE_CAPS, APPLIED_PATH, MODEL_THINKING
+    global SCORE_CAPS, APPLIED_PATH, MODEL_THINKING, NUM_CTX
     PROMPT_PATH = Path(cfg.get("prompt_path", "screening_prompt.txt"))
     # Digest rows from files whose Date header is older than this many
     # days are rejected as stale before ranking. Board postings are
     # exempt: their freshness is enforced by the archive mechanism in
     # board_fetch.py, not by age. 0 or missing disables the window.
     RECENCY_DAYS = int(cfg.get("recency_days", 0))
+    # Listings per pass-1 request. Fewer means shorter responses, which
+    # matters only if responses start coming back truncated
+    PASS1_BATCH = int(cfg.get("pass1_batch", 30))
     # Second pass: how many top description-bearing rows to re-score,
     # how many per request, and the excerpt cap fed to the model.
     RERANK_TOP_N = int(cfg.get("rerank_top_n", 15))
@@ -173,6 +162,10 @@ def configure(cfg):
     #        greedy (temperature 0) for repeatable scores, but the
     #        prompt's caps are broken more often.
     MODEL_THINKING = bool(cfg.get("model_thinking", False))
+    # The model's context window per request, in tokens: the system
+    # prompt, the batch, and the response (and with thinking on, the
+    # reasoning, which is what used to overflow it)
+    NUM_CTX = int(cfg.get("num_ctx", 8192))
 
 # Until main() configures it, the module runs as for an empty config
 configure({"excluded_employers": [], "excluded_title_patterns": [],
@@ -224,15 +217,7 @@ def parse_metadata_date(lines):
             if ln == "---":
                 break
             if ln.startswith("Date: "):
-                try:
-                    dt = parsedate_to_datetime(ln[6:].strip())
-                except (TypeError, ValueError):
-                    return None
-                if dt is None:
-                    return None
-                if dt.tzinfo is None:
-                    dt = dt.replace(tzinfo=timezone.utc)
-                return dt
+                return parse_email_date(ln[6:].strip())
     return None
 
 def role_excerpt(description, max_chars):
@@ -433,7 +418,7 @@ def ollama_chat(system, user, attempt=1):
         "stream": False,
         "think": MODEL_THINKING,
         "format": "json",
-        "options": {"num_ctx": 8192, **sampling_options(attempt)},
+        "options": {"num_ctx": NUM_CTX, **sampling_options(attempt)},
     }
     req = urllib.request.Request(
         OLLAMA_URL.rstrip("/") + "/api/chat",
@@ -447,6 +432,33 @@ def ollama_chat(system, user, attempt=1):
     if not isinstance(content, str):
         raise ValueError("Ollama response has no message content")
     return content
+
+def model_available(tags, model):
+    """True when an /api/tags response lists model. A name without a
+    tag means ":latest", as it does in Ollama."""
+    names = {m.get("name") for m in (tags or {}).get("models") or []
+             if isinstance(m, dict)}
+    return model in names or (":" not in model
+                              and f"{model}:latest" in names)
+
+def ollama_preflight():
+    """Check Ollama before scoring. Exits 2 when it can't be reached:
+    nothing has been written, so the wrapper's retry is safe. Exits 1
+    when it's up without MODEL: a retry can't fix that, and an HTTP 404
+    mid-run would otherwise be retried like an outage."""
+    try:
+        with urllib.request.urlopen(OLLAMA_URL.rstrip("/") + "/api/tags",
+                                    timeout=30) as resp:
+            tags = json.load(resp)
+    except (*TRANSPORT_ERRORS, ValueError) as e:
+        print(f"[ERROR] Ollama isn't reachable at {OLLAMA_URL} ({e}). "
+              f"No shortlist written.")
+        sys.exit(2)
+    if not model_available(tags if isinstance(tags, dict) else {}, MODEL):
+        print(f"[ERROR] Ollama at {OLLAMA_URL} has no model {MODEL}: pull "
+              f"it (ollama pull {MODEL}) or set SCREEN_MODEL. No shortlist "
+              f"written.")
+        sys.exit(1)
 
 def coerce_entry(entry):
     """One model response entry -> (index, score, reason) or None.
@@ -640,6 +652,9 @@ def apply_rerank(batch, scores):
     for idx, s in scores.items():
         j = batch[idx]
         j["pass1_score"] = j["score"]
+        # set_score replaces capped_from; keep the model's own pass-1 score
+        if "capped_from" in j:
+            j["pass1_capped_from"] = j["capped_from"]
         set_score(j, s["score"], s["reason"])
         j["rescored"] = True
 
@@ -718,9 +733,11 @@ def main():
         j["score"] = 0
         j["reason"] = "unscored"
 
+    if kept:
+        ollama_preflight()
     kept.sort(key=batch_order)
-    BATCH = 30
-    batches = [kept[s:s + BATCH] for s in range(0, len(kept), BATCH)]
+    batches = [kept[s:s + PASS1_BATCH]
+               for s in range(0, len(kept), PASS1_BATCH)]
     n_batches = len(batches)
     print(f"Pass 1: scoring {len(kept)} listings with {MODEL} "
           f"({n_batches} batches)...")
@@ -765,56 +782,56 @@ def main():
     for i, j in enumerate(rows, 1):
         j["shortlist_rank"] = i
 
+    # Every output goes through write_atomic: a run killed while writing
+    # leaves the previous file or the complete new one
     OUT_DIR.mkdir(exist_ok=True)
     stamp = date.today().isoformat()
     json_path = OUT_DIR / f"ranked_{stamp}.json"
-    with open(json_path, "w", encoding="utf-8") as f:
-        json.dump({"ranked": kept, "rejected": rejected,
-                   "failed_batches": failed,
-                   "rerank_failed_batches": rerank_failed}, f, indent=2)
+    write_atomic(json_path, json.dumps(
+        {"ranked": kept, "rejected": rejected, "failed_batches": failed,
+         "rerank_failed_batches": rerank_failed}, indent=2))
 
     md_path = OUT_DIR / f"shortlist_{stamp}.md"
-    with open(md_path, "w", encoding="utf-8") as f:
-        f.write(f"# Daily Shortlist — {stamp}\n\n")
-        if failed:
-            f.write(f"**WARNING: {failed} of {n_batches} pass-1 batches "
-                    f"failed; those listings are ranked as 0/unscored.**"
-                    f"\n\n")
-        if rerank_failed:
-            f.write(f"**NOTE: {rerank_failed} re-scoring batch(es) failed "
-                    f"or were skipped; those rows kept their pass-1 "
-                    f"score.**\n\n")
-        f.write(f"{len(kept)} ranked, {len(rejected)} auto-cut. "
-                f"Board postings link directly; digest rows need the "
-                f"email. Rows marked ▲ were re-scored against the "
-                f"posting text. Flags come from score_caps rules; "
-                f"\"capped\" means a rule lowered the model's score.\n\n")
-        f.write("| # | Score | Flags | Title | Employer | Location | Link "
-                "| Reason |\n")
-        f.write("|---|-------|-------|-------|----------|----------|------"
-                "|--------|\n")
-        for i, j in enumerate(rows, 1):
-            mark = "▲ " if j.get("rescored") else ""
-            flags = j.get("flags", []) + (["capped"] if "capped_from" in j
-                                          else [])
-            f.write(f"| {i} | {mark}{j['score']} | {', '.join(flags)} | "
-                    f"{md_cell(j['title'])} | {md_cell(j['employer'])} | "
-                    f"{md_cell(j['location'])} | "
-                    f"{md_cell(j.get('url') or '-')} | "
-                    f"{md_cell(j['reason'], 80)} |\n")
-        if more:
-            f.write("\nMore from: "
-                    + ", ".join(f"{md_cell(e)} (+{n})"
-                                for e, n in more.most_common())
-                    + f". At most {SHORTLIST_PER_EMPLOYER} per employer are "
-                      f"shown; the rest are in the JSON.\n")
-        applied = [j for j in rejected if j["reject_reason"] == "applied"]
-        if applied:
-            f.write("\n## Already applied, still posted\n\n")
-            for j in applied:
-                f.write(f"- {md_cell(j['title'])} · {md_cell(j['employer'])}"
-                        f" · {md_cell(j['location'])} · "
-                        f"{j.get('url') or 'digest listing'}\n")
+    md = [f"# Daily Shortlist — {stamp}\n\n"]
+    if failed:
+        md.append(f"**WARNING: {failed} of {n_batches} pass-1 batches "
+                  f"failed; those listings are ranked as 0/unscored.**\n\n")
+    if rerank_failed:
+        md.append(f"**NOTE: {rerank_failed} re-scoring batch(es) failed "
+                  f"or were skipped; those rows kept their pass-1 "
+                  f"score.**\n\n")
+    md.append(f"{len(kept)} ranked, {len(rejected)} auto-cut. "
+              f"Board postings link directly; digest rows need the "
+              f"email. Rows marked ▲ were re-scored against the "
+              f"posting text. Flags come from score_caps rules; "
+              f"\"capped\" means a rule lowered the model's score.\n\n")
+    md.append("| # | Score | Flags | Title | Employer | Location | Link "
+              "| Reason |\n")
+    md.append("|---|-------|-------|-------|----------|----------|------"
+              "|--------|\n")
+    for i, j in enumerate(rows, 1):
+        mark = "▲ " if j.get("rescored") else ""
+        flags = j.get("flags", []) + (["capped"] if "capped_from" in j
+                                      else [])
+        md.append(f"| {i} | {mark}{j['score']} | {', '.join(flags)} | "
+                  f"{md_cell(j['title'])} | {md_cell(j['employer'])} | "
+                  f"{md_cell(j['location'])} | "
+                  f"{md_cell(j.get('url') or '-')} | "
+                  f"{md_cell(j['reason'], 80)} |\n")
+    if more:
+        md.append("\nMore from: "
+                  + ", ".join(f"{md_cell(e)} (+{n})"
+                              for e, n in more.most_common())
+                  + f". At most {SHORTLIST_PER_EMPLOYER} per employer are "
+                    f"shown; the rest are in the JSON.\n")
+    applied = [j for j in rejected if j["reject_reason"] == "applied"]
+    if applied:
+        md.append("\n## Already applied, still posted\n\n")
+        for j in applied:
+            md.append(f"- {md_cell(j['title'])} · {md_cell(j['employer'])}"
+                      f" · {md_cell(j['location'])} · "
+                      f"{j.get('url') or 'digest listing'}\n")
+    write_atomic(md_path, "".join(md))
 
     # Verdict template for the owner (verdicts.py). Never overwritten: a
     # rerun the same day keeps whatever was already filled in
@@ -822,9 +839,8 @@ def main():
     feedback_path = template_dir / f"{stamp}.md"
     if not feedback_path.exists():
         template_dir.mkdir(exist_ok=True)
-        feedback_path.write_text(
-            "\n".join(verdicts.template_lines(stamp, rows)) + "\n",
-            encoding="utf-8")
+        write_atomic(feedback_path,
+                     "\n".join(verdicts.template_lines(stamp, rows)) + "\n")
 
     print(f"\nWrote {json_path}")
     print(f"Wrote {md_path} (top {len(rows)} of {len(kept)})")

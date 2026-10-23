@@ -10,77 +10,21 @@ server folder is never touched (read-only guarantee), so old emails
 cost one cheap header fetch per run until manually archived.
 """
 import email
+import email.policy
 import imaplib
 import ipaddress
-import json
 import os
 import re
 import ssl
 import sys
 from datetime import datetime, timezone
-from email.header import decode_header
-from email.utils import parsedate_to_datetime
 from pathlib import Path
 
 from html_text import html_to_text
+from pipeline_common import load_config, parse_email_date, write_atomic
 
-# Configuration
-CONFIG_FILE = Path("pipeline_config.json")
-
-def load_config():
-    """Fail closed: no config, no run. Prevents silent fallback to
-    defaults — the same discipline as the missing-folder check."""
-    if not CONFIG_FILE.exists():
-        print("[ERROR] pipeline_config.json missing — copy "
-              "pipeline_config.example.json and fill in your values.")
-        return None
-    return json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
-
-CFG = load_config()
-if CFG is None:
-    sys.exit(1)
-IMAP_HOST = CFG.get("imap_host", os.getenv("EMAIL_IMAP_HOST", ""))
-# 993 is the standard implicit-TLS IMAP port
-IMAP_PORT = int(CFG.get("imap_port", os.getenv("EMAIL_IMAP_PORT", "993")))
-# True for servers that expect a plain connect upgraded with STARTTLS;
-# False (default) uses implicit TLS
-IMAP_STARTTLS = CFG.get("imap_starttls", False)
-# The server certificate is verified against the system CA store, or
-# only against imap_cafile when that is set (e.g. a local bridge's
-# exported certificate). imap_tls_verify=false skips verification and
-# is accepted for loopback hosts only, where traffic never leaves the
-# machine
-IMAP_TLS_VERIFY = CFG.get("imap_tls_verify", True)
-IMAP_CAFILE = CFG.get("imap_cafile")
 IMAP_TIMEOUT = 60  # seconds per socket operation
-# Same knob jobs_screen.py reads: digests older than this are not
-# ingested. 0 or missing ingests everything.
-RECENCY_DAYS = int(CFG.get("recency_days", 0))
-
-def env_name(key, default):
-    """Config names the env var that holds a credential; the credential
-    itself stays out of the file. A value that isn't a valid variable
-    name is probably the credential pasted in, so refuse it without
-    echoing it."""
-    name = CFG.get(key, default)
-    if not (isinstance(name, str)
-            and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name)):
-        print(f"[ERROR] {key} must be the NAME of an environment variable "
-              f"(e.g. {default}), not the value itself.")
-        sys.exit(1)
-    return name
-
-USER_ENV = env_name("email_user_env", "EMAIL_USER")
-PASSWORD_ENV = env_name("email_password_env", "EMAIL_PASSWORD")
-EMAIL_USER = os.getenv(USER_ENV, "")
-PASSWORD = os.getenv(PASSWORD_ENV, "")
-MAIL_FOLDER = CFG.get("mail_folder", "")
 RAW_DIR = Path("raw")
-
-if not IMAP_HOST or not EMAIL_USER or not PASSWORD or not MAIL_FOLDER:
-    print("[ERROR] imap_host/mail_folder (pipeline_config.json) and "
-          f"{USER_ENV}/{PASSWORD_ENV} (environment) must all be set.")
-    sys.exit(1)
 
 def is_loopback(host):
     if host.lower() == "localhost":
@@ -90,37 +34,63 @@ def is_loopback(host):
     except ValueError:
         return False
 
-if not IMAP_TLS_VERIFY and not is_loopback(IMAP_HOST):
-    print("[ERROR] imap_tls_verify=false is only accepted for a loopback "
-          "imap_host (localhost, 127.0.0.1, ::1). To trust a self-signed "
-          "certificate, set imap_cafile instead.")
-    sys.exit(1)
+def env_name(cfg, key, default):
+    """Config names the env var that holds a credential; the credential
+    itself stays out of the file. A value that isn't a valid variable
+    name is probably the credential pasted in, so it's refused without
+    being echoed."""
+    name = cfg.get(key, default)
+    if not (isinstance(name, str)
+            and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name)):
+        raise ValueError(f"{key} must be the NAME of an environment "
+                         f"variable (e.g. {default}), not the value itself.")
+    return name
+
+def configure(cfg):
+    """Set the mail settings from a config dict. main() passes
+    pipeline_config.json and tests pass their own, so importing the
+    module reads no files and no credentials. Raises ValueError for a
+    setting that must stop the run: fail closed, no silent defaults."""
+    global IMAP_HOST, IMAP_PORT, IMAP_STARTTLS, IMAP_TLS_VERIFY
+    global IMAP_CAFILE, RECENCY_DAYS, USER_ENV, PASSWORD_ENV, MAIL_FOLDER
+    IMAP_HOST = cfg.get("imap_host", os.getenv("EMAIL_IMAP_HOST", ""))
+    # 993 is the standard implicit-TLS IMAP port
+    IMAP_PORT = int(cfg.get("imap_port", os.getenv("EMAIL_IMAP_PORT", "993")))
+    # True for servers that expect a plain connect upgraded with
+    # STARTTLS; False (default) uses implicit TLS
+    IMAP_STARTTLS = cfg.get("imap_starttls", False)
+    # The server certificate is verified against the system CA store, or
+    # only against imap_cafile when that is set (e.g. a local bridge's
+    # exported certificate). imap_tls_verify=false skips verification and
+    # is accepted for loopback hosts only, where traffic never leaves the
+    # machine
+    IMAP_TLS_VERIFY = cfg.get("imap_tls_verify", True)
+    IMAP_CAFILE = cfg.get("imap_cafile")
+    # Same knob jobs_screen.py reads: digests older than this are not
+    # ingested. 0 or missing ingests everything.
+    RECENCY_DAYS = int(cfg.get("recency_days", 0))
+    USER_ENV = env_name(cfg, "email_user_env", "EMAIL_USER")
+    PASSWORD_ENV = env_name(cfg, "email_password_env", "EMAIL_PASSWORD")
+    MAIL_FOLDER = cfg.get("mail_folder", "")
+    if not IMAP_TLS_VERIFY and not is_loopback(IMAP_HOST):
+        raise ValueError(
+            "imap_tls_verify=false is only accepted for a loopback "
+            "imap_host (localhost, 127.0.0.1, ::1). To trust a "
+            "self-signed certificate, set imap_cafile instead.")
+
+# Until main() configures it, the module runs as for an empty config
+configure({})
 
 def tls_context():
     """TLS settings for the IMAP connection. Always passed explicitly:
     imaplib's own default (no context) does NOT verify certificates."""
     if IMAP_TLS_VERIFY:
         return ssl.create_default_context(cafile=IMAP_CAFILE)
-    # Loopback only (checked at startup)
+    # Loopback only (checked by configure)
     ctx = ssl.create_default_context()
     ctx.check_hostname = False
     ctx.verify_mode = ssl.CERT_NONE
     return ctx
-
-def decode_mime_header(header):
-    """Decode MIME encoded headers."""
-    if not header:
-        return ""
-    decoded_parts = []
-    for part, enc in decode_header(header):
-        if isinstance(part, bytes):
-            try:
-                decoded_parts.append(part.decode(enc or "utf-8", errors="replace"))
-            except LookupError:  # unknown charset name
-                decoded_parts.append(part.decode("utf-8", errors="replace"))
-        else:
-            decoded_parts.append(str(part))
-    return "".join(decoded_parts)
 
 def fetch_payload(data):
     """The message bytes from an imaplib FETCH response, or None.
@@ -150,18 +120,50 @@ def digest_is_stale(mail, uid):
     header = fetch_payload(data) if typ == "OK" else None
     if header is None:
         return False
-    raw_date = email.message_from_bytes(header).get("Date", "")
-    try:
-        dt = parsedate_to_datetime(raw_date)
-    except (TypeError, ValueError):
-        return False
+    dt = parse_email_date(email.message_from_bytes(header).get("Date", ""))
     if dt is None:
         return False
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
     return (datetime.now(timezone.utc) - dt).days > RECENCY_DAYS
 
+def read_message(raw_email):
+    """(subject, sender, date, body) from a raw message. Subject and
+    sender are decoded; the date is the header as the email states it
+    (the parsed form would add a weekday it may not have). The body is
+    the text/plain part, or failing that the text/html one, decoded by
+    the charset it declares (as UTF-8 when Python doesn't know that
+    charset); None when the message has neither."""
+    msg = email.message_from_bytes(raw_email, policy=email.policy.default)
+    part = msg.get_body(preferencelist=("plain", "html"))
+    body = None
+    if part is not None:
+        try:
+            body = part.get_content()
+        except LookupError:  # unknown charset name
+            body = part.get_payload(decode=True).decode("utf-8",
+                                                        errors="replace")
+    date = next((v for k, v in msg.raw_items() if k.lower() == "date"), "")
+    return (str(msg.get("Subject", "")), str(msg.get("From", "")),
+            date, body)
+
+def digest_record(subject, sender, date, uid, text):
+    """A digest file's full text: the metadata block, then the body with
+    one field per line, which jobs_screen.py parses into listings."""
+    return (f"# Metadata\nSubject: {subject}\nSender: {sender}\n"
+            f"Date: {date}\nUID: {uid}\n---\n\n{text}")
+
 def main():
+    try:
+        configure(load_config())
+    except ValueError as e:
+        print(f"[ERROR] {e}")
+        return 1
+    email_user = os.getenv(USER_ENV, "")
+    password = os.getenv(PASSWORD_ENV, "")
+    if not IMAP_HOST or not email_user or not password or not MAIL_FOLDER:
+        print("[ERROR] imap_host/mail_folder (pipeline_config.json) and "
+              f"{USER_ENV}/{PASSWORD_ENV} (environment) must all be set.")
+        return 1
+
     RAW_DIR.mkdir(exist_ok=True)
 
     print(f"Connecting to {IMAP_HOST}:{IMAP_PORT}...")
@@ -176,7 +178,7 @@ def main():
     else:
         mail = imaplib.IMAP4_SSL(IMAP_HOST, IMAP_PORT, ssl_context=ctx,
                                  timeout=IMAP_TIMEOUT)
-    mail.login(EMAIL_USER, PASSWORD)
+    mail.login(email_user, password)
 
     print(f"Selecting folder: {MAIL_FOLDER}")
     # readonly=True issues EXAMINE: no flag changes, and close() can't
@@ -207,7 +209,7 @@ def main():
         return 0
 
     print(f"Found {len(uid_list)} emails to process.")
-    processed = duplicates = stale_skipped = fetch_failures = 0
+    processed = duplicates = stale_skipped = fetch_failures = no_body = 0
 
     for uid_bytes in uid_list:
         uid = uid_bytes.decode()
@@ -237,63 +239,28 @@ def main():
             fetch_failures += 1
             continue
 
-        msg_obj = email.message_from_bytes(raw_email)
-
-        # Extract metadata
-        subject_raw = msg_obj.get("Subject", "")
-        from_raw = msg_obj.get("From", "")
-        date_raw = msg_obj.get("Date", "")
-        subject = decode_mime_header(subject_raw)
-        sender = decode_mime_header(from_raw)
-
-        # Extract body text (prefers text/plain, falls back to text/html)
-        body = None
-        if msg_obj.is_multipart():
-            for part in msg_obj.walk():
-                ctype = part.get_content_type()
-                disposition = str(part.get("Content-Disposition"))
-                if ctype == "text/plain" and "attachment" not in disposition:
-                    try:
-                        body = part.get_payload(decode=True).decode(
-                            "utf-8", errors="replace")
-                        break
-                    except:
-                        continue
-                elif ctype == "text/html" and body is None:
-                    try:
-                        body = part.get_payload(decode=True).decode(
-                            "utf-8", errors="replace")
-                    except:
-                        continue
+        subject, sender, date_raw, body = read_message(raw_email)
+        if body:
+            # One field per line: the title / employer / location / View
+            # quadruple jobs_screen.py parses. Plain text keeps its
+            # lines; in HTML, table cells and block tags become line
+            # breaks, so an HTML digest still yields one field per line
+            clean_text = html_to_text(body)
         else:
-            payload = msg_obj.get_payload(decode=True)
-            if payload:
-                body = payload.decode("utf-8", errors="replace")
+            # Still written, with no listings, so the message isn't
+            # downloaded again on every run; counted in the summary
+            print(f"No body found: {subject[:50]}... ({filepath.name} "
+                  f"written without listings)")
+            no_body += 1
+            clean_text = ""
 
-        if not body:
-            print(f"No body found: {subject[:50]}...")
-            continue
-
-        # One field per line: the title / employer / location / View
-        # quadruple jobs_screen.py parses. Plain text keeps its lines;
-        # in the HTML fallback, table cells and block tags become line
-        # breaks, so an HTML-only digest still yields one field per line
-        clean_text = html_to_text(body)
-
-        with open(filepath, "w", encoding="utf-8") as f:
-            f.write("# Metadata\n")
-            f.write(f"Subject: {subject}\n")
-            f.write(f"Sender: {sender}\n")
-            f.write(f"Date: {date_raw}\n")
-            f.write(f"UID: {uid}\n")
-            f.write("---\n\n")
-            f.write(clean_text)
-
+        write_atomic(filepath, digest_record(subject, sender, date_raw,
+                                             uid, clean_text))
         processed += 1
         print(f"Ingested UID {uid}: {subject[:60]}... ({filepath.name})")
 
-    print(f"Processed {processed} new, skipped {duplicates} duplicate(s) "
-          f"and {stale_skipped} stale digest(s) "
+    print(f"Processed {processed} new ({no_body} without a body), skipped "
+          f"{duplicates} duplicate(s) and {stale_skipped} stale digest(s) "
           f"(recency_days={RECENCY_DAYS}).")
 
     mail.close()
@@ -306,4 +273,3 @@ def main():
 
 if __name__ == "__main__":
     sys.exit(main())
-    
