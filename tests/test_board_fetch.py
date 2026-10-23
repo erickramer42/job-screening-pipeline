@@ -19,7 +19,7 @@ CONFIG = {
     "pay_floor": 100000,
 }
 
-# The layout every live board file has (format 2). record_text must
+# The layout every live board file has (format 3). record_text must
 # reproduce it byte for byte, or every file is rewritten on the next
 # run; a deliberate change needs a FILE_FORMAT bump instead
 EXPECTED_FILE = """\
@@ -27,9 +27,8 @@ EXPECTED_FILE = """\
 Source: greenhouse/example
 Company: Example Co
 URL: https://example.com/1
-Title: Senior Engineer
-Pay: $120,000-$150,000
-Format: 2
+Posted: 2026-09-01
+Format: 3
 ---
 
 Senior Engineer
@@ -49,22 +48,24 @@ def greenhouse_board(title="Senior Engineer", content=None):
     return {"jobs": [{"id": 1, "title": title,
                       "location": {"name": "Springfield"},
                       "absolute_url": "https://example.com/1",
+                      "first_published": "2026-09-01T09:30:00-04:00",
                       "content": content}]}
 
 class Layout(unittest.TestCase):
     def test_record_text_matches_the_file_format(self):
-        self.assertEqual(bf.FILE_FORMAT, 2)
+        self.assertEqual(bf.FILE_FORMAT, 3)
         self.assertEqual(bf.record_text(
             "greenhouse", "example", "Example Co", "https://example.com/1",
-            "Senior Engineer", "$120,000-$150,000",
+            "2026-09-01", "Senior Engineer",
             "Springfield ($120,000-$150,000)",
             "About the role\nBuild things."), EXPECTED_FILE)
 
     def test_no_description_no_marker(self):
-        text = bf.record_text("lever", "example", "Example Co", "u",
-                              "Senior Engineer", "", "Springfield", "")
+        text = bf.record_text("lever", "example", "Example Co", "u", "",
+                              "Senior Engineer", "Springfield", "")
         self.assertTrue(text.endswith("Springfield\nView\n"))
         self.assertNotIn(pipeline_common.DESC_MARKER, text)
+        self.assertNotIn("Posted:", text)
 
 class Parsing(unittest.TestCase):
     def test_greenhouse_pay_from_the_transparency_block(self):
@@ -110,6 +111,91 @@ class Parsing(unittest.TestCase):
         self.assertEqual((row.pay, row.pay_min, row.pay_max),
                          ("$124,800-$145,600", 124800, 145600))
         self.assertIs(row.remote, False)
+
+    def test_greenhouse_arrangement_only_location_reads_the_offices(self):
+        offices = [{"name": "HQ", "location": "Springfield, ST"},
+                   {"name": "Riverton office", "location": None},
+                   {"name": "HQ", "location": "Springfield, ST"}]
+        cases = [
+            ("Hybrid", offices,
+             ("Hybrid: Springfield, ST; Riverton office", None)),
+            ("Hybrid; In-Office", offices[:1],
+             ("Hybrid; In-Office: Springfield, ST", None)),
+            ("Distributed", [{"location": "United States"}],
+             ("Distributed: United States", True)),
+            # A name with a place, or a bare "Remote", is kept as it is
+            ("Remote", offices, ("Remote", None)),
+            ("Springfield", offices, ("Springfield", None)),
+            ("Hybrid Springfield", offices, ("Hybrid Springfield", None)),
+            ("Hybrid", [], ("Hybrid", None)),
+            (None, offices, (None, None)),
+        ]
+        for name, offs, expected in cases:
+            with self.subTest(name=name):
+                self.assertEqual(bf.greenhouse_location(name, offs), expected)
+
+    def test_lever_description_pay_and_date(self):
+        def posting(salary):
+            return {"id": "l1", "text": "Senior Engineer",
+                    "categories": {"location": "Springfield, ST",
+                                   "allLocations": ["Springfield, ST"]},
+                    "country": "US", "workplaceType": "hybrid",
+                    "hostedUrl": "https://example.com/l1",
+                    "createdAt": 1788220800000,  # 2026-09-01 UTC
+                    "description": "<div>About Example Co &amp; us</div>",
+                    "lists": [{"text": "What You'll Do",
+                               "content": "<li>Build things</li>"
+                                          "<li>Run them</li>"},
+                              "not a list"],
+                    "additional": "<div>Pay is $1 &lt; $2</div>",
+                    "salaryRange": salary}
+        (row,) = bf.flatten([posting(
+            {"min": 130000, "max": 160000, "currency": "USD",
+             "interval": "per-year-salary"})], "lever", "example")
+        self.assertEqual((row.pay, row.pay_min, row.pay_max, row.posted),
+                         ("$130,000-$160,000", 130000, 160000, "2026-09-01"))
+        self.assertEqual((row.remote, row.country), (False, "US"))
+        self.assertEqual(bf.description_text("lever", row.raw_description),
+                         "About Example Co & us\nWhat You'll Do\n"
+                         "Build things\nRun them\nPay is $1 < $2")
+        for salary, pay in (
+                ({"min": 60, "max": 70, "currency": "USD",
+                  "interval": "per-hour-wage"}, "$124,800-$145,600"),
+                ({"min": 90000, "currency": "USD",
+                  "interval": "per-year-salary"}, "$90,000-$90,000"),
+                ({"min": 1, "max": 2, "currency": "GBP",
+                  "interval": "per-year-salary"}, ""),
+                ({"min": 1, "max": 2, "currency": "USD",
+                  "interval": "one-time"}, ""),
+                (None, "")):
+            with self.subTest(salary=salary):
+                (row,) = bf.flatten([posting(salary)], "lever", "example")
+                self.assertEqual(row.pay, pay)
+
+    def test_posted_date(self):
+        for value, expected in (
+                ("2026-09-01T09:30:00-04:00", "2026-09-01"),
+                ("2026-09-01T23:59:59.000Z", "2026-09-01"),
+                (1788220800000, "2026-09-01"),
+                (None, ""), ("", ""), ("soon", ""), (True, ""),
+                (10 ** 30, "")):
+            with self.subTest(value=value):
+                self.assertEqual(bf.posted_date(value), expected)
+
+    def test_each_platform_reads_its_posted_date(self):
+        boards = {
+            "greenhouse": {"jobs": [{"id": 1, "first_published":
+                                     "2026-09-01T00:00:00Z"}]},
+            "ashby": {"jobs": [{"id": "a", "publishedAt":
+                                "2026-09-01T00:00:00Z"}]},
+            "smartrecruiters": {"content": [{"id": "s", "releasedDate":
+                                             "2026-09-01T00:00:00.000Z"}]},
+            "lever": [{"id": "l", "createdAt": 1788220800000}],
+        }
+        for platform, board in boards.items():
+            with self.subTest(platform=platform):
+                (row,) = bf.flatten(board, platform, "example")
+                self.assertEqual(row.posted, "2026-09-01")
 
 class SyncBoard(unittest.TestCase):
     """sync_board against a temporary raw_boards/, with the APIs mocked."""
@@ -237,6 +323,34 @@ class SyncBoard(unittest.TestCase):
                         '$60,000 - $80,000&lt;/div&gt;'}]}
         self.sync(board)
         self.assertEqual(list(self.out.glob("*.txt")), [])
+
+    def test_arrangement_only_locations_are_filtered_by_their_offices(self):
+        def job(n, name, office):
+            return {"id": n, "title": "Senior Engineer",
+                    "location": {"name": name}, "absolute_url": "u",
+                    "content": "", "offices": [{"location": office}]}
+        self.sync({"jobs": [job(1, "Hybrid", "Springfield, ST"),
+                            job(2, "Hybrid", "Elsewhere, XY"),
+                            job(3, "Distributed", "United States"),
+                            job(4, "Distributed", "Canada")]})
+        lines = {f.name: f.read_text(encoding="utf-8").split("\n---\n")[1]
+                 .split("\n")[3] for f in self.out.glob("*.txt")}
+        self.assertEqual(lines, {
+            "greenhouse_1.txt": "Hybrid: Springfield, ST",
+            "greenhouse_3.txt": "Distributed: United States (Remote)"})
+
+    def test_lever_pay_floor(self):
+        def board(top):
+            return [{"id": "l1", "text": "Senior Engineer",
+                     "categories": {"location": "Springfield, ST"},
+                     "hostedUrl": "u", "salaryRange": {
+                         "min": 60000, "max": top, "currency": "USD",
+                         "interval": "per-year-salary"}}]
+        self.sync(board(80000), "lever")
+        self.assertEqual(list(self.out.glob("*.txt")), [])
+        self.sync(board(110000), "lever")
+        self.assertIn("\nSpringfield, ST ($60,000-$110,000)\nView\n",
+                      (self.out / "lever_l1.txt").read_text(encoding="utf-8"))
 
     def test_smartrecruiters_description_fetched_only_when_needed(self):
         def board(name):

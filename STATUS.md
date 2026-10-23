@@ -29,15 +29,27 @@ The goal is a focused daily application routine (~10 highest-quality matches per
 | Component | Status | Notes |
 |-----------|--------|-------|
 | Email ingest (`job_ingest.py`) | ✅ Operational | Fetches digest emails over IMAP into `raw/job_uv<UIDVALIDITY>_uid<UID>.txt`. Read-only (EXAMINE + `BODY.PEEK[]`). |
-| Board fetch (`board_fetch.py`) | ✅ Operational | Pulls `boards.json` companies into `raw_boards/` and filters by title, metro-area/US-remote location, and pay floor. Stores each posting's description (Greenhouse, Ashby, SmartRecruiters; not Lever). Closed postings, and those of boards removed from `boards.json`, move to `raw_boards/archive/`. A posting's file is rewritten whenever the posting changes or the file format is older. |
+| Board fetch (`board_fetch.py`) | ✅ Operational | Pulls `boards.json` companies into `raw_boards/` and filters by title, metro-area/US-remote location, and pay floor. Stores each posting's description and published date. A Greenhouse location that names only the work arrangement is read with the posting's offices. Closed postings, and those of boards removed from `boards.json`, move to `raw_boards/archive/`. A posting's file is rewritten whenever the posting changes or the file format is older. |
 | Slug discovery (`slug_probe.py`) | ✅ Operational | Guesses board slugs for company names (e.g. `targets.txt`) and prints `boards.json` lines for slugs that return jobs |
 | Job parsing (`jobs_screen.py` parser) | ✅ Operational | Reads title/employer/location quadruples from `raw/` and `raw_boards/`. Keeps one copy per listing (board copy first, then newest digest) and cuts digests older than `recency_days`. A recent digest with text but no listings gets a warning in the shortlist. |
 | Hard filters | ✅ Operational | Cuts the employers and title patterns listed in `pipeline_config.json`, digest listings outside the search area, and jobs already applied to (`applied.txt`, or an `a` flag in `feedback/`, which follows a board posting by URL) |
 | LLM ranking | ✅ Operational | Pass 1 scores every survivor 0–100 from title/employer/location. Pass 2 re-scores the top `rerank_top_n` listings that have a description, using a role-section excerpt. Thinking is off and the first attempt is greedy, so scores are repeatable; `score_caps` (by employer, title or posting text) are enforced after each pass. Malformed responses are retried; 3 consecutive failed batches stop a pass. |
-| Output generation | ✅ Operational | Produces `out/shortlist_YYYY-MM-DD.md` and JSON. Board rows include direct posting links; ▲ marks pass-2 scores. The JSON records the model, prompt and settings behind the run. |
+| Output generation | ✅ Operational | Produces `out/shortlist_YYYY-MM-DD.md` and JSON. Board rows include direct posting links and their posted date; ▲ marks pass-2 scores. The JSON records the model, prompt and settings behind the run. |
 | Scheduled runs | ✅ Operational | Task Scheduler runs ingest at 01:00 and 05:00, and board fetch + screening at 06:00. Tasks wake the computer, run after a missed start, and the wrappers retry (see [Automation](#automation)). Verified across 2026-10-09 to 10-23, with two misses. On 10-14 no task ran: a Windows Update restart at 00:33 left no one signed in until 08:52, and the missed-start catch-up didn't run the tasks after sign-in. On 10-22 screening failed all 3 attempts because Ollama wasn't running. Since 2026-10-23 both tasks also start at log on, the screening wrapper starts Ollama before a retry, and a failed morning leaves `out/FAILED_<date>.md`. |
 
 ### Recent Changes (2026-10-23)
+- **Board postings whose location is only "Hybrid", "In-Office" or "Distributed" are no longer lost:**
+  - One configured Greenhouse board puts the work arrangement in the location field and the city only in the posting's offices. None of its 216 title-matching postings passed the area filter, so the board counted as having "none in the area".
+  - For such a location, board fetch now adds the office locations (`Hybrid: <city>`), and "Distributed" counts as remote. Every other location is unchanged.
+  - On the live boards, 101 postings from that board are now kept. No other board's postings changed. The daily run gains three pass-1 batches, about a minute.
+- **Lever postings carry their description and pay:** the description is built from the body, the bulleted lists under their headings, and the closing text. Pay comes from `salaryRange`, in USD per year or per hour, so `pay_floor` applies. The schema was checked on live Lever boards. No Lever board is configured yet.
+- **The shortlist shows when each board posting was published** (Posted column, and `posted` in the JSON). Board postings are exempt from `recency_days`, so a posting open for months used to look like a new one. Digest rows show `-`.
+- **Board file format 3:** a `Posted:` line, and no `Title:` or `Pay:` lines, which nothing read (review L11). Every board file is rewritten once by the next run, and the SmartRecruiters descriptions are fetched once more.
+- **Tests:** 141, up from 133.
+- **Checked:** against the live APIs, the committed and new board fetch ran on copies of `raw_boards/`.
+  - All 181 existing files kept identical listing lines and descriptions. Only their metadata changed, as described.
+  - The 101 new files all come from that one board. Nothing more was archived.
+  - With a stand-in model, the screener sent all 272 earlier pass-1 lines unchanged, plus 99 new ones; 2 of the new postings were duplicates or hard-filtered.
 - **Scheduled runs recover on their own:**
   - **An update restart no longer costs a morning:** both tasks also start at log on, ingest after 5 minutes and screening after 15. Screening skips a start before 06:00, since the daily run comes then, and a day whose shortlist is already written.
   - **Ollama down:** before each retry, the screening wrapper starts the Ollama app if it isn't running. Ollama already starts at login, but was down at 06:00 on 10-22.
@@ -74,7 +86,7 @@ The goal is a focused daily application routine (~10 highest-quality matches per
   - The next ingest renames the 38 existing files once. Checked first, read-only against the mailbox: all 38 match the server's current UIDs.
 - **Parser canary:** a recent digest with text but no listings gets a WARNING in the shortlist, as the sign of a changed digest format. All digests on disk have listings today.
 - **Board fetch:**
-  - Each board's log line starts with how many postings the API returned. One board returns none at all, which suggests a stale slug. Three others return postings, but none in the area.
+  - Each board's log line starts with how many postings the API returned. One board returns none at all, which suggests a stale slug. Three others return postings, but none in the area. (For one of the three, that was the location format, fixed above.)
   - The files of a board removed from `boards.json` are archived.
 - **Smaller fixes:**
   - An `applied.txt` line that can never match is reported.
@@ -272,7 +284,6 @@ Quick fixes and score stabilization from a code review.
 | Every run re-scores everything in the recency window | Medium | Each day re-scores all digest listings from the last `recency_days` plus every live board posting, though ~97% were scored the day before. The 10-23 scheduled run took 4 min 41 s; runs took ~25 min before 2026-10-22. | Score cache keyed by listing |
 | Scores depend on batch-mates | Medium | The same listing scored in a different batch of 30 moves ~6 points on average (8% move 20+), against ~1.2 for a repeat of the same batch. The per-batch quota is gone (2026-10-22), but the model still grades partly against the other listings in its request. | Score each new listing in its own request, together with the score cache |
 | Dedup key ignores location | Low | Same title+employer in another city is dropped. The kept copy is the board row when there is one, otherwise the newest digest. On 10-23 this hid 1 of 360 listings: a board posting with two locations in the area. | Add location to the key where the location strings are comparable; it's also listing identity, so it would reshuffle batches and orphan verdicts |
-| Lever descriptions not captured | Low | Lever postings never reach pass 2. No Lever boards are configured today. | Probe the Lever schema when a Lever board is added |
 | `slug_probe.py` "VERIFIED" only means the slug has jobs, on Ashby and Lever | Low | A generic name (e.g. "Acme") can match a different company's board. Greenhouse and SmartRecruiters boards now show their own name, and a different one is marked CHECK; Ashby and Lever don't name the company. | Open an Ashby or Lever board before adding it to `boards.json` |
 
 ---

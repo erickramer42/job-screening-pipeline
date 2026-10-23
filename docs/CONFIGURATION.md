@@ -19,7 +19,7 @@ Both `_env` keys must be valid variable names (letters, digits, underscores). In
 
 ## Search area (`board_fetch.py` and `jobs_screen.py`)
 
-Board fetch applies these to postings, using the platforms' structured remote and country fields where they exist. The screener applies them to digest listings before ranking, using the location text alone.
+Board fetch applies these to postings, using the platforms' structured remote and country fields where they exist. A Greenhouse location that names only the work arrangement ("Hybrid", "In-Office", "Distributed") is matched with the posting's office locations added. The screener applies these rules to digest listings before ranking, using the location text alone.
 
 | Key | Purpose | Example |
 |-----|---------|---------|
@@ -30,7 +30,7 @@ Board fetch applies these to postings, using the platforms' structured remote an
 
 | Key | Purpose | Example |
 |-----|---------|---------|
-| `pay_floor` | Annual base salary in USD. A posting is cut only when the **top** of its published range is below this; postings without published pay are kept. Pay is read from Greenhouse pay-transparency sections and Ashby salary data, with hourly rates × 2080. Lever and SmartRecruiters postings never have pay parsed. Missing or `0` disables the cut. | `100000` |
+| `pay_floor` | Annual base salary in USD. A posting is cut only when the **top** of its published range is below this; postings without published pay are kept. Pay is read from Greenhouse pay-transparency sections, and from Ashby and Lever salary data in USD, with hourly rates × 2080. SmartRecruiters postings never have pay parsed. Missing or `0` disables the cut. | `100000` |
 | `included_title_patterns` | Python regular expressions. A board posting is fetched only if its title matches at least one, ignoring case. Matching is by substring, so `"analyst"` also matches "Analysts". An empty list fetches every title. Applies to board postings only. | `["analyst", "data ?engineer"]` |
 | `excluded_keywords` | Plain phrases, checked after `included_title_patterns`. A board posting is skipped if its title contains one as a whole word, ignoring case: `"sales engineer"` blocks "Sales Engineer II" but not "Sales Platform Engineer". Applies to board postings only. | `["intern", "recruiter", "sales engineer"]` |
 
@@ -51,15 +51,15 @@ Board fetch applies these to postings, using the platforms' structured remote an
 
 | Key | Purpose | Default |
 |-----|---------|---------|
-| `recency_days` | Digests older than this many days (by their Date header) are skipped by ingest and cut as stale by the screener. A listing still present in a newer digest stays. Board postings are exempt, because closed postings are archived instead. Digests with an unreadable date are kept, with a warning. `0` or missing disables the window. | `0` |
+| `recency_days` | Ingest leaves out digests that arrived more than this many days ago, plus one day, since its IMAP search counts arrival dates in whole days. The screener cuts digests older than this many days by their Date header. A listing still present in a newer digest stays. Board postings are exempt, because closed postings are archived instead. Digests with an unreadable date are kept, with a warning. `0` or missing disables the window. | `0` |
 | `pass1_batch` | Listings per pass-1 request. Lower it only if responses come back truncated. | `30` |
 | `rerank_top_n` | How many of the top pass-1 listings that have a description get re-scored in pass 2. `0` turns pass 2 off. | `15` |
 | `rerank_batch` | Listings per pass-2 request. | `5` |
 | `excerpt_chars` | Maximum length of the posting excerpt sent per listing in pass 2. | `1500` |
 | `model_thinking` | Let a thinking model reason before it answers. See [Model thinking](#model-thinking) below. | `false` |
 | `num_ctx` | The model's context window per request, in tokens. It must hold the prompt, the batch and the response. | `8192` |
-| `score_caps` | Upper score limits applied in code after each pass. Optional. See [Score caps](#score-caps). | `[{"employers": ["Acme Staffing"], "max_score": 50}]` |
-| `shortlist_per_employer` | At most this many shortlist rows from one employer; the rest are counted under the table and stay in the JSON. `0` or missing means no limit. | `2` |
+| `score_caps` | Upper score limits applied in code after each pass, for example `[{"employers": ["Acme Staffing"], "max_score": 50}]`. Optional. See [Score caps](#score-caps). | `[]` |
+| `shortlist_per_employer` | At most this many shortlist rows from one employer, for example `3`; the rest are counted under the table and stay in the JSON. `0` or missing means no limit. | `0` |
 
 The pass-2 excerpt starts at the posting's role section: a heading such as "What you'll do", "Responsibilities" or "Job description". Failing that, it starts at a similar phrase in the first half of the description. Mentions inside closing EEO or pay text are ignored. It's cut at a sentence or line end.
 

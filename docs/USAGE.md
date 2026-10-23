@@ -17,8 +17,9 @@ jobs_screen.py   raw/ + raw_boards/     ->  recency + hard filters -> pass 1 -> 
    - A file is named for the folder's UIDVALIDITY and the message's UID. If the server ever resets its UIDs, the window is ingested again, rather than new digests being skipped as already saved.
 2. **Board fetch** pulls each configured board. It keeps postings whose titles match your patterns and whose location is in your metro area or remote within the US.
    - It drops postings whose published pay range tops out below your floor.
+   - Some Greenhouse boards give only the work arrangement as the location ("Hybrid", "In-Office", "Distributed"). For those, the posting's office locations are added, as in `Hybrid: Springfield, ST`, and the filter reads them; "Distributed" counts as remote.
    - Postings that close, or stop passing the filters, move to `raw_boards/archive/`. So do the files of a board you remove from `boards.json`.
-   - Each posting's description is stored below the listing. Greenhouse, Ashby and SmartRecruiters provide one; Lever isn't supported yet.
+   - Each posting's description is stored below the listing, from every supported platform, along with the date the board first published it.
    - A posting's file is rewritten whenever its text would change: the employer edited the title, location, pay or description, or an older version of the script wrote the file.
    - SmartRecruiters descriptions cost a request per posting, so they're fetched again only when the listing lines change.
    - Files are written through a temporary file, so an interrupted run never leaves a truncated one.
@@ -116,8 +117,9 @@ They write their fixtures to a temporary folder, mock the network, and need no p
 
 ## Outputs
 
-- `out/shortlist_<date>.md` is the top 25 as a table: score, flags, title, employer, location, link, and the model's one-line reason.
+- `out/shortlist_<date>.md` is the top 25 as a table: score, flags, title, employer, location, posted date, link, and the model's one-line reason.
   - A ▲ before the score marks a listing re-scored in pass 2.
+  - Posted is the date the board first published the posting. Digest rows show `-`. Board postings are exempt from `recency_days`, so this is how to spot one that has been open for months.
   - Flags come from `score_caps` rules; `capped` means a rule lowered the model's score.
   - With `shortlist_per_employer` set, a line under the table counts the postings left out for that limit.
   - Jobs in `applied.txt` that are still posted are listed after the table.
@@ -128,7 +130,8 @@ They write their fixtures to a temporary folder, mock the network, and need no p
   - **Every ranked listing**, with its score and reason, plus these fields where they apply:
     - re-scored listings: `pass1_score`, `rescored`, and the `excerpt` pass 2 sent, plus `pass1_capped_from` when a cap lowered the pass-1 score;
     - listings that match a cap rule: `score_cap` and `flags`, plus `capped_from` if the cap lowered the score;
-    - shortlisted listings: `shortlist_rank`.
+    - shortlisted listings: `shortlist_rank`;
+    - board listings: `posted`, when the board gives a date.
   - **Every cut listing**, with its `reject_reason`: `applied`, `excluded employer`, `excluded title pattern`, `outside area`, or `stale digest`.
   - `failed_batches` and `rerank_failed_batches`.
 

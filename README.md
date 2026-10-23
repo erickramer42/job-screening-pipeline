@@ -36,15 +36,15 @@ verdicts.py <-- the owner's verdicts in feedback/<date>.md <--+
 
 The rows are placeholders, laid out in the real shortlist's format:
 
-| # | Score | Flags | Title | Employer | Location | Link | Reason |
-|---|-------|-------|-------|----------|----------|------|--------|
-| 1 | ▲ 86 |  | Senior Backend Engineer | Acme Robotics | Springfield, ST ($150,000-$180,000) | https://… | Python services and distributed systems at the core; level fits. |
-| 2 | 72 |  | Software Engineer III | Initech | Remote - US | - | Backend title at the right level; stack unknown from the listing. |
-| 3 | ▲ 50 | rails, capped | Senior Platform Engineer | Globex | Springfield, ST | https://… | Strong platform fit, but requires 5+ years of Rails. |
+| # | Score | Flags | Title | Employer | Location | Posted | Link | Reason |
+|---|-------|-------|-------|----------|----------|--------|------|--------|
+| 1 | ▲ 86 |  | Senior Backend Engineer | Acme Robotics | Springfield, ST ($150,000-$180,000) | 2026-10-20 | https://… | Python services and distributed systems at the core; level fits. |
+| 2 | 72 |  | Software Engineer III | Initech | Remote - US | - | - | Backend title at the right level; stack unknown from the listing. |
+| 3 | ▲ 50 | rails, capped | Senior Platform Engineer | Globex | Hybrid: Springfield, ST | 2026-08-03 | https://… | Strong platform fit, but requires 5+ years of Rails. |
 
 - ▲ marks a score revised against the posting text in pass 2.
 - `rails` is a config rule's flag, and `capped` means that rule lowered the model's score.
-- Digest rows have no link.
+- Posted is the date the board published the posting. Digest rows have neither a date nor a link.
 
 ## Design decisions
 
@@ -90,7 +90,7 @@ Each of these was measured before and after the change. [STATUS.md](STATUS.md) h
   - A partial run, in either pass, still writes the shortlist, flagged at the top, and exits 1.
   - A preflight check tells an Ollama outage apart from a model that isn't installed, and a request Ollama rejects stops the run with its reason instead of being retried.
 - **Atomic writes.** Every file is written through a temporary file, so a killed run never leaves a truncated one.
-- **133 `unittest` tests**, which need no network and no personal config. They include the contracts between stages:
+- **141 `unittest` tests**, which need no network and no personal config. They include the contracts between stages:
   - what ingest and board fetch write must parse in the screener;
   - the board-file layout is pinned byte for byte;
   - each exit code, with the screener run end to end against a stand-in model.

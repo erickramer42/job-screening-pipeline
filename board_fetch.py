@@ -20,8 +20,13 @@ description prose can never be misread as a listing. Text conversion
     fetched from the detail endpoint jobAd.sections.{jobDescription,
     qualifications}, one request per posting, so only when the
     posting's listing lines changed or its file has no description
-  - Lever: no boards in use; captures "" until the day one is added
-    and its schema is probed
+  - Lever: 'description', each of 'lists' (a heading and <li> items),
+    then 'additional', all HTML (verified live 2026-10-23)
+
+Greenhouse location: some boards put only the work arrangement in
+location.name ("Hybrid", "In-Office", "Distributed") and the city in
+the posting's offices. For such a name the offices are appended:
+"Hybrid: Springfield, ST". Every other name is used as it is.
 
 Each posting's file is rewritten whenever its text would change: the
 employer edited the posting, FILE_FORMAT was bumped (files carry a
@@ -34,6 +39,7 @@ import json
 import re
 import sys
 import urllib.request
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import NamedTuple
 
@@ -47,11 +53,19 @@ OUT_DIR = Path("raw_boards")
 # only globs raw_boards/*.txt, so archived files drop out of ranking
 ARCHIVE_DIR = OUT_DIR / "archive"
 ANNUALIZE = {"1 YEAR": 1, "1 HOUR": 2080}
+LEVER_ANNUALIZE = {"per-year-salary": 1, "per-hour-wage": 2080}
 # Bump when the file layout or description text changes. The Format
 # line is part of every file, so each one is then rewritten on the next
 # run, SmartRecruiters descriptions included. 2: line-preserving text,
-# entities decoded after tag stripping
-FILE_FORMAT = 2
+# entities decoded after tag stripping. 3: a Posted: line; no Title:
+# or Pay: line, which nothing read
+FILE_FORMAT = 3
+# A Greenhouse location.name that states only how the job is worked.
+# Not "remote": a bare "Remote" already counts as US remote
+PLACELESS_RE = re.compile(
+    r"(?:hybrid|in[- ]?office|on[- ]?site|distributed|flexible)"
+    r"(?:[\s;,/]+(?:hybrid|in[- ]?office|on[- ]?site|distributed"
+    r"|flexible))*", re.I)
 
 API_TEMPLATES = {
     "greenhouse":
@@ -175,15 +189,18 @@ def description_text(platform, raw):
         # HTML-escaped HTML: decode once to get the markup; html_to_text
         # then strips tags and decodes the entities inside it
         return html_to_text(html_mod.unescape(raw))
+    if platform == "lever":
+        return html_to_text(raw)
     return normalize_text(raw)
 
-def record_text(platform, slug, company, url, title, pay, loc_line, desc):
+def record_text(platform, slug, company, url, posted, title, loc_line,
+                desc):
     """A posting file's full text: metadata, the title / company /
     location / View quadruple, then the description, if any."""
     lines = ["# Metadata", f"Source: {platform}/{slug}",
-             f"Company: {company}", f"URL: {url}", f"Title: {title}"]
-    if pay:
-        lines.append(f"Pay: {pay}")
+             f"Company: {company}", f"URL: {url}"]
+    if posted:
+        lines.append(f"Posted: {posted}")
     lines += [f"Format: {FILE_FORMAT}", "---", "",
               title, company, loc_line, "View"]
     text = "\n".join(lines) + "\n"
@@ -233,6 +250,37 @@ class Posting(NamedTuple):
     # Unconverted (see description_text), or "". sync_board() converts
     # it only for postings that pass the filters
     raw_description: str = ""
+    posted: str = ""        # YYYY-MM-DD, or "" when unknown
+
+def posted_date(value):
+    """YYYY-MM-DD from an ISO timestamp, or from epoch milliseconds
+    (Lever); "" for anything else. The date alone, so a re-stamped time
+    of day doesn't rewrite the file."""
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        try:
+            return datetime.fromtimestamp(value / 1000,
+                                          timezone.utc).date().isoformat()
+        except (OverflowError, OSError, ValueError):
+            return ""
+    if isinstance(value, str) and re.match(r"\d{4}-\d{2}-\d{2}", value):
+        return value[:10]
+    return ""
+
+def greenhouse_location(name, offices):
+    """(location, remote) for a Greenhouse posting. A name that states
+    only the work arrangement gets its offices' locations appended, and
+    "Distributed" counts as remote. Any other name is kept as it is,
+    with remote unknown."""
+    if not (isinstance(name, str) and PLACELESS_RE.fullmatch(name.strip())):
+        return name, None
+    places = dict.fromkeys(
+        (o.get("location") or o.get("name") or "").strip()
+        for o in offices or [] if isinstance(o, dict))
+    places.pop("", None)
+    remote = True if re.search("distributed", name, re.I) else None
+    if places:
+        name = f"{name}: {'; '.join(places)}"
+    return name, remote
 
 def flatten(board, platform, slug):
     """Normalize each platform's schema to a list of Posting.
@@ -242,25 +290,53 @@ def flatten(board, platform, slug):
     if platform == "greenhouse":
         for j in board.get("jobs", []):
             lo, hi = extract_greenhouse_pay(j.get("content"))
+            location, remote = greenhouse_location(
+                (j.get("location") or {}).get("name", "Unknown"),
+                j.get("offices"))
             jobs.append(Posting(
                 id=str(j.get("id")), title=j.get("title", ""),
-                location=(j.get("location") or {}).get("name", "Unknown"),
-                url=j.get("absolute_url", ""),
+                location=location, url=j.get("absolute_url", ""),
                 pay=f"${lo:,}-${hi:,}" if lo is not None else "",
-                pay_min=lo, pay_max=hi, remote=None, country=None,
-                raw_description=j.get("content") or ""))
+                pay_min=lo, pay_max=hi, remote=remote, country=None,
+                raw_description=j.get("content") or "",
+                posted=posted_date(j.get("first_published"))))
     elif platform == "lever":
         for j in board:
             cats = j.get("categories") or {}
             locs = (cats.get("allLocations")
                     or [cats.get("location") or "Unknown"])
-            # No description: the schema hasn't been probed yet
+            # Verified schema (2026-10-23, live boards): salaryRange ->
+            # min, max, currency, interval ("per-year-salary",
+            # "per-hour-wage", ...). Only USD per year or hour compares
+            # to PAY_FLOOR
+            sal = j.get("salaryRange") or {}
+            pay = ""
+            lo = hi = None
+            if (sal.get("currency") == "USD"
+                    and sal.get("interval") in LEVER_ANNUALIZE
+                    and isinstance(sal.get("min"), (int, float))):
+                k = LEVER_ANNUALIZE[sal["interval"]]
+                top = sal.get("max")
+                lo = int(sal["min"] * k)
+                hi = int((top if isinstance(top, (int, float))
+                          else sal["min"]) * k)
+                pay = f"${lo:,}-${hi:,}"
+            # The body, then each list under its heading, then the
+            # closing text; <br> keeps the parts on separate lines
+            parts = [j.get("description") or ""]
+            parts += [f"<h3>{html_mod.escape(lst.get('text') or '')}</h3>"
+                      f"<ul>{lst.get('content') or ''}</ul>"
+                      for lst in j.get("lists") or []
+                      if isinstance(lst, dict)]
+            parts.append(j.get("additional") or "")
             jobs.append(Posting(
                 id=j.get("id", ""), title=j.get("text", ""),
                 location="; ".join(locs), url=j.get("hostedUrl", ""),
-                pay="", pay_min=None, pay_max=None,
+                pay=pay, pay_min=lo, pay_max=hi,
                 remote=j.get("workplaceType") == "remote",
-                country=j.get("country")))
+                country=j.get("country"),
+                raw_description="<br>".join(p for p in parts if p),
+                posted=posted_date(j.get("createdAt"))))
     elif platform == "ashby":
         for j in board.get("jobs", []):
             pay = ""
@@ -296,7 +372,8 @@ def flatten(board, platform, slug):
                 remote=(bool(j.get("isRemote"))
                         or j.get("workplaceType") == "Remote"),
                 country=postal.get("addressCountry"),
-                raw_description=j.get("descriptionPlain") or ""))
+                raw_description=j.get("descriptionPlain") or "",
+                posted=posted_date(j.get("publishedAt"))))
     elif platform == "smartrecruiters":
         for j in board.get("content", []):
             loc = j.get("location") or {}
@@ -308,7 +385,8 @@ def flatten(board, platform, slug):
                           or "Unknown"),
                 url=f"https://jobs.smartrecruiters.com/{slug}/{jid}",
                 pay="", pay_min=None, pay_max=None,
-                remote=loc.get("remote"), country=loc.get("country")))
+                remote=loc.get("remote"), country=loc.get("country"),
+                posted=posted_date(j.get("releasedDate"))))
     return jobs
 
 def board_source(board_cfg):
@@ -402,8 +480,8 @@ def sync_board(board_cfg):
             # unchanged. A file without one (its fetch failed) retries.
             # A failed fetch costs the text, not the posting: it still
             # writes and ranks.
-            head = record_text(platform, slug, company, p.url, p.title,
-                               p.pay, loc_line, "")
+            head = record_text(platform, slug, company, p.url, p.posted,
+                               p.title, loc_line, "")
             old_head, _, old_desc = (old or "").partition(
                 f"\n{DESC_MARKER}\n")
             desc = old_desc.removesuffix("\n") if old_head == head else ""
@@ -416,8 +494,8 @@ def sync_board(board_cfg):
                           f"{p.id} ({e}) — written without description")
         else:
             desc = description_text(platform, p.raw_description)
-        text = record_text(platform, slug, company, p.url, p.title, p.pay,
-                           loc_line, desc)
+        text = record_text(platform, slug, company, p.url, p.posted,
+                           p.title, loc_line, desc)
         if text == old:
             continue
         write_atomic(fname, text)

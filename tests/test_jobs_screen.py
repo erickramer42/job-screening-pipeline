@@ -46,11 +46,13 @@ def digest_text(days_old, *listings):
         lines += [title, employer, location, "View"]
     return "\n".join(lines) + "\n"
 
-def board_text(title, employer, location, url, description=""):
+def board_text(title, employer, location, url, description="", posted=""):
     """A board file in board_fetch.py's layout."""
     lines = ["# Metadata", "Source: greenhouse/example",
-             f"Company: {employer}", f"URL: {url}", f"Title: {title}",
-             "Format: 2", "---", "", title, employer, location, "View"]
+             f"Company: {employer}", f"URL: {url}"]
+    if posted:
+        lines.append(f"Posted: {posted}")
+    lines += ["Format: 3", "---", "", title, employer, location, "View"]
     text = "\n".join(lines) + "\n"
     if description:
         text += f"\n{js.DESC_MARKER}\n{description}\n"
@@ -87,6 +89,16 @@ class ListingIdentity(SourceFiles):
         self.assertEqual(jobs[0]["source"], "raw_boards")
         self.assertEqual(jobs[0]["url"], "https://example.com/1")
         self.assertIn("Build things.", jobs[0]["description"])
+
+    def test_a_board_row_carries_its_posted_date(self):
+        self.write(self.raw, "job_uid_1.txt", digest_text(
+            1, ("Data Engineer", "Beta", "Springfield")))
+        self.write(self.boards, "greenhouse_1.txt", board_text(
+            "Senior Engineer", "Acme", "Springfield", "https://example.com/1",
+            posted="2026-09-01"))
+        jobs = {j["title"]: j for j in js.parse_jobs()[0]}
+        self.assertEqual(jobs["Senior Engineer"]["posted"], "2026-09-01")
+        self.assertEqual(jobs["Data Engineer"]["posted"], "")
 
     def test_newest_digest_copy_is_kept_and_judged_for_staleness(self):
         self.write(self.raw, "job_uid_1.txt", digest_text(
@@ -569,7 +581,7 @@ class MainRun(SourceFiles):
                 1):
             self.write(self.boards, f"greenhouse_{n}.txt", board_text(
                 title, employer, "Springfield", f"https://example.com/{n}",
-                "About the role\nBuild things."))
+                "About the role\nBuild things.", posted=f"2026-09-0{n}"))
         self.stamp = date.today().isoformat()
 
     def run_main(self, model, preflight=True):
@@ -626,6 +638,19 @@ class MainRun(SourceFiles):
         self.assertFalse(any("description" in j for j in rows))
         self.assertEqual({j["excerpt"] for j in rows if j.get("rescored")},
                          {"About the role\nBuild things."})
+
+    def test_the_shortlist_shows_when_board_rows_were_posted(self):
+        self.assertEqual(self.run_main(FakeModel())[0], 0)
+        rows = {ln.split(" | ")[3]: ln.split(" | ")[6]
+                for ln in self.shortlist().splitlines()
+                if ln.startswith("| ") and ln[2].isdigit()}
+        self.assertEqual(rows, {"Senior Engineer": "2026-09-01",
+                                "Backend Engineer": "2026-09-02",
+                                "Data Engineer": "-",
+                                "Platform Engineer": "-"})
+        self.assertEqual({j["title"]: j["posted"]
+                          for j in self.ranked()["ranked"]}["Senior Engineer"],
+                         "2026-09-01")
 
     def test_ollama_unreachable_writes_nothing(self):
         with mock.patch("urllib.request.urlopen",

@@ -324,6 +324,8 @@ def parse_jobs():
                     "location": location,
                     "source_file": f.name,
                     "url": url,
+                    # When the board first published it; board files only
+                    "posted": meta.get("Posted", ""),
                     "source": src_dir.name,
                     "description": desc,
                     "_dt": digest_dt,
@@ -941,10 +943,10 @@ def main():
               f"email. Rows marked ▲ were re-scored against the "
               f"posting text. Flags come from score_caps rules; "
               f"\"capped\" means a rule lowered the model's score.\n\n")
-    md.append("| # | Score | Flags | Title | Employer | Location | Link "
-              "| Reason |\n")
-    md.append("|---|-------|-------|-------|----------|----------|------"
-              "|--------|\n")
+    md.append("| # | Score | Flags | Title | Employer | Location | Posted "
+              "| Link | Reason |\n")
+    md.append("|---|-------|-------|-------|----------|----------|--------"
+              "|------|--------|\n")
     for i, j in enumerate(rows, 1):
         mark = "▲ " if j.get("rescored") else ""
         flags = j.get("flags", []) + (["capped"] if "capped_from" in j
@@ -952,6 +954,7 @@ def main():
         md.append(f"| {i} | {mark}{j['score']} | {', '.join(flags)} | "
                   f"{md_cell(j['title'])} | {md_cell(j['employer'])} | "
                   f"{md_cell(j['location'])} | "
+                  f"{md_cell(j.get('posted') or '-')} | "
                   f"{md_cell(j.get('url') or '-')} | "
                   f"{md_cell(j['reason'], 80)} |\n")
     if more:
