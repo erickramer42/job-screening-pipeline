@@ -142,6 +142,12 @@ def load_verdicts(folder=None):
                 key_by_url[v["url"]] = key
     return verdicts
 
+def template_row(n, job):
+    """Shortlist row n's line in the template. A pipe in the employer
+    gets a backslash, so it can't be mistaken for the separator."""
+    employer = job["employer"].replace("|", "\\|")
+    return f"{n} [?] {job['title']} | {employer} ::"
+
 def template_lines(stamp, rows):
     """The feedback file the screener writes for a day's shortlist."""
     lines = [f"# Feedback on out/shortlist_{stamp}.md",
@@ -150,10 +156,30 @@ def template_lines(stamp, rows):
              "# \"title | employer\" as written: it identifies the listing.",
              "# Other lines are free notes.",
              ""]
-    for i, j in enumerate(rows, 1):
-        employer = j["employer"].replace("|", "\\|")
-        lines.append(f"{i} [?] {j['title']} | {employer} ::")
-    return lines
+    return lines + [template_row(i, j) for i, j in enumerate(rows, 1)]
+
+def is_untouched_template(text, stamp):
+    """True for a feedback file as the screener wrote it: the template's
+    header, then row lines, none of them filled in, and nothing else."""
+    header = template_lines(stamp, [])
+    lines = text.splitlines()
+    if lines[:len(header)] != header:
+        return False
+    for ln in lines[len(header):]:
+        m = LINE_RE.match(ln)
+        if not m or m.group(2).strip() != "?" or m.group(4):
+            return False
+    return True
+
+def listed_keys(text):
+    """The listing keys of a feedback file's row lines, filled in or not."""
+    keys = set()
+    for ln in text.splitlines():
+        m = LINE_RE.match(ln)
+        listing = split_listing(m.group(3)) if m else None
+        if listing:
+            keys.add(listing_key(*listing))
+    return keys
 
 def ordering_agreement(graded):
     """(agreeing pairs, pairs) over the pairs of (grade, score) entries

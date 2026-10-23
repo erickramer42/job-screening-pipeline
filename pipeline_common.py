@@ -56,12 +56,13 @@ def parse_email_date(value):
         return None
     return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
 
-def write_atomic(path, text):
+def write_atomic(path, text, newline=None):
     """Write text through a temporary file, so an interrupted run leaves
     the old file or the new one, never a truncated one. The .tmp name
-    matches no glob the pipeline reads."""
+    matches no glob the pipeline reads. newline is open()'s: None writes
+    the platform's line ending for each "\\n", and "" writes text as is."""
     path = Path(path)
     tmp = path.with_name(path.name + ".tmp")
-    with open(tmp, "w", encoding="utf-8") as f:
+    with open(tmp, "w", encoding="utf-8", newline=newline) as f:
         f.write(text)
     os.replace(tmp, path)

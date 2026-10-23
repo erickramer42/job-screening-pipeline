@@ -23,7 +23,7 @@ Board fetch applies these to postings, using the platforms' structured remote an
 
 | Key | Purpose | Example |
 |-----|---------|---------|
-| `metro_cities` | A listing is kept if its location contains any of these names. The match is a case-insensitive substring, so `"springfield"` also matches "West Springfield". Remote listings open to the US are kept regardless. The names are combined into a regular expression, so avoid characters like `(`, `+`, `.`. An empty list matches every location. | `["springfield", "riverton"]` |
+| `metro_cities` | A listing is kept if its location contains any of these names, as whole words, ignoring case: `"springfield"` matches "West Springfield, ST" but not "Springfieldtown". Names are plain text, so `"St. Louis"` works as written. Remote listings open to the US are kept regardless. An empty list matches every location. | `["springfield", "riverton"]` |
 | `remote_regions` | Extra place names, such as your state and its abbreviation, that make a remote listing count as US-based when there's no country field. Matched as whole words, ignoring case. Without it, only US-wide wording ("US", "USA", "United States", "North America") or a bare "Remote" counts. Optional. | `["state name", "ST"]` |
 
 ## Board fetch (`board_fetch.py`)

@@ -1,0 +1,60 @@
+@echo off
+rem Morning run: refresh board postings, then screen and rank. Scheduled
+rem at 06:00, after the 01:00 and 05:00 ingest runs, and 15 minutes after
+rem log on, for a morning when an update restart left no one signed in.
+setlocal
+cd /d "%~dp0" || exit /b 1
+if not exist logs mkdir logs
+rem Redirected output otherwise uses the ANSI code page, which can't
+rem encode every character in company names and titles
+set PYTHONUTF8=1
+set "OLLAMA_APP=%LOCALAPPDATA%\Programs\Ollama\ollama app.exe"
+rem Rotate logs: keep newest 2,000 lines per file
+for %%L in (logs\boards.log logs\screen.log) do (
+  if exist %%L powershell -NoProfile -Command ^
+    "Get-Content -Encoding UTF8 '%%L' -Tail 2000 | Set-Content -Encoding UTF8 '%%L.tmp'; Move-Item -Force '%%L.tmp' '%%L'"
+)
+rem At most one run a day, from 06:00: a start at log on is skipped
+rem before 06:00 (the daily trigger runs then) and once today's shortlist
+rem is written. Exit 10 means skip; anything else, a crash included, runs
+call python -u wrapper_helper.py begin 06:00 >> logs\screen.log 2>&1
+if %errorlevel% equ 10 exit /b 0
+set FAILED=0
+
+rem A board fetch failure is logged, but screening still runs on the
+rem postings already on disk
+echo [%date% %time%] board fetch >> logs\boards.log
+call python -u board_fetch.py >> logs\boards.log 2>&1
+set RC=%errorlevel%
+if %RC% neq 0 (
+  echo [%date% %time%] board fetch FAILED rc=%RC% >> logs\errors.log
+  set FAILED=1
+)
+
+rem jobs_screen.py exits 2 when nothing could be scored (usually Ollama
+rem still starting) and nothing was written, so only that case is
+rem retried: up to 3 attempts, 15 minutes apart
+set /a ATTEMPT=0
+:attempt
+set /a ATTEMPT+=1
+echo [%date% %time%] screen attempt %ATTEMPT% >> logs\screen.log
+call python -u jobs_screen.py >> logs\screen.log 2>&1
+set RC=%errorlevel%
+if %RC% equ 2 if %ATTEMPT% lss 3 (
+  rem Ollama starts at log on, but was down on 2026-10-22: start its app
+  rem before the retry, unless it's already running
+  tasklist /fi "imagename eq ollama app.exe" 2>nul | find /i "ollama app.exe" >nul
+  if errorlevel 1 if exist "%OLLAMA_APP%" (
+    echo [%date% %time%] starting Ollama before the retry >> logs\screen.log
+    start "" "%OLLAMA_APP%"
+  )
+  powershell -NoProfile -Command "Start-Sleep -Seconds 900"
+  goto attempt
+)
+if %RC% neq 0 (
+  echo [%date% %time%] screen FAILED rc=%RC% attempts=%ATTEMPT% >> logs\errors.log
+  rem A marker in out/, next to where the shortlist would be
+  call python -u wrapper_helper.py failed %RC% %ATTEMPT% logs\screen.log >> logs\screen.log 2>&1
+  set FAILED=1
+)
+exit /b %FAILED%

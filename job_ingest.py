@@ -5,10 +5,9 @@ write raw/*.txt files for screening. Each file is named for the folder's
 UIDVALIDITY and the message's UID (job_uv<UIDVALIDITY>_uid<UID>.txt),
 which together identify a message for as long as it exists.
 
-Digests whose Date header is older than recency_days (pipeline_config)
-are skipped: header probe only, no body download, no file written. The
-server folder is never touched (read-only guarantee), so old emails
-cost one cheap header fetch per run until manually archived.
+With recency_days set (pipeline_config), the folder is searched with
+SINCE, so the server leaves older digests out: they're never listed or
+downloaded. The server folder is never touched (read-only guarantee).
 """
 import email
 import email.policy
@@ -18,15 +17,16 @@ import os
 import re
 import ssl
 import sys
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from html_text import html_to_text
-from pipeline_common import (configure_from_file, parse_email_date,
-                             write_atomic)
+from pipeline_common import configure_from_file, write_atomic
 
 IMAP_TIMEOUT = 60  # seconds per socket operation
 RAW_DIR = Path("raw")
+# IMAP dates name the month in English, whatever the locale
+MONTHS = "Jan Feb Mar Apr May Jun Jul Aug Sep Oct Nov Dec".split()
 
 def is_loopback(host):
     if host.lower() == "localhost":
@@ -108,24 +108,18 @@ def fetch_payload(data):
             return item[1]
     return None
 
-def digest_is_stale(mail, uid):
-    """
-    True when the email's Date header is older than RECENCY_DAYS.
-    Header-only fetch (BODY.PEEK, so no Seen flag): the body is never
-    downloaded for old digests. Unreadable/missing dates return False —
-    age can't be verified, so the email is fetched and the screener's
-    undated-digest path decides what happens to it.
-    """
+def search_criteria(now=None):
+    """What to ask UID SEARCH for: every message, or with RECENCY_DAYS
+    set, those that arrived SINCE the window's start. SINCE compares the
+    arrival date, by whole days, so the window searched is one day
+    longer; the screener cuts a stale digest by its Date header anyway.
+    Checked 2026-10-23 against the bridge: at windows of 1 to 10 days,
+    this missed no message the Date header put inside the window."""
     if not RECENCY_DAYS:
-        return False
-    typ, data = mail.uid('fetch', uid, '(BODY.PEEK[HEADER.FIELDS (DATE)])')
-    header = fetch_payload(data) if typ == "OK" else None
-    if header is None:
-        return False
-    dt = parse_email_date(email.message_from_bytes(header).get("Date", ""))
-    if dt is None:
-        return False
-    return (datetime.now(timezone.utc) - dt).days > RECENCY_DAYS
+        return "(ALL)"
+    start = ((now or datetime.now(timezone.utc))
+             - timedelta(days=RECENCY_DAYS + 1)).date()
+    return f"(SINCE {start.day:02d}-{MONTHS[start.month - 1]}-{start.year})"
 
 def read_message(raw_email):
     """(subject, sender, date, body) from a raw message. Subject and
@@ -237,7 +231,8 @@ def main():
 
     # Search BY UID to get stable identifiers directly (UIDs survive
     # deletions and moves; sequence numbers do not)
-    typ, search_data = mail.uid('search', None, "(ALL)")
+    criteria = search_criteria()
+    typ, search_data = mail.uid('search', None, criteria)
     if typ != "OK":
         print(f"[ERROR] UID search failed: {search_data}")
         mail.logout()
@@ -246,30 +241,22 @@ def main():
     print(f"Selected folder: {MAIL_FOLDER} ({data[0].decode()} messages)")
     uid_list = search_data[0].split()
     if not uid_list:
-        print("No emails found in folder.")
+        print(f"No emails found in folder {criteria}.")
         mail.logout()
         return 0
 
-    print(f"Found {len(uid_list)} emails to process.")
-    processed = duplicates = stale_skipped = fetch_failures = no_body = 0
+    print(f"Found {len(uid_list)} emails to process {criteria}.")
+    processed = duplicates = fetch_failures = no_body = 0
 
     for uid_bytes in uid_list:
         uid = uid_bytes.decode()
 
-        # Duplicate check first: a UID whose file exists costs nothing
-        # (no header probe, no body fetch). UIDs, unlike sequence
-        # numbers, stay stable across deletions and moves
+        # Duplicate check first: a UID whose file exists costs nothing.
+        # UIDs, unlike sequence numbers, stay stable across deletions
+        # and moves
         filepath = RAW_DIR / digest_name(uidvalidity, uid)
         if filepath.exists():
             duplicates += 1
-            continue
-
-        # Old digests are skipped before their bodies are downloaded.
-        # Re-probed every run (header-only fetch) until the email is
-        # manually archived on the server — deliberately cheap rather
-        # than writing skip-tombstones to raw/
-        if digest_is_stale(mail, uid):
-            stale_skipped += 1
             continue
 
         # Fetch by UID — one namespace end to end (uid search -> uid fetch).
@@ -302,8 +289,7 @@ def main():
         print(f"Ingested UID {uid}: {subject[:60]}... ({filepath.name})")
 
     print(f"Processed {processed} new ({no_body} without a body), skipped "
-          f"{duplicates} duplicate(s) and {stale_skipped} stale digest(s) "
-          f"(recency_days={RECENCY_DAYS}).")
+          f"{duplicates} duplicate(s).")
 
     mail.close()
     mail.logout()

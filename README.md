@@ -83,12 +83,14 @@ Each of these was measured before and after the change. [STATUS.md](STATUS.md) h
 ## Reliability and testing
 
 - **Unattended runs.** Windows Task Scheduler runs ingest overnight, then board fetch and screening at 06:00. The wrapper scripts retry and log.
+  - Both tasks also start at log on, so an update restart that leaves no one signed in doesn't cost a morning. Screening still runs at most once a day.
+  - A failed morning leaves `out/FAILED_<date>.md`, next to where the shortlist would be, with the reason.
 - **An exit-code contract with the scheduler:**
   - The screener exits 2 only when nothing was scored and nothing was written, for example because Ollama wasn't running. That's the only case the wrapper retries.
   - A partial run, in either pass, still writes the shortlist, flagged at the top, and exits 1.
   - A preflight check tells an Ollama outage apart from a model that isn't installed, and a request Ollama rejects stops the run with its reason instead of being retried.
 - **Atomic writes.** Every file is written through a temporary file, so a killed run never leaves a truncated one.
-- **116 `unittest` tests**, which need no network and no personal config. They include the contracts between stages:
+- **133 `unittest` tests**, which need no network and no personal config. They include the contracts between stages:
   - what ingest and board fetch write must parse in the screener;
   - the board-file layout is pinned byte for byte;
   - each exit code, with the screener run end to end against a stand-in model.
@@ -120,6 +122,7 @@ Email ingest (`python job_ingest.py`) also needs IMAP credentials in environment
 | `verdicts.py` | Reads the owner's verdicts and scores a run against them |
 | `html_text.py`, `location_filter.py`, `pipeline_common.py` | Shared code: HTML to text, the search-area rule, config loading and atomic writes |
 | `slug_probe.py` | Finds a company's board on the four platforms |
+| `run_*.bat.example`, `wrapper_helper.py` | The scheduled-run wrappers, and the date decisions they leave to Python |
 | `tests/` | The `unittest` suite |
 | `*.example.json` | Placeholder config to start from |
 

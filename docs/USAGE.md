@@ -11,7 +11,7 @@ jobs_screen.py   raw/ + raw_boards/     ->  recency + hard filters -> pass 1 -> 
 ```
 
 1. **Ingest** saves each digest email as a text file.
-   - Digests older than `recency_days` are skipped after checking only their Date header.
+   - With `recency_days` set, the folder is searched with SINCE, so the server leaves older digests out. SINCE counts the arrival date in whole days, so one extra day is searched; the screener cuts a stale digest by its Date header anyway.
    - Mail is opened read-only, so emails are never marked read, moved, or deleted.
    - Each job in the email must appear as four lines: title, employer, location, and a `View` link.
    - A file is named for the folder's UIDVALIDITY and the message's UID. If the server ever resets its UIDs, the window is ingested again, rather than new digests being skipped as already saved.
@@ -109,6 +109,7 @@ The tests use the standard library's `unittest` and live in `tests/`. They cover
 - the screener's exit codes, with `main()` run end to end and a stand-in for the model;
 - the board-file layout and when a file is rewritten or archived;
 - email decoding, digest file names, and an ingest run against a stand-in mailbox, which may only examine and peek;
+- the scheduled wrappers' date decisions (`wrapper_helper.py`): when screening starts, and the failure marker;
 - the contract between them: a file ingest or board fetch writes must parse into listings in the screener.
 
 They write their fixtures to a temporary folder, mock the network, and need no personal config.
@@ -123,12 +124,16 @@ They write their fixtures to a temporary folder, mock the network, and need no p
   - `feedback/<date>.md` is written alongside, ready for your verdicts.
   - Board rows link straight to the posting. Digest rows have no link, so open the digest email to find them.
 - `out/ranked_<date>.json` holds:
+  - **What produced the run** (`run`): when it started, the model and whether thinking was on, 12-character fingerprints of the ranking prompt (`prompt_sha`), the pass-2 addendum and the `score_caps` rules, and the settings that affect scores. Two runs with the same `prompt_sha` used the same prompt.
   - **Every ranked listing**, with its score and reason, plus these fields where they apply:
-    - re-scored listings: `pass1_score` and `rescored`, plus `pass1_capped_from` when a cap lowered the pass-1 score;
+    - re-scored listings: `pass1_score`, `rescored`, and the `excerpt` pass 2 sent, plus `pass1_capped_from` when a cap lowered the pass-1 score;
     - listings that match a cap rule: `score_cap` and `flags`, plus `capped_from` if the cap lowered the score;
     - shortlisted listings: `shortlist_rank`.
   - **Every cut listing**, with its `reject_reason`: `applied`, `excluded employer`, `excluded title pattern`, `outside area`, or `stale digest`.
   - `failed_batches` and `rerank_failed_batches`.
+
+  The posting text isn't copied into the JSON: it's in each row's `source_file`.
+- `out/FAILED_<date>.md` appears when a scheduled screening run fails (see [Scheduled runs](#scheduled-runs-windows)).
 
 ## When something fails
 
@@ -175,7 +180,7 @@ A short daily loop keeps the ranking honest, and gives it something to be measur
    - Keep `title | employer` as written: it identifies the listing, so a verdict stays valid on later days. A board row is also matched by its posting URL, from that day's `out/ranked_<date>.json`, so its verdict survives an edit to the title.
    - A later line on the same listing updates your verdict rather than replacing it. `[a]` alone keeps the earlier y/m/n, an empty note keeps the earlier note, and "applied" stays set once given.
    - Other lines are free notes, ignored by the parser.
-   - The file is never overwritten, so a rerun the same day keeps what you've filled in. The `feedback/` folder is gitignored.
+   - **A rerun the same day:** while the file is still the untouched template, it's rewritten for the rerun's rows. Once you've filled anything in, only the rows new to the list are appended, under a `# Rerun at HH:MM` comment; nothing already in the file changes. The `feedback/` folder is gitignored.
 2. **Record applications.** An `a` flag cuts that listing from future rankings, and `verdicts.py` then leaves it out of its figures, since the ranker no longer places it. For jobs you applied to outside the shortlist, add a line to `applied.txt`:
    - the posting's URL for a board row;
    - `Title | Employer` for a digest row, since those have no link.
@@ -201,16 +206,16 @@ A short daily loop keeps the ranking honest, and gives it something to be measur
 
 To have the shortlist waiting each morning, run the scripts from Windows Task Scheduler:
 
-1. **Create two wrapper batch files** in the repo. `*.bat` is gitignored, so wrappers stay local.
-   - The ingest wrapper runs `job_ingest.py`.
-   - The screening wrapper runs `board_fetch.py`, then `jobs_screen.py`.
-   - Each wrapper should:
-     - start with `cd /d "%~dp0"` so it runs from its own folder;
-     - `set PYTHONUTF8=1`, because Python on Windows otherwise writes redirected output in the ANSI code page and crashes on characters outside it;
-     - append unbuffered output to a file in `logs\`, for example `python -u job_ingest.py >> logs\ingest.log 2>&1`.
-   - **Retries:** retrying ingest on any failure is safe. Retry the screener only on exit code 2. Nothing was written in that case. Exit 1 means a partial run that a retry would score again from scratch, or a problem a retry can't fix.
-2. **Schedule the ingest task** for after your digests usually arrive (a second, later run catches stragglers cheaply). Schedule the screening task a few hours later.
-3. **Change the task settings:**
+1. **Copy the wrappers:** `run_ingest.bat.example` to `run_ingest.bat`, and `run_screen.bat.example` to `run_screen.bat`. `*.bat` is gitignored, so your copies stay local; the examples hold no personal data. They:
+   - start with `cd /d "%~dp0"` so they run from their own folder;
+   - `set PYTHONUTF8=1`, because Python on Windows otherwise writes redirected output in the ANSI code page and crashes on characters outside it;
+   - append unbuffered output to `logs\ingest.log`, `logs\boards.log` and `logs\screen.log`, trim them to 2,000 lines, and write one line per failed step to `logs\errors.log`.
+   - **Retries:** ingest is retried on any failure, 3 attempts 10 minutes apart. The screener is retried only on exit code 2, when nothing was written, 3 attempts 15 minutes apart, and the Ollama app is started before each retry unless it's running. Exit 1 means a partial run that a retry would score again from scratch, or a problem a retry can't fix.
+   - **Once a day:** the screening wrapper asks `wrapper_helper.py begin 06:00` whether to run. It skips a start before 06:00, and one after today's shortlist was written. Change `06:00` if your daily screening time differs.
+   - **A failed morning:** after the screener's last failed attempt, `out/FAILED_<date>.md` says what the exit code means and quotes the attempt's error lines. A later run that day removes it.
+2. **Schedule the ingest task** for after your digests usually arrive (a second, later run catches stragglers cheaply). Schedule the screening task a few hours later, at the time the screening wrapper names.
+3. **Add an "At log on" trigger to both tasks**, with a delay (5 minutes for ingest, 15 for screening). After an update restart that leaves no one signed in, the night's runs then happen once you sign in.
+4. **Change the task settings:**
    - Turn on "Wake the computer to run this task".
    - Turn on "Run task as soon as possible after a scheduled start is missed".
    - Set "Stop the task if it runs longer than" to a few hours, so a hung run doesn't block the next day's run.
@@ -257,7 +262,9 @@ python slug_probe.py targets.txt
 ```
 
 The script tries common slug spellings on all four platforms and prints a `boards.json` line for each slug that returns jobs.
-- **VERIFIED only means the slug has postings.** A generic name can match a different company's board, so open the board and check it before adding the line.
+- **VERIFIED only means the slug has postings.** A generic name can match a different company's board.
+  - Greenhouse and SmartRecruiters name the company on their postings, so the line says what the board calls itself, and starts that note with CHECK when it differs from the name you gave.
+  - Ashby and Lever don't name it, so open the board and check it before adding the line.
 - A company whose lookup fails (network down, a platform error) is reported as failed rather than as having no board, and the script then exits 1.
 - With no file argument, it takes employers that scored 60 or higher from the latest `out/ranked_*.json`. A file argument that doesn't exist stops the script instead.
 

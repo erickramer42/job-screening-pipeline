@@ -17,12 +17,17 @@ def location_matcher(metro_cities, remote_regions=()):
     configured by metro_cities and remote_regions.
 
     The metro city list lives in config (PII routing). Its names are
-    joined into one regex searched anywhere in the location; an empty
-    list matches every location. remote_regions adds your own region,
-    e.g. a state name and its abbreviation, matched as whole words, so
-    "Remote - <region>" counts as US when there is no country field.
+    plain text, matched as whole words anywhere in the location and
+    ignoring case: "springfield" matches "West Springfield, ST" but not
+    "Springfieldtown". An empty list matches every location.
+    remote_regions adds your own region, e.g. a state name and its
+    abbreviation, matched as whole words, so "Remote - <region>" counts
+    as US when there is no country field.
     """
-    metro_re = re.compile("|".join(metro_cities), re.I)
+    # Lookarounds rather than \b, so a name may start or end with a
+    # character that isn't a letter, such as "St."
+    metro_re = re.compile("|".join(rf"(?<!\w){re.escape(c)}(?!\w)"
+                                   for c in metro_cities), re.I)
     # Only consulted for remote locations without a country field
     us_re = re.compile(
         r"\bus\b|\busa\b|\bu\.s\.|united states|north america"

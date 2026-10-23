@@ -2,7 +2,9 @@
 """
 slug_probe.py — guess-and-verify board slugs for a list of company
 names against the four public job-board APIs. Prints verified entries
-ready to paste into boards.json.
+ready to paste into boards.json, each with the company name the board
+gives itself where the platform has one, so a board that belongs to a
+different company with a similar name stands out.
 
 Input: a file with one company name per line, e.g. targets.txt (or,
 when no file is given, employers pulled from the latest
@@ -47,10 +49,19 @@ def slug_variants(name):
     variants += [stem + s for s in SUFFIXES]
     return list(dict.fromkeys(v for v in variants if v))
 
-def probe(slug, platform):
-    """True if the endpoint returns live JSON with job data; False when
-    the platform has no such board (a 4xx answer) or it has no jobs.
-    Raises OSError when the platform can't be asked (network down,
+def postings(platform, data):
+    """The postings in a board API's answer, or [] for any other shape."""
+    if platform == "lever":
+        return data if isinstance(data, list) else []
+    if not isinstance(data, dict):
+        return []
+    key = "content" if platform == "smartrecruiters" else "jobs"
+    return data.get(key) or []
+
+def lookup(slug, platform):
+    """The board's postings when the slug has a board with postings;
+    [] when the platform has no such board (a 4xx answer) or it has no
+    jobs. Raises OSError when the platform can't be asked (network down,
     timeout, a 5xx answer), so an outage isn't reported as "no board"."""
     url = PROBES[platform].format(slug=slug)
     req = urllib.request.Request(
@@ -60,19 +71,38 @@ def probe(slug, platform):
             data = json.load(resp)
     except urllib.error.HTTPError as e:
         if 400 <= e.code < 500:
-            return False
+            return []
         raise
     except ValueError:  # not JSON: not a posting API answer
-        return False
+        return []
+    return postings(platform, data)
+
+def probe(slug, platform):
+    """True if the slug has a board with postings on the platform."""
+    return bool(lookup(slug, platform))
+
+def board_name(platform, jobs):
+    """The company name a board's postings give, or None. Greenhouse
+    and SmartRecruiters name it on each posting; Ashby and Lever don't.
+    Verified live 2026-10-23."""
+    first = jobs[0] if jobs and isinstance(jobs[0], dict) else {}
     if platform == "greenhouse":
-        return bool(data.get("jobs"))
-    if platform == "lever":
-        return isinstance(data, list) and len(data) > 0
-    if platform == "ashby":
-        return bool(data.get("jobs"))
+        return first.get("company_name") or None
     if platform == "smartrecruiters":
-        return bool(data.get("content"))
-    return False
+        return (first.get("company") or {}).get("name") or None
+    return None
+
+def name_note(name, board):
+    """What to tell the owner about the board's own name. VERIFIED only
+    means the slug has postings: a generic name can find a different
+    company's board."""
+    if board is None:
+        return "this platform doesn't name the company: check the board"
+    def letters(s):
+        return re.sub(r"[^a-z0-9]", "", s.lower())
+    if letters(name) in letters(board) or letters(board) in letters(name):
+        return f"the board is \"{board}\""
+    return f"CHECK: the board calls itself \"{board}\""
 
 def candidates():
     if len(sys.argv) > 1:
@@ -116,8 +146,9 @@ def main():
         try:
             for variant in slug_variants(name):
                 for platform in PROBES:
-                    if probe(variant, platform):
-                        found.append((platform, variant))
+                    jobs = lookup(variant, platform)
+                    if jobs:
+                        found.append((platform, variant, jobs))
                         break  # first platform hit is enough
                 if found:
                     break
@@ -126,16 +157,18 @@ def main():
             failed += 1
             continue
         if found:
-            platform, slug = found[0]
+            platform, slug, jobs = found[0]
             # json.dumps, so a name with a quote still pastes as JSON
             entry = json.dumps({"platform": platform, "slug": slug,
                                 "company": name}, ensure_ascii=False)
-            print(f"  {entry},   <- VERIFIED")
+            print(f"  {entry},   <- VERIFIED; "
+                  f"{name_note(name, board_name(platform, jobs))}")
             hits += 1
         else:
             print(f"  # {name}: no board found on any platform")
     print(f"\n{hits} verifiable boards found — paste the VERIFIED "
-          f"lines above into boards.json")
+          f"lines above into boards.json, after checking any marked CHECK, "
+          f"and those whose platform doesn't name the company")
     if failed:
         print(f"[ERROR] {failed} lookup(s) failed; those companies are "
               f"unchecked, not boardless.")

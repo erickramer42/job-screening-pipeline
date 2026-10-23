@@ -465,6 +465,58 @@ class Shortlist(unittest.TestCase):
         self.assertEqual([j["title"] for j in rows], ["Role 0", "Role 2"])
         self.assertEqual(dict(more), {"Acme": 2})
 
+class VerdictTemplate(unittest.TestCase):
+    """write_verdict_template on a new file, and on a same-day rerun."""
+    STAMP = "2026-01-02"
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.path = Path(tmp.name) / "feedback" / f"{self.STAMP}.md"
+
+    def rows(self, *titles):
+        return [{"title": t, "employer": "Acme"} for t in titles]
+
+    def write(self, *titles):
+        return js.write_verdict_template(self.path, self.STAMP,
+                                         self.rows(*titles))
+
+    def test_a_new_file_gets_the_template(self):
+        self.assertEqual(self.write("Senior Engineer"), "written")
+        self.assertIn("1 [?] Senior Engineer | Acme ::",
+                      self.path.read_text(encoding="utf-8"))
+
+    def test_an_untouched_template_follows_the_rerun(self):
+        self.write("Senior Engineer", "Data Engineer")
+        self.assertEqual(self.write("Senior Engineer", "Data Engineer"),
+                         "unchanged")
+        self.assertTrue(self.write("Lead Engineer").startswith("rewritten"))
+        text = self.path.read_text(encoding="utf-8")
+        self.assertIn("1 [?] Lead Engineer | Acme ::", text)
+        self.assertNotIn("Data Engineer", text)
+
+    def test_a_filled_file_only_gets_new_rows_appended(self):
+        for eol in ("\r\n", "\n"):
+            with self.subTest(line_endings=repr(eol)):
+                self.path.unlink(missing_ok=True)
+                self.write("Senior Engineer", "Data Engineer")
+                text = self.path.read_text(encoding="utf-8").replace(
+                    "1 [?]", "1 [y]").replace("\n", eol) + "my notes"
+                self.path.write_bytes(text.encode("utf-8"))
+                self.assertEqual(self.write("Data Engineer", "Lead Engineer",
+                                            "Senior Engineer"),
+                                 "1 row(s) new to the list appended")
+                after = self.path.read_bytes().decode("utf-8")
+                # Everything that was there stays byte for byte; the
+                # last line is ended, then a blank line and the new rows
+                self.assertTrue(after.startswith(text + eol))
+                self.assertEqual(after[len(text):].split(eol),
+                                 ["", "", after.split(eol)[-3],
+                                  "2 [?] Lead Engineer | Acme ::", ""])
+                self.assertTrue(after.split(eol)[-3].startswith(
+                    "# Rerun at "))
+                self.assertEqual(self.write("Lead Engineer"), "unchanged")
+
 class FakeModel:
     """Stands in for ollama_chat: scores every listing in a request 60,
     and raises error instead for the requests when(user) picks."""
@@ -561,6 +613,19 @@ class MainRun(SourceFiles):
         self.assertEqual(sum("rescored" in j for j in data["ranked"]), 2)
         self.assertEqual(len(model.requests), 4)
         self.assertNotIn("WARNING", self.shortlist())
+
+    def test_the_json_records_its_run_and_not_the_posting_text(self):
+        self.assertEqual(self.run_main(FakeModel())[0], 0)
+        data = self.ranked()
+        run = data["run"]
+        self.assertEqual((run["model"], run["prompt_sha"], run["pass1_batch"]),
+                         (js.MODEL, js.fingerprint("Rank jobs."), 2))
+        self.assertEqual(run["score_caps_sha"], js.fingerprint(
+            json.dumps(CONFIG["score_caps"], sort_keys=True)))
+        rows = data["ranked"] + data["rejected"]
+        self.assertFalse(any("description" in j for j in rows))
+        self.assertEqual({j["excerpt"] for j in rows if j.get("rescored")},
+                         {"About the role\nBuild things."})
 
     def test_ollama_unreachable_writes_nothing(self):
         with mock.patch("urllib.request.urlopen",

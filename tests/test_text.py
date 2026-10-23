@@ -40,6 +40,14 @@ class LocationMatcher(unittest.TestCase):
         self.assertTrue(self.ok("West Springfield, ST"))
         self.assertFalse(self.ok("Elsewhere"))
 
+    def test_city_names_are_plain_whole_words(self):
+        self.assertFalse(self.ok("Springfieldtown"))
+        ok = location_matcher(["St. Louis", "C++ City"])
+        self.assertTrue(ok("St. Louis, MO"))
+        self.assertTrue(ok("Remote or C++ City"))
+        self.assertFalse(ok("Stu Louis"))
+        self.assertFalse(ok("C City"))
+
     def test_remote_needs_the_us(self):
         self.assertTrue(self.ok("Remote"))
         self.assertTrue(self.ok("Remote - US"))

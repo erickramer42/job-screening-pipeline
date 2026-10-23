@@ -107,7 +107,9 @@ class Parsing(unittest.TestCase):
                                 "currencyCode": "EUR", "interval": "1 YEAR",
                                 "minValue": 1, "maxValue": 2}]}}]}
         (row,) = bf.flatten(board, "ashby", "example")
-        self.assertEqual(row[4:7], ("$124,800-$145,600", 124800, 145600))
+        self.assertEqual((row.pay, row.pay_min, row.pay_max),
+                         ("$124,800-$145,600", 124800, 145600))
+        self.assertIs(row.remote, False)
 
 class SyncBoard(unittest.TestCase):
     """sync_board against a temporary raw_boards/, with the APIs mocked."""

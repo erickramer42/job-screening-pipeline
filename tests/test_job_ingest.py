@@ -151,6 +151,20 @@ class Run(unittest.TestCase):
         self.assertNotIn(("uid fetch", ("5", "(BODY.PEEK[])")),
                          mailbox.commands)
 
+    def test_the_server_leaves_old_digests_out(self):
+        mailbox = FakeMailbox({"6": self.message})
+        self.run_main(mailbox)
+        (search,) = [args for name, args in mailbox.commands
+                     if name == "uid search"]
+        self.assertRegex(search[1], r"^\(SINCE \d\d-[A-Z][a-z]{2}-\d{4}\)$")
+
+    def test_since_names_the_day_before_the_window_in_english(self):
+        ji.configure({"recency_days": 30})
+        now = datetime(2026, 3, 31, 0, 30, tzinfo=timezone.utc)
+        self.assertEqual(ji.search_criteria(now), "(SINCE 28-Feb-2026)")
+        ji.configure({})
+        self.assertEqual(ji.search_criteria(now), "(ALL)")
+
     def test_the_mailbox_is_only_read(self):
         mailbox = FakeMailbox({"6": self.message})
         self.run_main(mailbox)

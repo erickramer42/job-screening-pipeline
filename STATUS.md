@@ -34,10 +34,28 @@ The goal is a focused daily application routine (~10 highest-quality matches per
 | Job parsing (`jobs_screen.py` parser) | ✅ Operational | Reads title/employer/location quadruples from `raw/` and `raw_boards/`. Keeps one copy per listing (board copy first, then newest digest) and cuts digests older than `recency_days`. A recent digest with text but no listings gets a warning in the shortlist. |
 | Hard filters | ✅ Operational | Cuts the employers and title patterns listed in `pipeline_config.json`, digest listings outside the search area, and jobs already applied to (`applied.txt`, or an `a` flag in `feedback/`, which follows a board posting by URL) |
 | LLM ranking | ✅ Operational | Pass 1 scores every survivor 0–100 from title/employer/location. Pass 2 re-scores the top `rerank_top_n` listings that have a description, using a role-section excerpt. Thinking is off and the first attempt is greedy, so scores are repeatable; `score_caps` (by employer, title or posting text) are enforced after each pass. Malformed responses are retried; 3 consecutive failed batches stop a pass. |
-| Output generation | ✅ Operational | Produces `out/shortlist_YYYY-MM-DD.md` and JSON. Board rows include direct posting links; ▲ marks pass-2 scores. |
-| Scheduled runs | ✅ Operational | Task Scheduler runs ingest at 01:00 and 05:00, and board fetch + screening at 06:00. Tasks wake the computer, run after a missed start, and the wrappers retry (see [Automation](#automation)). Verified across 2026-10-09 to 10-23, with two misses. On 10-14 no task ran: a Windows Update restart at 00:33 left no one signed in until 08:52, and the missed-start catch-up didn't run the tasks after sign-in. On 10-22 screening failed all 3 attempts because Ollama wasn't running. Both are open items (see Next Milestones). |
+| Output generation | ✅ Operational | Produces `out/shortlist_YYYY-MM-DD.md` and JSON. Board rows include direct posting links; ▲ marks pass-2 scores. The JSON records the model, prompt and settings behind the run. |
+| Scheduled runs | ✅ Operational | Task Scheduler runs ingest at 01:00 and 05:00, and board fetch + screening at 06:00. Tasks wake the computer, run after a missed start, and the wrappers retry (see [Automation](#automation)). Verified across 2026-10-09 to 10-23, with two misses. On 10-14 no task ran: a Windows Update restart at 00:33 left no one signed in until 08:52, and the missed-start catch-up didn't run the tasks after sign-in. On 10-22 screening failed all 3 attempts because Ollama wasn't running. Since 2026-10-23 both tasks also start at log on, the screening wrapper starts Ollama before a retry, and a failed morning leaves `out/FAILED_<date>.md`. |
 
 ### Recent Changes (2026-10-23)
+- **Scheduled runs recover on their own:**
+  - **An update restart no longer costs a morning:** both tasks also start at log on, ingest after 5 minutes and screening after 15. Screening skips a start before 06:00, since the daily run comes then, and a day whose shortlist is already written.
+  - **Ollama down:** before each retry, the screening wrapper starts the Ollama app if it isn't running. Ollama already starts at login, but was down at 06:00 on 10-22.
+  - **A failed morning shows in `out/`:** after the last failed attempt, the wrapper writes `out/FAILED_<date>.md` with what the exit code means and the log's error lines. A later run that day removes it.
+  - The date logic is in the new `wrapper_helper.py`, since `cmd`'s `%date%` and `%time%` follow the locale.
+  - The wrappers' logic is versioned: `run_ingest.bat.example` and `run_screen.bat.example` are committed copies.
+  - **Checked:** a copy of the wrapper ran five scenarios with stub scripts. Both tasks kept their daily triggers and settings; their old definitions are saved in `logs/`.
+- **A same-day rerun updates `feedback/<date>.md`:** while it's still the untouched template, it's rewritten for the rerun's rows. Once anything is filled in, only the rows new to the list are appended, under a comment, and nothing already there changes.
+- **The ranked JSON:**
+  - It records what produced the run: the model, fingerprints of the prompt, the pass-2 addendum and the `score_caps` rules, and the settings that affect scores. So the 10-24 and 10-25 runs, the stability baseline, can show they used one prompt.
+  - It no longer copies each posting's text, which stays in the row's source file. A re-scored row keeps the excerpt pass 2 sent instead. 1.35 MB → 0.22 MB on 10-23 data.
+- **Ingest searches with SINCE**, so the server leaves digests older than `recency_days` out, instead of a header fetch per message. Checked read-only against the mailbox: with a day of margin it missed no message at windows of 1 to 10 days.
+- **City names in `metro_cities` are plain text, matched as whole words.** They used to be joined into a regular expression. No match changed among 837 locations on disk and on the live boards.
+- **`slug_probe.py`** prints what a Greenhouse or SmartRecruiters board calls itself next to each VERIFIED line, and CHECK when the name differs. No configured board differed.
+- **`boards.json`:** the board that returned no postings was removed. No supported platform has postings for that company.
+- **Checked, and closed without a change:** remote-by-timezone locations (none among 1,773 title-passing postings), near-duplicate variants on the shortlist (mostly different roles; a title rule would merge different jobs), and cross-source dedup (the sources still don't overlap). The dedup key ignoring location affects 1 of 360 listings, so it's now Low.
+- **Tests:** 133, up from 116.
+- **Checked:** on today's data with a stand-in model, the committed and new screener sent the same 22 requests and wrote an identical shortlist and verdict template, and the JSON changed only as described. Board fetch left identical folders against the live APIs.
 - **Exit codes pinned before the scoring rewrite:**
   - Tests now run the screener end to end with a stand-in model, one for each exit code the wrapper relies on.
   - **A failed or skipped pass 2 now exits 1.** It used to exit 0, with only a note in the shortlist, so it never reached `errors.log`. The wrapper still doesn't retry it.
@@ -113,7 +131,7 @@ The goal is a focused daily application routine (~10 highest-quality matches per
 - **The 10-14 scheduling miss, explained:**
   - Windows restarted for an update at 00:31–00:33, and no one signed in until 08:52.
   - The tasks run only while the user is signed in, so the 01:00, 05:00 and 06:00 starts couldn't happen, and the catch-up didn't run them after sign-in. That day's files came from manual runs.
-  - Fixing it means changing Windows or Task Scheduler settings (see Next Milestones).
+  - Fixing it means changing Windows or Task Scheduler settings. Done later on 10-23: both tasks also start at log on.
 - **Verdict flags combine:**
   - A feedback row can now say `[m,a]`: a verdict plus "applied". `[a]` alone still works.
   - The old parser expected a single letter, so it silently skipped the first combined rows. The 7 jobs applied to on 10-23 would have reappeared on the next shortlist.
@@ -253,11 +271,9 @@ Quick fixes and score stabilization from a code review.
 | Pass-2 scores share a ranking with pass-1 scores | Medium | Only listings with a description (board rows) are re-scored against posting text, so board rows can crowd digest rows out of the top 25. Much smaller since 2026-10-22: the 10-23 scheduled run's top 25 had 18 board and 7 digest rows, and the verdicts so far show no digest "yes" row below the cut. | Separate shortlist sections, only if `verdicts.py` shows digest "yes" rows below the cut |
 | Every run re-scores everything in the recency window | Medium | Each day re-scores all digest listings from the last `recency_days` plus every live board posting, though ~97% were scored the day before. The 10-23 scheduled run took 4 min 41 s; runs took ~25 min before 2026-10-22. | Score cache keyed by listing |
 | Scores depend on batch-mates | Medium | The same listing scored in a different batch of 30 moves ~6 points on average (8% move 20+), against ~1.2 for a repeat of the same batch. The per-batch quota is gone (2026-10-22), but the model still grades partly against the other listings in its request. | Score each new listing in its own request, together with the score cache |
-| Dedup key ignores location | Medium | Same title+employer in another city is dropped. The kept copy is the board row when there is one, otherwise the newest digest. | Add location to the key where the location strings are comparable |
+| Dedup key ignores location | Low | Same title+employer in another city is dropped. The kept copy is the board row when there is one, otherwise the newest digest. On 10-23 this hid 1 of 360 listings: a board posting with two locations in the area. | Add location to the key where the location strings are comparable; it's also listing identity, so it would reshuffle batches and orphan verdicts |
 | Lever descriptions not captured | Low | Lever postings never reach pass 2. No Lever boards are configured today. | Probe the Lever schema when a Lever board is added |
-| `slug_probe.py` "VERIFIED" only means the slug has jobs | Low | A generic name (e.g. "Google") can match a different company's board | Check the company on the board before adding to `boards.json` |
-| One configured board returns no postings | Low | Its line in `logs/boards.log` reads "0 fetched" (checked 2026-10-23), which suggests a stale slug | Check the slug with `slug_probe.py`, or remove the entry |
-| Remote-by-timezone locations dropped | Low | e.g. Greenhouse "Eastern or Central Timezone" fails the location filter | Add timezone phrases to the remote check if needed |
+| `slug_probe.py` "VERIFIED" only means the slug has jobs, on Ashby and Lever | Low | A generic name (e.g. "Acme") can match a different company's board. Greenhouse and SmartRecruiters boards now show their own name, and a different one is marked CHECK; Ashby and Lever don't name the company. | Open an Ashby or Lever board before adding it to `boards.json` |
 
 ---
 
@@ -279,6 +295,8 @@ jobScreensApplications/
 ├── verdicts.py                  # Reads shortlist verdicts; scores a run against them
 ├── slug_probe.py                # Finds board slugs for company names
 │                                #   (python slug_probe.py targets.txt)
+├── wrapper_helper.py            # Date decisions for the wrappers: whether
+│                                #   to screen now, and the failure marker
 ├── tests/                       # unittest suite (python -m unittest)
 ├── pipeline_config.json         # All personal settings (gitignored)
 ├── pipeline_config.example.json # Placeholder config to copy
@@ -290,6 +308,8 @@ jobScreensApplications/
 ├── feedback/                    # Daily verdict files, feedback/<date>.md (gitignored)
 ├── run_ingest.bat               # Task Scheduler wrappers (gitignored)
 ├── run_screen.bat
+├── run_ingest.bat.example       # Committed copies of the wrappers, kept
+├── run_screen.bat.example       #   identical (they hold no personal data)
 ├── README.md                    # Project overview
 ├── STATUS.md                    # This file: project state and roadmap
 ├── docs/
@@ -316,7 +336,7 @@ python jobs_screen.py      # Scores and writes out/shortlist_<today>.md
 
 Credentials come from Windows user environment variables (see [Environment Variables](#environment-variables)), so any newly opened terminal has them.
 
-Review `out/shortlist_<today>.md`:
+Review `out/shortlist_<today>.md`. If it's missing, `out/FAILED_<today>.md` says why.
 - Board rows have direct posting links.
 - Digest rows need the original email for their "View" links.
 
@@ -340,14 +360,16 @@ Goal: the pipeline runs unattended overnight and the shortlist is waiting in the
 
 | Time | Task | Wrapper | Runs |
 |------|------|---------|------|
-| 01:00 and 05:00 daily | `JobIngest` | `run_ingest.bat` | `job_ingest.py` |
-| 06:00 daily | `JobScreen` | `run_screen.bat` | `board_fetch.py`, then `jobs_screen.py` |
+| 01:00 and 05:00 daily, and 5 min after log on | `JobIngest` | `run_ingest.bat` | `job_ingest.py` |
+| 06:00 daily, and 15 min after log on | `JobScreen` | `run_screen.bat` | `board_fetch.py`, then `jobs_screen.py` |
 
 The 01:00 ingest has caught every nightly digest since Oct 11, and 22 of the 23 weekly ones before that. The 05:00 run is insurance for late arrivals; it hasn't been needed since the nightly schedule started. Emails already saved to `raw/` are skipped, so the second run costs almost nothing. Board fetch runs just before screening, so the shortlist uses the freshest postings.
 
+The log-on starts cover a night when an update restart leaves no one signed in, as on 10-14. A repeated ingest costs nothing. Screening runs at most once a day: a log-on start before 06:00 is skipped, since the daily run comes then, and so is one after today's shortlist was written.
+
 ### Wrappers
 
-The wrappers are gitignored. Both run under `cmd` (no Git Bash) and contain no machine-specific paths: each one changes to its own folder with `cd /d "%~dp0"`.
+The wrappers are gitignored; `run_ingest.bat.example` and `run_screen.bat.example` are committed copies, kept identical. Both run under `cmd` (no Git Bash) and contain no machine-specific paths: each one changes to its own folder with `cd /d "%~dp0"`. `%date%` and `%time%` follow the locale, so the screening wrapper leaves date decisions to `wrapper_helper.py`.
 - **Both:**
   - Create `logs\` if it's missing, and trim their own logs to the newest 2,000 lines before running.
   - Set `PYTHONUTF8=1`. Output redirected to a file would otherwise use the ANSI code page, and a character outside it crashes the script.
@@ -355,26 +377,28 @@ The wrappers are gitignored. Both run under `cmd` (no Git Bash) and contain no m
   - Write a header line to the log for each attempt.
 - **`run_ingest.bat`:** up to 3 attempts, 10 minutes apart, for a mail server that's still starting after wake or login. Output goes to `logs\ingest.log`. If every attempt fails, it writes `ingest FAILED rc=<code> attempts=3` to `logs\errors.log` and exits with the script's code.
 - **`run_screen.bat`:**
+  - First asks `wrapper_helper.py begin 06:00` whether to run. Exit 10 means skip: before 06:00, or today's shortlist was already written at or after 06:00. Any other answer, a crash included, runs. A run that starts removes the day's failure marker.
   - Runs board fetch, logging to `logs\boards.log`. A non-zero exit is logged to `errors.log`, and screening still runs on the postings already on disk.
-  - Then runs the screener, logging to `logs\screen.log`. Only exit code 2 is retried (nothing scored, so nothing was written, usually because Ollama is still starting): up to 3 attempts, 15 minutes apart.
+  - Then runs the screener, logging to `logs\screen.log`. Only exit code 2 is retried (nothing scored, so nothing was written, usually because Ollama is still starting): up to 3 attempts, 15 minutes apart. Before each retry it starts the Ollama app, unless it's already running.
   - Partial failures (exit 1) aren't retried, because a retry would re-score everything. They're logged as `screen FAILED rc=<code> attempts=<n>`.
+  - After the screener's last failed attempt, `wrapper_helper.py failed` writes `out/FAILED_<date>.md`: what the exit code means, and the last attempt's error lines.
   - Exits 1 if either step failed.
 
 ### Task settings (current)
-- **Trigger:** daily at the times above. **Action:** the wrapper, which sets its own working directory.
+- **Triggers:** daily at the times above, and at log on with a delay (5 min for ingest, 15 for screening; added 2026-10-23). **Action:** the wrapper, which sets its own working directory. The definitions from before the log-on triggers are saved as `logs/<task>.before-logon-trigger.xml`; `Register-ScheduledTask -Xml` restores one.
 - **Wake the computer to run this task:** on. **Run as soon as possible after a missed start:** on, so a run missed while the PC was off or logged out happens at the next opportunity.
 - **Can start on battery and keeps running on battery:** on.
 - **Time limit:** 2 h for ingest, 8 h for screening. A full run on 2026-10-22 data (275 ranked listings, 22 batches) took 9.4 min, and the 10-23 scheduled run took 4 min 41 s. The limit stops a hung run before the next day's run, which would otherwise be skipped ("do not start a new instance").
-- **Runs only while the user is logged on.** This is deliberate: the local mail server and Ollama run in the user's session, so a logged-off run couldn't reach them. With catch-up on, a missed run starts once the user logs on.
+- **Runs only while the user is logged on.** This is deliberate: the local mail server and Ollama run in the user's session, so a logged-off run couldn't reach them. Catch-up alone didn't run the tasks after the 10-14 sign-in, hence the log-on triggers.
 
 ### Prerequisites for unattended runs
 1. The IMAP server must be reachable; if it runs locally, set it to auto-start with Windows
-2. Ollama service must be running — set Ollama to launch at login or install as a service
+2. Ollama service must be running — set Ollama to launch at login or install as a service. The screening wrapper also starts the Ollama app before a retry, from its default install folder.
 3. `EMAIL_USER` and `EMAIL_PASSWORD` must be set as Windows user environment variables (see below)
 4. Check Task Scheduler's **Last Run Result** and `logs/` after the first automated nights:
    - `logs/errors.log` gets one timestamped line per failed step (`ingest FAILED`, `board fetch FAILED`, `screen FAILED`), after retries.
    - The scripts exit non-zero on failure. `board_fetch.py` tries every board first, then exits 1 if any failed.
-   - **No shortlist for today** means scoring failed completely (Ollama down, model missing, or a request Ollama rejects; see `logs/screen.log`) or a wrapper path/env-var problem. A missing model or a rejected request fails on the first attempt (`screen FAILED rc=1`); Ollama being down fails after three (`rc=2 attempts=3`).
+   - **No shortlist for today** means scoring failed completely (Ollama down, model missing, or a request Ollama rejects) or a wrapper path/env-var problem. `out/FAILED_<date>.md` says which, with the log's error lines; `logs/screen.log` has the rest. A missing model or a rejected request fails on the first attempt (`screen FAILED rc=1`); Ollama being down fails after three (`rc=2 attempts=3`).
    - **A WARNING line at the top of the shortlist** means some pass-1 batches failed and those listings are ranked 0, or that a recent digest parsed to no listings.
    - **A NOTE line** means some pass-2 batches failed, so those rows kept their pass-1 scores. The run is logged as `screen FAILED rc=1`.
 
@@ -462,20 +486,17 @@ Agreed 2026-10-22, in this order:
    - Per-listing scoring without a cache would mean ~270 requests every morning.
    - Together, the first run scores everything once, one request per listing. After that, a day scores only its new listings.
    - The cache key includes the model and a prompt hash, so a prompt or model change re-scores everything. Include a switch to force a full re-score.
-   - Record `model` and the prompt hash in `ranked_<date>.json`.
+   - Record `model` and the prompt hash in `ranked_<date>.json`. Done 2026-10-23: the JSON's `run` record.
    - Re-score every board posting against its text, not just the top `rerank_top_n`.
-   - Measure per-listing request time before building. The estimate is a few seconds each: ~15–30 min for the first full run, ~1–2 min daily after that.
+   - Measure per-listing request time before building. The estimate is a few seconds each: ~15–30 min for the first full run, ~1–2 min daily after that. In the same session, check what Ollama's `prompt_eval_count` counts, so each pass can log how much of `num_ctx` it used.
    - Done 2026-10-23, before the rewrite: tests run the screener end to end with a stand-in model. They pin its exit codes and the rule that a run with nothing scored writes nothing, and the rewrite must keep them passing. A failed pass 2 now exits 1.
 4. **Judge it** with `python verdicts.py`, and check day-to-day stability: a listing's score shouldn't move unless its listing, the prompt, or the model changed.
 
 After that, as needed:
 - **Separate board and digest sections** in the shortlist, only if the verdicts show digest "yes" rows below the cut.
-- **Visibility for Ollama outages:** a `FAILED_<date>.md` marker written by the wrapper after its last attempt, and possibly starting Ollama before a retry. The preflight check is done (10-23).
-- **The 10-14 scheduling miss** (an update restart with no one signed in). Two fixes, both settings rather than code:
-  - turn on Windows' "Use my sign-in info to automatically finish setting up after an update";
-  - or add an "At log on" trigger to both tasks. Ingest is safe to repeat; screening would then need a guard so it doesn't redo a finished day.
-- **The 10-22 miss** (Ollama not running): make sure Ollama starts at login.
-- **The board that returns no postings** (see Known Issues).
+- **Ollama structured outputs** (a JSON schema as the response format): a scoring change, so it waits for verdicts like any other.
+
+The automation items (the 10-14 and 10-22 misses, a visible failure marker) and the empty board were done on 2026-10-23.
 
 Success metric for automation: zero manual intervention; shortlist present in `out/` by 7:00 AM each weekday.
 

@@ -1,0 +1,32 @@
+@echo off
+rem Nightly digest ingest. Scheduled at 01:00, plus a 05:00 catch-up for
+rem late digests, and 5 minutes after log on for a night when an update
+rem restart left no one signed in. Emails already saved to raw/ are
+rem skipped, so a repeat costs almost nothing.
+rem Credentials come from Windows user env vars (setx), not .bashrc.
+setlocal
+cd /d "%~dp0" || exit /b 1
+if not exist logs mkdir logs
+rem Redirected output otherwise uses the ANSI code page, which can't
+rem encode every character in email subjects
+set PYTHONUTF8=1
+rem Rotate logs: keep newest 2,000 lines per file
+for %%L in (logs\ingest.log logs\errors.log) do (
+  if exist %%L powershell -NoProfile -Command ^
+    "Get-Content -Encoding UTF8 '%%L' -Tail 2000 | Set-Content -Encoding UTF8 '%%L.tmp'; Move-Item -Force '%%L.tmp' '%%L'"
+)
+rem Up to 3 attempts, 10 minutes apart, for a mail server that is still
+rem starting after wake or login
+set /a ATTEMPT=0
+:attempt
+set /a ATTEMPT+=1
+echo [%date% %time%] ingest attempt %ATTEMPT% >> logs\ingest.log
+call python -u job_ingest.py >> logs\ingest.log 2>&1
+set RC=%errorlevel%
+if %RC% equ 0 exit /b 0
+if %ATTEMPT% lss 3 (
+  powershell -NoProfile -Command "Start-Sleep -Seconds 600"
+  goto attempt
+)
+echo [%date% %time%] ingest FAILED rc=%RC% attempts=%ATTEMPT% >> logs\errors.log
+exit /b %RC%

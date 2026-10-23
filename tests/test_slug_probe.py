@@ -53,6 +53,24 @@ class Probe(unittest.TestCase):
         with mock.patch("urllib.request.urlopen", side_effect=not_found):
             self.assertFalse(slug_probe.probe("acme", "greenhouse"))
 
+    def test_the_board_names_its_company_where_the_platform_can(self):
+        greenhouse = [{"id": 1, "company_name": "Acme Robotics"}]
+        smartrecruiters = [{"id": "a", "company": {"name": "Acme"}}]
+        self.assertEqual(slug_probe.board_name("greenhouse", greenhouse),
+                         "Acme Robotics")
+        self.assertEqual(slug_probe.board_name("smartrecruiters",
+                                               smartrecruiters), "Acme")
+        self.assertIsNone(slug_probe.board_name("ashby", [{"id": "a"}]))
+
+    def test_a_different_company_name_is_flagged(self):
+        self.assertTrue(slug_probe.name_note("Acme", "ACME, Inc.")
+                        .startswith("the board is"))
+        self.assertTrue(slug_probe.name_note("Initech", "Initech Labs")
+                        .startswith("the board is"))
+        self.assertTrue(slug_probe.name_note("Initech", "Acme")
+                        .startswith("CHECK"))
+        self.assertIn("check the board", slug_probe.name_note("Acme", None))
+
     def test_an_outage_is_not_no_board(self):
         for error in (urllib.error.URLError("down"),
                       urllib.error.HTTPError("u", 503, "Unavailable", None,

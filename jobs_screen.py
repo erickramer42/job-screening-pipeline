@@ -73,6 +73,11 @@ FOOTER_MIN_FRACTION = 0.4
 RUNNING_TEXT_MAX_FRACTION = 0.5
 
 # ---------- Settings ----------
+def fingerprint(text):
+    """A short hash that identifies a text, such as the prompt a run
+    used. The prompt file is gitignored and has no history of its own."""
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()[:12]
+
 def any_of(patterns):
     """One case-insensitive regex matching any of patterns, or None."""
     if not patterns:
@@ -113,7 +118,7 @@ def configure(cfg):
     global PROMPT_PATH, RECENCY_DAYS, PASS1_BATCH, RERANK_TOP_N
     global RERANK_BATCH, EXCERPT_CHARS, SHORTLIST_PER_EMPLOYER, KNOWN_NOISE
     global EXCLUDED_EMPLOYER_RE, EXCLUDE_TITLE_RES, location_ok
-    global SCORE_CAPS, APPLIED_PATH, MODEL_THINKING, NUM_CTX
+    global SCORE_CAPS, SCORE_CAPS_SHA, APPLIED_PATH, MODEL_THINKING, NUM_CTX
     PROMPT_PATH = Path(cfg.get("prompt_path", "screening_prompt.txt"))
     # Digest rows from files whose Date header is older than this many
     # days are rejected as stale before ranking. Board postings are
@@ -150,6 +155,8 @@ def configure(cfg):
                                    cfg.get("remote_regions", []))
     SCORE_CAPS = [score_cap_rule(n, c)
                   for n, c in enumerate(cfg.get("score_caps", []), 1)]
+    SCORE_CAPS_SHA = fingerprint(json.dumps(cfg.get("score_caps", []),
+                                            sort_keys=True))
     APPLIED_PATH = Path(cfg.get("applied_path", "applied.txt"))
 
     # Model thinking (config "model_thinking"). A thinking model reasons
@@ -723,6 +730,29 @@ def apply_rerank(batch, scores):
             j["pass1_capped_from"] = j["capped_from"]
         set_score(j, s["score"], s["reason"])
         j["rescored"] = True
+        # What pass 2 saw: the JSON doesn't keep the whole posting text
+        j["excerpt"] = role_excerpt(j["description"], EXCERPT_CHARS)
+
+def run_record(started):
+    """What produced a run: the model, hashes of the prompt, the pass-2
+    addendum and the score_caps rules, and the settings that affect
+    scores. A ranked JSON can then be traced to the prompt behind it,
+    and two runs shown to share one."""
+    return {"started": started.isoformat(timespec="seconds"),
+            "model": MODEL, "model_thinking": MODEL_THINKING,
+            "prompt_sha": fingerprint(SYSTEM_PROMPT),
+            "rerank_addendum_sha": fingerprint(RERANK_ADDENDUM),
+            "score_caps_sha": SCORE_CAPS_SHA, "num_ctx": NUM_CTX,
+            "pass1_batch": PASS1_BATCH, "rerank_top_n": RERANK_TOP_N,
+            "rerank_batch": RERANK_BATCH, "excerpt_chars": EXCERPT_CHARS,
+            "recency_days": RECENCY_DAYS,
+            "shortlist_per_employer": SHORTLIST_PER_EMPLOYER}
+
+def without_text(rows):
+    """Rows for the ranked JSON, without the posting text. It made up 88%
+    of the file, and stays in each row's source_file; a re-scored row
+    keeps the excerpt pass 2 sent."""
+    return [{k: v for k, v in j.items() if k != "description"} for j in rows]
 
 def md_cell(text, limit=None):
     """One Markdown table cell: whitespace collapsed (no stray line
@@ -752,7 +782,39 @@ def shortlist_rows(ranked):
         rows.append(j)
     return rows, collections.Counter({names[e]: n for e, n in more.items()})
 
+def write_verdict_template(path, stamp, rows):
+    """The day's feedback file for the owner (verdicts.py). A new file
+    gets the template. On a rerun the same day, a file that's still the
+    untouched template is rewritten for this run's rows. Once the owner
+    has filled anything in, only the rows new to the list are appended,
+    under a comment: no line already there changes, line endings
+    included. Returns what was done, for the log."""
+    template = "\n".join(verdicts.template_lines(stamp, rows)) + "\n"
+    if not path.exists():
+        path.parent.mkdir(exist_ok=True)
+        write_atomic(path, template)
+        return "written"
+    with open(path, encoding="utf-8", newline="") as f:
+        old = f.read()
+    if verdicts.is_untouched_template(old, stamp):
+        if old.replace("\r\n", "\n") == template:
+            return "unchanged"
+        write_atomic(path, template)
+        return "rewritten for this run's rows, since none was filled in"
+    listed = verdicts.listed_keys(old)
+    added = [verdicts.template_row(i, j) for i, j in enumerate(rows, 1)
+             if verdicts.listing_key(j["title"], j["employer"]) not in listed]
+    if not added:
+        return "unchanged"
+    eol = "\r\n" if "\r\n" in old else "\n"
+    lead = "" if not old or old.endswith("\n") else eol
+    write_atomic(path, old + lead + eol.join(
+        ["", f"# Rerun at {datetime.now():%H:%M}: rows new to the shortlist",
+         *added]) + eol, newline="")
+    return f"{len(added)} row(s) new to the list appended"
+
 def main():
+    started = datetime.now()
     configure_from_file(configure)
     load_inputs()
     jobs, unparsed = parse_jobs()
@@ -857,7 +919,8 @@ def main():
     stamp = date.today().isoformat()
     json_path = OUT_DIR / f"ranked_{stamp}.json"
     write_atomic(json_path, json.dumps(
-        {"ranked": kept, "rejected": rejected, "failed_batches": failed,
+        {"run": run_record(started), "ranked": without_text(kept),
+         "rejected": without_text(rejected), "failed_batches": failed,
          "rerank_failed_batches": rerank_failed}, indent=2))
 
     md_path = OUT_DIR / f"shortlist_{stamp}.md"
@@ -906,19 +969,17 @@ def main():
                       f"{j.get('url') or 'digest listing'}\n")
     write_atomic(md_path, "".join(md))
 
-    # Verdict template for the owner (verdicts.py). Never overwritten: a
-    # rerun the same day keeps whatever was already filled in
-    template_dir = TEMPLATE_DIR or verdicts.FEEDBACK_DIR
-    feedback_path = template_dir / f"{stamp}.md"
-    if not feedback_path.exists():
-        template_dir.mkdir(exist_ok=True)
-        write_atomic(feedback_path,
-                     "\n".join(verdicts.template_lines(stamp, rows)) + "\n")
-
     print(f"\nWrote {json_path}")
     print(f"Wrote {md_path} (top {len(rows)} of {len(kept)})")
-    if feedback_path.exists():
-        print(f"Verdicts go in {feedback_path}")
+    # The owner may have the feedback file open in an editor. It's a
+    # convenience, so failing to write it doesn't fail the run
+    feedback_path = (TEMPLATE_DIR or verdicts.FEEDBACK_DIR) / f"{stamp}.md"
+    try:
+        done = write_verdict_template(feedback_path, stamp, rows)
+        print(f"Verdicts go in {feedback_path} ({done})")
+    except OSError as e:
+        print(f"[WARN] Couldn't update {feedback_path} ({e}); the shortlist "
+              f"is written.")
     # Exit 1 for a partial run: the wrapper logs it, and doesn't retry,
     # since a retry would score everything again
     if failed:

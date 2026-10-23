@@ -35,6 +35,7 @@ import re
 import sys
 import urllib.request
 from pathlib import Path
+from typing import NamedTuple
 
 from html_text import html_to_text, normalize_text
 from location_filter import REMOTE_RE, location_matcher
@@ -218,35 +219,48 @@ def extract_greenhouse_pay(content_html):
         return (None, None)
     return (lo, hi)
 
+class Posting(NamedTuple):
+    """One posting, as flatten() normalizes it from any platform."""
+    id: str
+    title: str
+    location: str
+    url: str
+    pay: str                # "$lo-$hi", or "" when unknown
+    pay_min: int | None
+    pay_max: int | None
+    remote: bool | None     # None when the platform doesn't say
+    country: str | None
+    # Unconverted (see description_text), or "". sync_board() converts
+    # it only for postings that pass the filters
+    raw_description: str = ""
+
 def flatten(board, platform, slug):
-    """Normalize each platform's schema to (id, title, location, url,
-    pay_str, pay_min, pay_max, remote, country, raw_description).
-    remote/country are None when the platform doesn't expose them.
-    raw_description is unconverted (see description_text) or "";
-    sync_board() converts it only for postings that pass the filters.
-    SmartRecruiters descriptions are fetched there too, only when they
-    may have changed (see sync_board)."""
+    """Normalize each platform's schema to a list of Posting.
+    SmartRecruiters postings come without a description: sync_board()
+    fetches it, only when it may have changed."""
     jobs = []
     if platform == "greenhouse":
         for j in board.get("jobs", []):
             lo, hi = extract_greenhouse_pay(j.get("content"))
-            pay = f"${lo:,}-${hi:,}" if lo is not None else ""
-            jobs.append((str(j.get("id")), j.get("title", ""),
-                         (j.get("location") or {}).get("name", "Unknown"),
-                         j.get("absolute_url", ""), pay, lo, hi,
-                         None, None,
-                         j.get("content") or ""))
+            jobs.append(Posting(
+                id=str(j.get("id")), title=j.get("title", ""),
+                location=(j.get("location") or {}).get("name", "Unknown"),
+                url=j.get("absolute_url", ""),
+                pay=f"${lo:,}-${hi:,}" if lo is not None else "",
+                pay_min=lo, pay_max=hi, remote=None, country=None,
+                raw_description=j.get("content") or ""))
     elif platform == "lever":
         for j in board:
             cats = j.get("categories") or {}
             locs = (cats.get("allLocations")
                     or [cats.get("location") or "Unknown"])
-            jobs.append((j.get("id", ""), j.get("text", ""),
-                         "; ".join(locs),
-                         j.get("hostedUrl", ""), "", None, None,
-                         j.get("workplaceType") == "remote",
-                         j.get("country"),
-                         ""))  # description: schema not probed yet
+            # No description: the schema hasn't been probed yet
+            jobs.append(Posting(
+                id=j.get("id", ""), title=j.get("text", ""),
+                location="; ".join(locs), url=j.get("hostedUrl", ""),
+                pay="", pay_min=None, pay_max=None,
+                remote=j.get("workplaceType") == "remote",
+                country=j.get("country")))
     elif platform == "ashby":
         for j in board.get("jobs", []):
             pay = ""
@@ -275,25 +289,26 @@ def flatten(board, platform, slug):
                 s["location"] for s in j.get("secondaryLocations") or []
                 if s.get("location")]
             postal = ((j.get("address") or {}).get("postalAddress") or {})
-            jobs.append((j.get("id", ""), j.get("title", ""),
-                         "; ".join(locs),
-                         j.get("jobUrl") or "", pay, lo, hi,
-                         bool(j.get("isRemote"))
-                         or j.get("workplaceType") == "Remote",
-                         postal.get("addressCountry"),
-                         j.get("descriptionPlain") or ""))
+            jobs.append(Posting(
+                id=j.get("id", ""), title=j.get("title", ""),
+                location="; ".join(locs), url=j.get("jobUrl") or "",
+                pay=pay, pay_min=lo, pay_max=hi,
+                remote=(bool(j.get("isRemote"))
+                        or j.get("workplaceType") == "Remote"),
+                country=postal.get("addressCountry"),
+                raw_description=j.get("descriptionPlain") or ""))
     elif platform == "smartrecruiters":
         for j in board.get("content", []):
             loc = j.get("location") or {}
             jid = j.get("id", "")
             # 'ref' is the API URL; this is the human-facing posting page
-            jobs.append((jid, j.get("name", ""),
-                         loc.get("fullLocation") or loc.get("city")
-                         or "Unknown",
-                         f"https://jobs.smartrecruiters.com/{slug}/{jid}",
-                         "", None, None,
-                         loc.get("remote"), loc.get("country"),
-                         ""))  # filled in main() after filters pass
+            jobs.append(Posting(
+                id=jid, title=j.get("name", ""),
+                location=(loc.get("fullLocation") or loc.get("city")
+                          or "Unknown"),
+                url=f"https://jobs.smartrecruiters.com/{slug}/{jid}",
+                pay="", pay_min=None, pay_max=None,
+                remote=loc.get("remote"), country=loc.get("country")))
     return jobs
 
 def board_source(board_cfg):
@@ -359,49 +374,49 @@ def sync_board(board_cfg):
     new = rewritten = cut_pay = 0
     live = set()
     postings = flatten(data, platform, slug)
-    for (jid, title, location, jurl, pay, lo, hi, remote,
-         country, raw_desc) in postings:
-        location = location or ""
-        if not TITLE_RE.search(title) or TITLE_BLOCK_RE.search(title):
+    for p in postings:
+        location = p.location or ""
+        if not TITLE_RE.search(p.title) or TITLE_BLOCK_RE.search(p.title):
             continue
-        if not location_ok(location, remote, country):
+        if not location_ok(location, p.remote, p.country):
             continue
         # Make structured remote flags visible to the LLM, which
         # sees only title/employer/location
-        if remote and not REMOTE_RE.search(location):
+        if p.remote and not REMOTE_RE.search(location):
             location = f"{location} (Remote)"
         # Deterministic pay floor: cut only when the RANGE MAX is
         # below floor (with a $100k floor, a $90k-$110k range clears
         # the bar; unknown pay stays in and defers to LLM judgment)
-        if lo is not None and hi is not None and hi < PAY_FLOOR:
+        if p.pay_min is not None and p.pay_max is not None \
+                and p.pay_max < PAY_FLOOR:
             cut_pay += 1
             continue
-        fname = OUT_DIR / f"{platform}_{jid}.txt"
+        fname = OUT_DIR / f"{platform}_{p.id}.txt"
         live.add(fname.name)
         old = (fname.read_text(encoding="utf-8", errors="replace")
                if fname.exists() else None)
-        loc_line = f"{location} ({pay})" if pay else location
+        loc_line = f"{location} ({p.pay})" if p.pay else location
         if platform == "smartrecruiters":
             # The description costs one detail request per posting, so
             # the stored one is kept while the listing lines are
             # unchanged. A file without one (its fetch failed) retries.
             # A failed fetch costs the text, not the posting: it still
             # writes and ranks.
-            head = record_text(platform, slug, company, jurl, title, pay,
-                               loc_line, "")
+            head = record_text(platform, slug, company, p.url, p.title,
+                               p.pay, loc_line, "")
             old_head, _, old_desc = (old or "").partition(
                 f"\n{DESC_MARKER}\n")
             desc = old_desc.removesuffix("\n") if old_head == head else ""
-            if not desc and jid:
+            if not desc and p.id:
                 try:
                     desc = extract_smartrecruiters_description(
-                        fetch_smartrecruiters_detail(slug, jid))
+                        fetch_smartrecruiters_detail(slug, p.id))
                 except Exception as e:
                     print(f"    {company}: detail fetch failed for "
-                          f"{jid} ({e}) — written without description")
+                          f"{p.id} ({e}) — written without description")
         else:
-            desc = description_text(platform, raw_desc)
-        text = record_text(platform, slug, company, jurl, title, pay,
+            desc = description_text(platform, p.raw_description)
+        text = record_text(platform, slug, company, p.url, p.title, p.pay,
                            loc_line, desc)
         if text == old:
             continue
