@@ -75,9 +75,15 @@ def probe(slug, platform):
     return False
 
 def candidates():
-    if len(sys.argv) > 1 and Path(sys.argv[1]).exists():
+    if len(sys.argv) > 1:
+        # A mistyped name stops here rather than falling through to auto
+        # mode, which would probe a different list over the network
+        path = Path(sys.argv[1])
+        if not path.is_file():
+            print(f"[ERROR] {path} not found.")
+            sys.exit(1)
         return [ln.strip() for ln in
-                Path(sys.argv[1]).read_text(encoding="utf-8").splitlines()
+                path.read_text(encoding="utf-8").splitlines()
                 if ln.strip()]
     # Auto mode: top employers from the latest ranked_<date>.json. The
     # dated pattern skips other files in out/ (a "ranked_v1_..." name

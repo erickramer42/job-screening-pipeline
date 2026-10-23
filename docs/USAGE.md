@@ -5,7 +5,7 @@ How to set up and run the pipeline day to day. The [README](../README.md) gives 
 ## How a run works
 
 ```
-job_ingest.py    mail folder (IMAP)     ->  raw/job_uid_<UID>.txt
+job_ingest.py    mail folder (IMAP)     ->  raw/job_uv<UIDVALIDITY>_uid<UID>.txt
 board_fetch.py   boards.json (APIs)     ->  raw_boards/<platform>_<id>.txt (with description)
 jobs_screen.py   raw/ + raw_boards/     ->  recency + hard filters -> pass 1 -> pass 2 -> out/
 ```
@@ -14,9 +14,10 @@ jobs_screen.py   raw/ + raw_boards/     ->  recency + hard filters -> pass 1 -> 
    - Digests older than `recency_days` are skipped after checking only their Date header.
    - Mail is opened read-only, so emails are never marked read, moved, or deleted.
    - Each job in the email must appear as four lines: title, employer, location, and a `View` link.
+   - A file is named for the folder's UIDVALIDITY and the message's UID. If the server ever resets its UIDs, the window is ingested again, rather than new digests being skipped as already saved.
 2. **Board fetch** pulls each configured board. It keeps postings whose titles match your patterns and whose location is in your metro area or remote within the US.
    - It drops postings whose published pay range tops out below your floor.
-   - Postings that close, or stop passing the filters, move to `raw_boards/archive/`.
+   - Postings that close, or stop passing the filters, move to `raw_boards/archive/`. So do the files of a board you remove from `boards.json`.
    - Each posting's description is stored below the listing. Greenhouse, Ashby and SmartRecruiters provide one; Lever isn't supported yet.
    - A posting's file is rewritten whenever its text would change: the employer edited the title, location, pay or description, or an older version of the script wrote the file.
    - SmartRecruiters descriptions cost a request per posting, so they're fetched again only when the listing lines change.
@@ -35,7 +36,7 @@ jobs_screen.py   raw/ + raw_boards/     ->  recency + hard filters -> pass 1 -> 
      - After each pass, a score that matches a `score_caps` rule is lowered to that rule's cap. Rules can match on employer, title, or posting text.
      - The model's own score is kept as `capped_from`.
      - A rule can carry a flag, such as "clearance", which the shortlist shows.
-   - **Already applied:** listings in `applied.txt` are cut before ranking and listed in their own shortlist section.
+   - **Already applied:** listings in `applied.txt`, or marked `a` in a feedback file, are cut before ranking and listed in their own shortlist section. A board row marked `a` is matched by its posting URL too, so it stays cut if the employer edits the title.
    - **Pass 2:** re-scores the top `rerank_top_n` listings that have a description, in small batches. Each one comes with an excerpt from the posting's role section.
 
 The scripts share three small modules:
@@ -104,8 +105,10 @@ python -m unittest       # run the tests
 
 The tests use the standard library's `unittest` and live in `tests/`. They cover:
 - listing identity (deduplication, applied jobs, batch order), score caps, the per-employer limit, and the verdict files;
-- the model-response handling and the pass-2 excerpt;
-- the board-file layout and when a file is rewritten, plus email decoding;
+- the model requests and responses, and the pass-2 excerpt;
+- the screener's exit codes, with `main()` run end to end and a stand-in for the model;
+- the board-file layout and when a file is rewritten or archived;
+- email decoding, digest file names, and an ingest run against a stand-in mailbox, which may only examine and peek;
 - the contract between them: a file ingest or board fetch writes must parse into listings in the screener.
 
 They write their fixtures to a temporary folder, mock the network, and need no personal config.
@@ -129,10 +132,11 @@ They write their fixtures to a temporary folder, mock the network, and need no p
 
 ## When something fails
 
+- **Config mistakes** stop every script at startup with exit 1, and one line naming `pipeline_config.json`: a missing required key, a bad value or JSON syntax, or an invalid regular expression.
 - **Ingest** exits non-zero if:
   - the config is incomplete;
   - the server's TLS certificate can't be verified;
-  - the folder can't be opened;
+  - the folder can't be opened, or the server doesn't report its UIDVALIDITY;
   - or a message can't be fetched.
 
   It gives up on a server that doesn't respond within 60 seconds, and it never falls back to the inbox. Email bodies are decoded with the charset they declare. A message with no text part is saved without listings, so it isn't downloaded again; the summary line counts it.
@@ -141,14 +145,19 @@ They write their fixtures to a temporary folder, mock the network, and need no p
   - If it's running without the model, it exits 1 straight away, since a retry wouldn't help.
 - **The screener** retries any malformed model response, up to 3 attempts per batch.
   - Indices numbered from 1 are corrected. Numbering that can't be determined is rejected rather than guessed.
+  - If a retry's connection fails, the scores from the attempt before it are kept.
   - A batch still without usable scores, or whose connection fails, is left as 0/"unscored". 3 failed batches in a row stop the pass.
-  - **Nothing scored:** exits with code 2 and writes nothing, which usually means Ollama stopped during the run.
+  - **Ollama rejects the request** (an HTTP 4xx, for example `model_thinking` on for a model that can't think): the pass stops at once and Ollama's reason goes to the log. If nothing was scored, it exits 1 and writes nothing, since a retry would send the same request.
+  - **Nothing scored** otherwise: exits with code 2 and writes nothing, which usually means Ollama stopped during the run. A server error from Ollama (5xx) is logged with its reason and counts the same way.
   - Every output file is written through a temporary file, so a run killed mid-write leaves the previous file or the complete new one. Ingest and board fetch write the same way.
   - **Some pass-1 batches failed:** still writes the shortlist with a warning at the top, then exits 1.
-  - **Pass 2 fails or is skipped** (it's skipped when pass 1 had to stop): those listings keep their pass-1 scores, with a note in the shortlist.
+  - **Pass 2 fails or is skipped** (it's skipped when pass 1 had to stop): those listings keep their pass-1 scores, with a note in the shortlist, and the run exits 1.
+  - **A recent digest yields no listings** though it has text: the shortlist names the file in a warning, since the digest's format has probably changed. The exit code doesn't change.
 - **Board fetch** reports a failed board and moves on to the next one.
   - A malformed `boards.json` entry (no slug, unknown platform) is reported and skipped the same way.
   - A failed board's files aren't archived.
+  - Each board's log line starts with how many postings the API returned, so an empty board (a stale slug, say) can be told from one whose postings were all filtered out.
+  - The files of a board no longer in `boards.json` are archived, except in a run where an entry is malformed, since that entry's files would look unconfigured.
   - Once every board has been tried, it exits 1 if any board failed.
   - A failed SmartRecruiters description fetch is retried on the next run.
 
@@ -163,18 +172,19 @@ A short daily loop keeps the ranking honest, and gives it something to be measur
    - Replace `?` with `y` (would apply), `m` (maybe) or `n` (no), and add notes after `::`.
    - Add `a` when you've applied, with a comma: `[m,a]` is a maybe you applied to anyway, and `[a]` alone records only the application.
    - A row whose flags can't be read is reported with its file and line number whenever the screener or `verdicts.py` reads the folder. That covers an unknown letter, or two verdicts like `[y,n]`. It isn't skipped silently.
-   - Keep `title | employer` as written: it identifies the listing, so a verdict stays valid on later days.
+   - Keep `title | employer` as written: it identifies the listing, so a verdict stays valid on later days. A board row is also matched by its posting URL, from that day's `out/ranked_<date>.json`, so its verdict survives an edit to the title.
+   - A later line on the same listing updates your verdict rather than replacing it. `[a]` alone keeps the earlier y/m/n, an empty note keeps the earlier note, and "applied" stays set once given.
    - Other lines are free notes, ignored by the parser.
    - The file is never overwritten, so a rerun the same day keeps what you've filled in. The `feedback/` folder is gitignored.
 2. **Record applications.** An `a` flag cuts that listing from future rankings, and `verdicts.py` then leaves it out of its figures, since the ranker no longer places it. For jobs you applied to outside the shortlist, add a line to `applied.txt`:
    - the posting's URL for a board row;
    - `Title | Employer` for a digest row, since those have no link.
 
-   Lines starting with `#`, and anything after ` #`, are comments. A `Title | Employer` line is split at the last pipe, so a title that contains one is fine. Applied jobs are skipped when ranking. While the posting stays up, they're listed under "Already applied, still posted".
+   Lines starting with `#`, and anything after ` #`, are comments. A `Title | Employer` line is split at the last pipe, so a title that contains one is fine. A line that is neither a URL nor `Title | Employer` is reported with its line number and ignored. Applied jobs are skipped when ranking. While the posting stays up, they're listed under "Already applied, still posted".
 3. **Measure:** `python verdicts.py` scores the latest run against every verdict so far; pass a file (`python verdicts.py out/ranked_<date>.json`) to score another run. It reports:
    - how often the run's scores order a pair of your verdicts the way you did, with equal scores counting half: 50% is random, 100% is your order;
    - how many y/m/n listings made the shortlist;
-   - the "yes" listings it missed and the "no" listings it let in.
+   - the "yes" listings it missed and the "no" listings it let in. A listed row shows its place on the shortlist, and a missed row says when the per-employer limit held it out.
 
    Verdicts that shaped a change score that change in-sample; the next days' verdicts show whether it generalizes.
 4. **Turn repeated notes into rules:**
@@ -198,7 +208,7 @@ To have the shortlist waiting each morning, run the scripts from Windows Task Sc
      - start with `cd /d "%~dp0"` so it runs from its own folder;
      - `set PYTHONUTF8=1`, because Python on Windows otherwise writes redirected output in the ANSI code page and crashes on characters outside it;
      - append unbuffered output to a file in `logs\`, for example `python -u job_ingest.py >> logs\ingest.log 2>&1`.
-   - **Retries:** retrying ingest on any failure is safe. Retry the screener only on exit code 2. Nothing was written in that case, while exit 1 means a partial run that a retry would score again from scratch.
+   - **Retries:** retrying ingest on any failure is safe. Retry the screener only on exit code 2. Nothing was written in that case. Exit 1 means a partial run that a retry would score again from scratch, or a problem a retry can't fix.
 2. **Schedule the ingest task** for after your digests usually arrive (a second, later run catches stragglers cheaply). Schedule the screening task a few hours later.
 3. **Change the task settings:**
    - Turn on "Wake the computer to run this task".
@@ -249,12 +259,12 @@ python slug_probe.py targets.txt
 The script tries common slug spellings on all four platforms and prints a `boards.json` line for each slug that returns jobs.
 - **VERIFIED only means the slug has postings.** A generic name can match a different company's board, so open the board and check it before adding the line.
 - A company whose lookup fails (network down, a platform error) is reported as failed rather than as having no board, and the script then exits 1.
-- With no file argument, it takes employers that scored 60 or higher from the latest `out/ranked_*.json`.
+- With no file argument, it takes employers that scored 60 or higher from the latest `out/ranked_*.json`. A file argument that doesn't exist stops the script instead.
 
 ## Tuning tips
 
 - After changing a board filter, re-run `board_fetch.py`. Postings that no longer pass move to `raw_boards/archive/` and drop out of ranking.
 - When you change how board files are written (layout or description text), bump `FILE_FORMAT` in `board_fetch.py`. Every live posting is then rewritten on the next run, with no manual cleanup.
 - If pass-1 responses come back truncated, lower `pass1_batch` in `pipeline_config.json`.
-- To re-ingest after changing how emails are converted to text, delete `raw/job_uid_*.txt` and run ingest again. Existing files are skipped.
+- To re-ingest after changing how emails are converted to text, delete `raw/job_*.txt` and run ingest again. Existing files are skipped.
 - Known issues and planned work are tracked in [STATUS.md](../STATUS.md).

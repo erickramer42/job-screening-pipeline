@@ -1,5 +1,6 @@
 """Tests for verdicts.py: the listing key, the "Title | Employer" split,
-the template round trip, and ordering agreement. Run from the repo root
+the template round trip, merging verdicts and matching them by posting
+URL, the run report, and ordering agreement. Run from the repo root
 with: python -m unittest
 """
 import contextlib
@@ -39,6 +40,19 @@ class FeedbackFiles(unittest.TestCase):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         self.folder = Path(tmp.name)
+        # The runs the files judge; none unless a test writes one
+        self.runs = self.folder / "out"
+        self.runs.mkdir()
+        patcher = mock.patch.object(verdicts, "RUNS_DIR", self.runs)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def write_run(self, stem, *rows):
+        """out/ranked_<stem>.json with (title, employer, url) rows."""
+        (self.runs / f"ranked_{stem}.json").write_text(json.dumps(
+            {"ranked": [{"title": t, "employer": e, "url": u}
+                        for t, e, u in rows], "rejected": []}),
+            encoding="utf-8")
 
     def test_template_round_trip_with_pipes(self):
         rows = [{"title": "Lead | Platform", "employer": "Acme"},
@@ -66,6 +80,39 @@ class FeedbackFiles(unittest.TestCase):
         self.assertEqual(loaded[("senior engineer", "acme")]["verdict"], "y")
         self.assertEqual(loaded[("senior engineer", "acme")]["note"],
                          "second look")
+
+    def test_a_later_line_updates_the_verdict_rather_than_replacing_it(self):
+        (self.folder / "2026-01-01.md").write_text(
+            "1 [y] Senior Engineer | Acme :: strong fit\n"
+            "2 [m,a] Data Engineer | Beta :: applied\n", encoding="utf-8")
+        (self.folder / "2026-01-02.md").write_text(
+            "1 [a] Senior Engineer | Acme ::\n"
+            "2 [n] Data Engineer | Beta ::\n", encoding="utf-8")
+        loaded = verdicts.load_verdicts(self.folder)
+        self.assertEqual({k[1]: (v["verdict"], v["applied"], v["note"])
+                          for k, v in loaded.items()},
+                         {"acme": ("y", True, "strong fit"),
+                          "beta": ("n", True, "applied")})
+
+    def test_a_board_row_keeps_its_verdict_when_its_title_changes(self):
+        self.write_run("2026-01-01",
+                       ("Senior Engineer", "Acme", "https://example.com/1"),
+                       ("Data Engineer", "Beta", ""))
+        self.write_run("2026-01-02", ("Senior Software Engineer", "Acme",
+                                      "https://example.com/1"))
+        (self.folder / "2026-01-01.md").write_text(
+            "1 [y] Senior Engineer | Acme :: strong fit\n"
+            "2 [m] Data Engineer | Beta ::\n", encoding="utf-8")
+        (self.folder / "2026-01-02.md").write_text(
+            "1 [a] Senior Software Engineer | Acme ::\n", encoding="utf-8")
+        loaded = verdicts.load_verdicts(self.folder)
+        self.assertEqual(set(loaded), {("senior software engineer", "acme"),
+                                       ("data engineer", "beta")})
+        v = loaded[("senior software engineer", "acme")]
+        self.assertEqual((v["verdict"], v["applied"], v["note"], v["url"]),
+                         ("y", True, "strong fit", "https://example.com/1"))
+        # A digest row has no URL, and is matched by title and employer
+        self.assertEqual(loaded[("data engineer", "beta")]["url"], "")
 
     def test_combined_flags(self):
         (self.folder / "2026-01-01.md").write_text(
@@ -120,6 +167,40 @@ class Evaluate(unittest.TestCase):
         self.assertIn("1 on listings in this run (1 marked applied)",
                       out.getvalue())
         self.assertNotIn("ordering agreement", out.getvalue())
+
+    def test_report_matches_by_url_and_names_shortlist_positions(self):
+        run = {"ranked": [
+            {"title": "Lead Engineer", "employer": "Acme", "score": 90,
+             "url": "https://example.com/1", "shortlist_rank": 1},
+            {"title": "Senior Engineer", "employer": "Acme", "score": 85,
+             "url": "https://example.com/2"},
+            {"title": "Data Engineer", "employer": "Beta", "score": 80,
+             "url": "", "shortlist_rank": 2},
+            {"title": "Platform Engineer", "employer": "Gamma", "score": 20,
+             "url": ""}],
+            "rejected": []}
+        def verdict(grade, url=""):
+            return {"verdict": grade, "applied": False, "note": "",
+                    "file": "f", "url": url}
+        v = {("senior engineer", "acme"):
+                 verdict("y", "https://example.com/2"),
+             ("data engineer", "beta"): verdict("n"),
+             ("platform engineer", "gamma"): verdict("y"),
+             # The posting's title has changed since this verdict
+             ("engineer", "acme"): verdict("m", "https://example.com/1")}
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "ranked.json"
+            path.write_text(json.dumps(run), encoding="utf-8")
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                verdicts.evaluate(path, v)
+        report = out.getvalue()
+        self.assertIn("4 on listings in this run", report)
+        self.assertIn("m: 1 of 1 in the shortlist", report)
+        self.assertIn("senior engineer | acme: rank 2, score 85, held out by "
+                      "the per-employer limit", report)
+        self.assertIn("platform engineer | gamma: rank 4, score 20 [", report)
+        self.assertIn("data engineer | beta: shortlist #2, score 80", report)
 
 class OrderingAgreement(unittest.TestCase):
     def test_better_verdict_with_higher_score_agrees(self):

@@ -26,6 +26,8 @@ description prose can never be misread as a listing. Text conversion
 Each posting's file is rewritten whenever its text would change: the
 employer edited the posting, FILE_FORMAT was bumped (files carry a
 'Format:' line), or a SmartRecruiters detail fetch failed last time.
+Files move to raw_boards/archive/ when their posting closes or stops
+passing the filters, or when their board leaves boards.json.
 """
 import html as html_mod
 import json
@@ -36,7 +38,7 @@ from pathlib import Path
 
 from html_text import html_to_text, normalize_text
 from location_filter import REMOTE_RE, location_matcher
-from pipeline_common import DESC_MARKER, load_config, write_atomic
+from pipeline_common import DESC_MARKER, configure_from_file, write_atomic
 
 CONFIG = Path("boards.json")
 OUT_DIR = Path("raw_boards")
@@ -294,21 +296,53 @@ def flatten(board, platform, slug):
                          ""))  # filled in main() after filters pass
     return jobs
 
+def board_source(board_cfg):
+    """The "platform/slug" a boards.json entry names, as its files'
+    Source: line states it. Raises ValueError for a malformed entry."""
+    if not isinstance(board_cfg, dict):
+        raise ValueError("entry is not a JSON object")
+    platform, slug = board_cfg.get("platform"), board_cfg.get("slug")
+    if platform not in API_TEMPLATES or not slug:
+        raise ValueError("entry needs a slug and a platform of "
+                         + ", ".join(API_TEMPLATES))
+    return f"{platform}/{slug}"
+
+def file_source(f):
+    """The "platform/slug" from a posting file's Source: line, or None."""
+    head = f.read_text(encoding="utf-8", errors="replace").splitlines()[:3]
+    return next((ln[len("Source: "):] for ln in head
+                 if ln.startswith("Source: ")), None)
+
+def archive(f):
+    ARCHIVE_DIR.mkdir(exist_ok=True)
+    f.replace(ARCHIVE_DIR / f.name)
+
 def archive_stale(platform, slug, live_names):
     """Move this board's files that are no longer live (posting closed,
     or no longer passing filters) into ARCHIVE_DIR."""
-    source = f"Source: {platform}/{slug}"
     moved = 0
     for f in OUT_DIR.glob(f"{platform}_*.txt"):
         if f.name in live_names:
             continue
-        head = f.read_text(encoding="utf-8",
-                           errors="replace").splitlines()[:3]
-        if source not in head:   # another board on the same platform
+        # Another board on the same platform shares the file prefix
+        if file_source(f) != f"{platform}/{slug}":
             continue
-        ARCHIVE_DIR.mkdir(exist_ok=True)
-        f.replace(ARCHIVE_DIR / f.name)
+        archive(f)
         moved += 1
+    return moved
+
+def archive_unconfigured(sources):
+    """Move the files of boards not in boards.json (removed, or given a
+    new slug) into ARCHIVE_DIR; archive_stale never visits them, so
+    they'd otherwise be screened every day with frozen text. A file
+    without a Source: line is left alone. Returns {source: files moved}."""
+    moved = {}
+    for f in OUT_DIR.glob("*.txt"):
+        source = file_source(f)
+        if source is None or source in sources:
+            continue
+        archive(f)
+        moved[source] = moved.get(source, 0) + 1
     return moved
 
 def sync_board(board_cfg):
@@ -317,19 +351,16 @@ def sync_board(board_cfg):
     postings. Raises on a malformed entry or any fetch/schema failure;
     the caller skips the board, so nothing of it is archived on
     incomplete information."""
-    if not isinstance(board_cfg, dict):
-        raise ValueError("entry is not a JSON object")
-    platform, slug = board_cfg.get("platform"), board_cfg.get("slug")
-    if platform not in API_TEMPLATES or not slug:
-        raise ValueError("entry needs a slug and a platform of "
-                         + ", ".join(API_TEMPLATES))
+    board_source(board_cfg)  # a malformed entry raises here
+    platform, slug = board_cfg["platform"], board_cfg["slug"]
     company = board_cfg.get("company", slug)
     data = fetch_board(platform, slug)
 
     new = rewritten = cut_pay = 0
     live = set()
+    postings = flatten(data, platform, slug)
     for (jid, title, location, jurl, pay, lo, hi, remote,
-         country, raw_desc) in flatten(data, platform, slug):
+         country, raw_desc) in postings:
         location = location or ""
         if not TITLE_RE.search(title) or TITLE_BLOCK_RE.search(title):
             continue
@@ -380,20 +411,15 @@ def sync_board(board_cfg):
         else:
             rewritten += 1
     archived = archive_stale(platform, slug, live)
-    print(f"  {company}: {new} new, {rewritten} rewritten, "
-          f"{len(live)} live, {cut_pay} cut by pay floor, "
-          f"{archived} archived")
+    # The fetched count tells an empty board (a stale slug, say) from one
+    # whose postings were all filtered out
+    print(f"  {company}: {len(postings)} fetched, {new} new, "
+          f"{rewritten} rewritten, {len(live)} live, {cut_pay} cut by pay "
+          f"floor, {archived} archived")
     return new
 
 def main():
-    try:
-        configure(load_config())
-    except KeyError as e:
-        print(f"[ERROR] pipeline_config.json has no {e} key; it's required.")
-        return 1
-    except re.error as e:
-        print(f"[ERROR] pipeline_config.json: bad title pattern ({e})")
-        return 1
+    configure_from_file(configure)
     if not CONFIG.exists():
         print("No boards.json found — copy boards.example.json and "
               "add your boards.")
@@ -402,9 +428,14 @@ def main():
 
     boards = json.loads(CONFIG.read_text(encoding="utf-8"))
     new_jobs = failed = 0
+    sources, malformed = set(), False
     # One bad entry or board never stops the others; any failure makes
     # the exit code non-zero so the scheduled run logs it
     for board_cfg in boards:
+        try:
+            sources.add(board_source(board_cfg))
+        except ValueError:
+            malformed = True
         try:
             new_jobs += sync_board(board_cfg)
         except Exception as e:
@@ -413,6 +444,15 @@ def main():
             print(f"  {name or repr(board_cfg)}: FAILED ({e}) — check "
                   f"slug/platform")
             failed += 1
+
+    # A malformed entry's files would look unconfigured, so nothing is
+    # archived as unconfigured until every entry can be read
+    if malformed:
+        print("  Files of boards no longer in boards.json: not checked, "
+              "because an entry is malformed.")
+    else:
+        for source, n in sorted(archive_unconfigured(sources).items()):
+            print(f"  {source}: not in boards.json, {n} file(s) archived")
 
     print(f"\nBoards: wrote {new_jobs} new postings to {OUT_DIR}/")
     if failed:

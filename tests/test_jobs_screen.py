@@ -1,19 +1,26 @@
 """Tests for jobs_screen.py: listing identity (dedup, applied, batch
-order), score caps, and the shortlist's per-employer limit. Run from the
-repo root with: python -m unittest
+order), score caps, model requests and responses, the shortlist's
+per-employer limit, and main()'s exit codes. Run from the repo root
+with: python -m unittest
 
-Fixtures are written to a temporary folder; no personal config is read.
+Fixtures are written to a temporary folder; no personal config is read,
+and a stand-in replaces the model.
 """
+import contextlib
 import hashlib
+import io
+import json
 import re
 import tempfile
 import unittest
-from datetime import datetime, timedelta, timezone
+import urllib.error
+from datetime import date, datetime, timedelta, timezone
 from email.utils import format_datetime
 from pathlib import Path
 from unittest import mock
 
 import jobs_screen as js
+import pipeline_common
 
 CONFIG = {
     "excluded_employers": ["Excluded Co"],
@@ -75,7 +82,7 @@ class ListingIdentity(SourceFiles):
         self.write(self.boards, "greenhouse_1.txt", board_text(
             "senior engineer", "ACME", "Springfield ($150,000-$180,000)",
             "https://example.com/1", "About the role\nBuild things."))
-        jobs = js.parse_jobs()
+        jobs, _ = js.parse_jobs()
         self.assertEqual(len(jobs), 1)
         self.assertEqual(jobs[0]["source"], "raw_boards")
         self.assertEqual(jobs[0]["url"], "https://example.com/1")
@@ -87,7 +94,7 @@ class ListingIdentity(SourceFiles):
             ("Old Role", "Acme", "Springfield")))
         self.write(self.raw, "job_uid_2.txt", digest_text(
             2, ("Senior Engineer", "Acme", "Springfield")))
-        jobs = {j["title"]: j for j in js.parse_jobs()}
+        jobs = {j["title"]: j for j in js.parse_jobs()[0]}
         self.assertEqual(jobs["Senior Engineer"]["source_file"],
                          "job_uid_2.txt")
         self.assertFalse(jobs["Senior Engineer"]["_stale"])
@@ -97,15 +104,36 @@ class ListingIdentity(SourceFiles):
         self.write(self.boards, "greenhouse_1.txt", board_text(
             "Senior Engineer", "Acme", "Springfield", "https://example.com/1",
             "Fake Title\nFake Co\nSpringfield\nView"))
-        self.assertEqual([j["title"] for j in js.parse_jobs()],
+        self.assertEqual([j["title"] for j in js.parse_jobs()[0]],
                          ["Senior Engineer"])
 
     def test_noise_lines_are_not_listings(self):
         self.write(self.raw, "job_uid_1.txt", digest_text(
             1, ("Manage alerts", "Acme", "Springfield"),
             ("Senior Engineer", "Acme", "Springfield")))
-        self.assertEqual([j["title"] for j in js.parse_jobs()],
+        self.assertEqual([j["title"] for j in js.parse_jobs()[0]],
                          ["Senior Engineer"])
+
+    def test_a_recent_digest_without_listings_is_reported(self):
+        self.write(self.raw, "job_uid_1.txt", digest_text(
+            1, ("Senior Engineer", "Acme", "Springfield")))
+        # A new layout: no View lines, so nothing parses
+        self.write(self.raw, "job_uid_2.txt", digest_text(1)
+                   + "Senior Engineer\nAcme\nSpringfield\nApply now\n")
+        # Past the recency window, and saved without a text part
+        self.write(self.raw, "job_uid_3.txt", digest_text(60) + "Old text\n")
+        self.write(self.raw, "job_uid_4.txt", digest_text(1))
+        jobs, unparsed = js.parse_jobs()
+        self.assertEqual([j["title"] for j in jobs], ["Senior Engineer"])
+        self.assertEqual(unparsed, ["job_uid_2.txt"])
+
+    def test_metadata_comes_from_the_block_only(self):
+        lines = ["# Metadata", "URL: https://example.com/1", "Date: x",
+                 "URL: https://example.com/2", "---",
+                 "URL: https://elsewhere.example.com"]
+        self.assertEqual(js.metadata(lines),
+                         {"URL": "https://example.com/1", "Date": "x"})
+        self.assertEqual(js.metadata(["Senior Engineer", "URL: x"]), {})
 
     def test_applied_by_url_and_by_title_with_a_pipe(self):
         applied = self.root / "applied.txt"
@@ -140,9 +168,56 @@ class ListingIdentity(SourceFiles):
         prompt.write_text("Rank jobs.", encoding="utf-8")
         js.configure({**CONFIG, "prompt_path": str(prompt),
                       "applied_path": str(self.root / "none.txt")})
-        with mock.patch.object(js.verdicts, "FEEDBACK_DIR", feedback):
+        with mock.patch.object(js.verdicts, "FEEDBACK_DIR", feedback), \
+                mock.patch.object(js.verdicts, "RUNS_DIR", self.root):
             js.load_inputs()
         self.assertIn(("senior engineer", "acme"), js.APPLIED_PAIRS)
+
+    def test_an_applied_board_row_stays_cut_after_a_title_edit(self):
+        feedback, runs = self.root / "feedback", self.root / "out"
+        feedback.mkdir()
+        runs.mkdir()
+        (feedback / "2026-01-01.md").write_text(
+            "1 [y,a] Senior Engineer | Acme ::\n", encoding="utf-8")
+        (runs / "ranked_2026-01-01.json").write_text(json.dumps(
+            {"ranked": [{"title": "Senior Engineer", "employer": "Acme",
+                         "url": "https://example.com/1"}],
+             "rejected": []}), encoding="utf-8")
+        prompt = self.root / "prompt.txt"
+        prompt.write_text("Rank jobs.", encoding="utf-8")
+        js.configure({**CONFIG, "prompt_path": str(prompt),
+                      "applied_path": str(self.root / "none.txt")})
+        rows = [
+            {"title": "Senior Software Engineer", "employer": "Acme",
+             "url": "https://example.com/1", "source": "raw_boards"},
+            {"title": "Data Engineer", "employer": "Acme", "url": "",
+             "source": "raw", "location": "Springfield"},
+        ]
+        with mock.patch.object(js.verdicts, "FEEDBACK_DIR", feedback), \
+                mock.patch.object(js.verdicts, "RUNS_DIR", runs), \
+                mock.patch.object(js, "APPLIED_URLS", set()), \
+                mock.patch.object(js, "APPLIED_PAIRS", set()):
+            js.load_inputs()
+            kept, rejected = js.hard_filter(rows)
+        self.assertEqual([j["title"] for j in rejected],
+                         ["Senior Software Engineer"])
+        # The digest row has no URL, so it can't match one
+        self.assertEqual([j["title"] for j in kept], ["Data Engineer"])
+
+    def test_unreadable_applied_lines_are_reported(self):
+        applied = self.root / "applied.txt"
+        applied.write_text("Senior Engineer at Acme\n"
+                           "Software Engineer #2 | Acme\n"
+                           "https://example.com/1\n", encoding="utf-8")
+        with mock.patch("builtins.print") as printed:
+            urls, pairs = js.load_applied(applied)
+        self.assertEqual((urls, pairs), ({"https://example.com/1"}, set()))
+        warnings = [c.args[0] for c in printed.call_args_list]
+        self.assertEqual(len(warnings), 2)
+        self.assertIn(":1:", warnings[0])
+        # The " #" cut "#2 | Acme" off as a comment; the warning says so
+        self.assertIn(":2:", warnings[1])
+        self.assertIn('" #"', warnings[1])
 
     def test_hard_filters(self):
         rows = [
@@ -264,6 +339,69 @@ class ModelResponses(unittest.TestCase):
         self.assertEqual(js.parse_scores(text, 2, 1),
                          {0: {"score": 100, "reason": "x"}})
 
+    def test_a_failed_retry_keeps_the_earlier_partial_result(self):
+        answers = iter([json.dumps({"scores": [
+            {"index": 0, "score": 70, "reason": "a"}]}), TimeoutError()])
+        def chat(system, user, attempt=1):
+            answer = next(answers)
+            if isinstance(answer, Exception):
+                raise answer
+            return answer
+        with mock.patch.object(js, "ollama_chat", chat), \
+                mock.patch("builtins.print"):
+            self.assertEqual(js.request_scores("s", "u", [{}, {}]),
+                             {0: {"score": 70, "reason": "a"}})
+
+    def test_a_failed_first_attempt_fails_the_batch(self):
+        with mock.patch.object(js, "ollama_chat", side_effect=TimeoutError()):
+            with self.assertRaises(TimeoutError):
+                js.request_scores("s", "u", [{}])
+
+    def http_error(self, code, reason, body):
+        return urllib.error.HTTPError("http://localhost:11434/api/chat",
+                                      code, reason, {}, io.BytesIO(body))
+
+    def test_a_4xx_is_rejected_with_ollamas_reason(self):
+        error = self.http_error(
+            400, "Bad Request",
+            b'{"error": "\\"gemma\\" does not support thinking"}')
+        with mock.patch("urllib.request.urlopen", side_effect=error), \
+                self.assertRaises(js.RequestRejected) as cm:
+            js.ollama_chat("s", "u")
+        self.assertEqual(str(cm.exception), 'HTTP 400 Bad Request: "gemma" '
+                                            'does not support thinking')
+
+    def test_a_5xx_is_a_transport_error_with_ollamas_reason(self):
+        error = self.http_error(500, "Internal Server Error",
+                                b'{"error": "model requires more memory"}')
+        with mock.patch("urllib.request.urlopen", side_effect=error), \
+                self.assertRaises(js.TRANSPORT_ERRORS) as cm:
+            js.ollama_chat("s", "u")
+        self.assertNotIsInstance(cm.exception, js.RequestRejected)
+        self.assertIn("model requires more memory", str(cm.exception))
+
+    def test_request_text_is_pinned(self):
+        # The request text is part of what's scored: changing it changes
+        # scores, so a change here should be deliberate
+        job = {"title": "Senior Engineer", "employer": "Acme",
+               "location": "Springfield",
+               "description": "About the role\nBuild things."}
+        with mock.patch.object(js, "request_scores",
+                               side_effect=lambda system, user, batch: user):
+            pass1, pass2 = js.score_batch([job]), js.score_rerank([job])
+        reply = ('Respond with STRICT JSON only, format: {"scores": '
+                 '[{"index": <int>, "score": <int 0-100>, "reason": '
+                 '"<one short sentence>"}]}. Score each job on its own: '
+                 'its score must not depend on the other jobs in this '
+                 'list. Include every index exactly once.')
+        self.assertEqual(pass1, f"Score every job below for fit. {reply}"
+                                f"\n\nJobs:\n0: Senior Engineer | Acme | "
+                                f"Springfield")
+        self.assertEqual(pass2, f"Re-score every job below for fit using "
+                                f"the posting text. {reply}\n\nJobs:\n0: "
+                                f"Senior Engineer | Acme | Springfield\n"
+                                f"POSTING: About the role\nBuild things.")
+
     def test_model_available(self):
         tags = {"models": [{"name": "gemma4:12b"}, {"name": "other:latest"}]}
         self.assertTrue(js.model_available(tags, "gemma4:12b"))
@@ -326,6 +464,148 @@ class Shortlist(unittest.TestCase):
         rows, more = js.shortlist_rows(ranked)
         self.assertEqual([j["title"] for j in rows], ["Role 0", "Role 2"])
         self.assertEqual(dict(more), {"Acme": 2})
+
+class FakeModel:
+    """Stands in for ollama_chat: scores every listing in a request 60,
+    and raises error instead for the requests when(user) picks."""
+    def __init__(self, error=None, when=lambda user: True):
+        self.error, self.when, self.requests = error, when, []
+
+    def __call__(self, system, user, attempt=1):
+        self.requests.append(user)
+        if self.error and self.when(user):
+            raise self.error
+        n = len(re.findall(r"^\d+: ", user, re.M))
+        return json.dumps({"scores": [{"index": i, "score": 60,
+                                       "reason": "fits"} for i in range(n)]})
+
+def pass1(user):
+    return user.startswith("Score")
+
+class MainRun(SourceFiles):
+    """main() end to end in a temporary folder, with FakeModel for
+    Ollama. Pins the exit codes run_screen.bat relies on: 2 means
+    nothing was written, so a retry is safe; 1 a partial run, or a
+    problem a retry can't fix; 0 success."""
+    def setUp(self):
+        super().setUp()
+        prompt = self.root / "prompt.txt"
+        prompt.write_text("Rank jobs.", encoding="utf-8")
+        config = self.root / "pipeline_config.json"
+        # 4 listings: 2 pass-1 batches. The 2 board rows have a
+        # description: 2 pass-2 batches
+        config.write_text(json.dumps({
+            **CONFIG, "prompt_path": str(prompt),
+            "applied_path": str(self.root / "applied.txt"),
+            "pass1_batch": 2, "rerank_top_n": 2, "rerank_batch": 1}),
+            encoding="utf-8")
+        self.out, self.feedback = self.root / "out", self.root / "feedback"
+        for target, name, value in (
+                (pipeline_common, "CONFIG_FILE", config),
+                (js, "OUT_DIR", self.out), (js, "TEMPLATE_DIR", None),
+                (js.verdicts, "FEEDBACK_DIR", self.feedback),
+                (js.verdicts, "RUNS_DIR", self.out)):
+            patcher = mock.patch.object(target, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        self.addCleanup(js.configure, CONFIG)
+        self.write(self.raw, "job_uid_1.txt", digest_text(
+            1, ("Data Engineer", "Beta", "Springfield"),
+            ("Platform Engineer", "Gamma", "Springfield")))
+        for n, (title, employer) in enumerate(
+                [("Senior Engineer", "Acme"), ("Backend Engineer", "Delta")],
+                1):
+            self.write(self.boards, f"greenhouse_{n}.txt", board_text(
+                title, employer, "Springfield", f"https://example.com/{n}",
+                "About the role\nBuild things."))
+        self.stamp = date.today().isoformat()
+
+    def run_main(self, model, preflight=True):
+        """main()'s exit code and what it printed; preflight=False runs
+        the real Ollama check."""
+        out = io.StringIO()
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(mock.patch.object(js, "ollama_chat", model))
+            if preflight:
+                stack.enter_context(mock.patch.object(js, "ollama_preflight"))
+            stack.enter_context(contextlib.redirect_stdout(out))
+            try:
+                js.main()
+                code = 0
+            except SystemExit as e:
+                code = e.code
+        return code, out.getvalue()
+
+    def written(self):
+        return sorted(p.relative_to(self.root).as_posix()
+                      for d in (self.out, self.feedback) if d.exists()
+                      for p in d.iterdir())
+
+    def shortlist(self):
+        return (self.out / f"shortlist_{self.stamp}.md").read_text(
+            encoding="utf-8")
+
+    def ranked(self):
+        return json.loads((self.out / f"ranked_{self.stamp}.json")
+                          .read_text(encoding="utf-8"))
+
+    def test_everything_scores(self):
+        model = FakeModel()
+        self.assertEqual(self.run_main(model)[0], 0)
+        self.assertEqual(self.written(), [f"feedback/{self.stamp}.md",
+                                          f"out/ranked_{self.stamp}.json",
+                                          f"out/shortlist_{self.stamp}.md"])
+        data = self.ranked()
+        self.assertEqual((data["failed_batches"],
+                          data["rerank_failed_batches"]), (0, 0))
+        self.assertEqual(sum("rescored" in j for j in data["ranked"]), 2)
+        self.assertEqual(len(model.requests), 4)
+        self.assertNotIn("WARNING", self.shortlist())
+
+    def test_ollama_unreachable_writes_nothing(self):
+        with mock.patch("urllib.request.urlopen",
+                        side_effect=urllib.error.URLError("refused")):
+            code, _ = self.run_main(FakeModel(), preflight=False)
+        self.assertEqual(code, 2)
+        self.assertEqual(self.written(), [])
+
+    def test_every_pass1_batch_failing_writes_nothing(self):
+        code, _ = self.run_main(FakeModel(ConnectionResetError()))
+        self.assertEqual(code, 2)
+        self.assertEqual(self.written(), [])
+
+    def test_a_rejected_request_writes_nothing_and_stops_at_once(self):
+        model = FakeModel(js.RequestRejected("HTTP 400 Bad Request: "
+                                             "no thinking"))
+        code, printed = self.run_main(model)
+        # 1, not 2: the wrapper's retry would send the same request
+        self.assertEqual(code, 1)
+        self.assertEqual(self.written(), [])
+        self.assertEqual(len(model.requests), 1)
+        self.assertIn("no thinking", printed)
+
+    def test_one_failed_pass1_batch_is_a_partial_run(self):
+        model = FakeModel(TimeoutError(),
+                          when=lambda u: pass1(u) and "Data Engineer" in u)
+        self.assertEqual(self.run_main(model)[0], 1)
+        self.assertIn("**WARNING: 1 of 2 pass-1 batches failed",
+                      self.shortlist())
+        self.assertEqual(self.ranked()["failed_batches"], 1)
+
+    def test_a_failed_pass2_is_a_partial_run(self):
+        model = FakeModel(TimeoutError(), when=lambda u: not pass1(u))
+        code, printed = self.run_main(model)
+        self.assertEqual(code, 1)
+        self.assertIn("**NOTE: 2 re-scoring batch(es) failed",
+                      self.shortlist())
+        self.assertEqual(self.ranked()["rerank_failed_batches"], 2)
+        self.assertIn("[ERROR] 2 re-scoring batch(es) failed", printed)
+
+    def test_a_digest_without_listings_is_flagged_in_the_shortlist(self):
+        self.write(self.raw, "job_uid_2.txt", digest_text(1) + "New layout\n")
+        self.assertEqual(self.run_main(FakeModel())[0], 0)
+        self.assertIn("**WARNING: 1 recent digest file(s) have text but no "
+                      "listings (job_uid_2.txt)", self.shortlist())
 
 if __name__ == "__main__":
     unittest.main()

@@ -1,6 +1,6 @@
 # Configuration
 
-`pipeline_config.json` holds every personal setting. Start from `pipeline_config.example.json`, which has placeholders only. Each script stops at startup if a key it requires is missing. Setup and day-to-day use are in [USAGE.md](USAGE.md).
+`pipeline_config.json` holds every personal setting. Start from `pipeline_config.example.json`, which has placeholders only. Each script stops at startup, with one line naming the file, if a key it requires is missing, a value or the JSON itself is invalid, or a regular expression doesn't compile. Setup and day-to-day use are in [USAGE.md](USAGE.md).
 
 ## Mail (`job_ingest.py`)
 

@@ -28,16 +28,45 @@ The goal is a focused daily application routine (~10 highest-quality matches per
 ### Working
 | Component | Status | Notes |
 |-----------|--------|-------|
-| Email ingest (`job_ingest.py`) | ✅ Operational | Fetches digest emails over IMAP into `raw/job_uid_<UID>.txt`. Read-only (EXAMINE + `BODY.PEEK[]`). |
-| Board fetch (`board_fetch.py`) | ✅ Operational | Pulls `boards.json` companies into `raw_boards/` and filters by title, metro-area/US-remote location, and pay floor. Stores each posting's description (Greenhouse, Ashby, SmartRecruiters; not Lever). Closed postings move to `raw_boards/archive/`. A posting's file is rewritten whenever the posting changes or the file format is older. |
+| Email ingest (`job_ingest.py`) | ✅ Operational | Fetches digest emails over IMAP into `raw/job_uv<UIDVALIDITY>_uid<UID>.txt`. Read-only (EXAMINE + `BODY.PEEK[]`). |
+| Board fetch (`board_fetch.py`) | ✅ Operational | Pulls `boards.json` companies into `raw_boards/` and filters by title, metro-area/US-remote location, and pay floor. Stores each posting's description (Greenhouse, Ashby, SmartRecruiters; not Lever). Closed postings, and those of boards removed from `boards.json`, move to `raw_boards/archive/`. A posting's file is rewritten whenever the posting changes or the file format is older. |
 | Slug discovery (`slug_probe.py`) | ✅ Operational | Guesses board slugs for company names (e.g. `targets.txt`) and prints `boards.json` lines for slugs that return jobs |
-| Job parsing (`jobs_screen.py` parser) | ✅ Operational | Reads title/employer/location quadruples from `raw/` and `raw_boards/`. Keeps one copy per listing (board copy first, then newest digest) and cuts digests older than `recency_days`. |
-| Hard filters | ✅ Operational | Cuts the employers and title patterns listed in `pipeline_config.json`, digest listings outside the search area, and jobs already applied to (`applied.txt`, or an `a` flag in `feedback/`) |
+| Job parsing (`jobs_screen.py` parser) | ✅ Operational | Reads title/employer/location quadruples from `raw/` and `raw_boards/`. Keeps one copy per listing (board copy first, then newest digest) and cuts digests older than `recency_days`. A recent digest with text but no listings gets a warning in the shortlist. |
+| Hard filters | ✅ Operational | Cuts the employers and title patterns listed in `pipeline_config.json`, digest listings outside the search area, and jobs already applied to (`applied.txt`, or an `a` flag in `feedback/`, which follows a board posting by URL) |
 | LLM ranking | ✅ Operational | Pass 1 scores every survivor 0–100 from title/employer/location. Pass 2 re-scores the top `rerank_top_n` listings that have a description, using a role-section excerpt. Thinking is off and the first attempt is greedy, so scores are repeatable; `score_caps` (by employer, title or posting text) are enforced after each pass. Malformed responses are retried; 3 consecutive failed batches stop a pass. |
 | Output generation | ✅ Operational | Produces `out/shortlist_YYYY-MM-DD.md` and JSON. Board rows include direct posting links; ▲ marks pass-2 scores. |
 | Scheduled runs | ✅ Operational | Task Scheduler runs ingest at 01:00 and 05:00, and board fetch + screening at 06:00. Tasks wake the computer, run after a missed start, and the wrappers retry (see [Automation](#automation)). Verified across 2026-10-09 to 10-23, with two misses. On 10-14 no task ran: a Windows Update restart at 00:33 left no one signed in until 08:52, and the missed-start catch-up didn't run the tasks after sign-in. On 10-22 screening failed all 3 attempts because Ollama wasn't running. Both are open items (see Next Milestones). |
 
 ### Recent Changes (2026-10-23)
+- **Exit codes pinned before the scoring rewrite:**
+  - Tests now run the screener end to end with a stand-in model, one for each exit code the wrapper relies on.
+  - **A failed or skipped pass 2 now exits 1.** It used to exit 0, with only a note in the shortlist, so it never reached `errors.log`. The wrapper still doesn't retry it.
+  - **A request Ollama rejects** (an HTTP 4xx, such as a model that can't think while `model_thinking` is on) stops the run at once with exit 1, and `screen.log` shows Ollama's reason. Before, it failed every batch and exited 2, so the wrapper retried it three times, 15 minutes apart. Server errors (5xx) still count as an outage, now with their reason logged too.
+  - A retry whose connection fails keeps the scores of the attempt before it, instead of losing the whole batch.
+- **Applied jobs and verdicts follow board postings by URL:**
+  - A feedback file's run holds each board row's posting URL. So a job marked applied stays cut, and its verdict still counts, after the employer edits the title.
+  - Verdict files are read as written.
+  - On the real files, all 8 applied jobs got a URL, and so did every board verdict.
+- **`verdicts.py`:**
+  - A later line updates a verdict instead of replacing it. `[a]` alone keeps the earlier y/m/n, an empty note keeps the earlier note, and "applied" stays set.
+  - Rows on the shortlist show their position on it. A row the per-employer limit held out says so.
+- **Digest files carry UIDVALIDITY:**
+  - Ingest writes `raw/job_uv<UIDVALIDITY>_uid<UID>.txt`. If the server resets UIDVALIDITY, the window is ingested again, instead of new digests being skipped as duplicates.
+  - Ingest stops if the server doesn't report UIDVALIDITY.
+  - The next ingest renames the 38 existing files once. Checked first, read-only against the mailbox: all 38 match the server's current UIDs.
+- **Parser canary:** a recent digest with text but no listings gets a WARNING in the shortlist, as the sign of a changed digest format. All digests on disk have listings today.
+- **Board fetch:**
+  - Each board's log line starts with how many postings the API returned. One board returns none at all, which suggests a stale slug. Three others return postings, but none in the area.
+  - The files of a board removed from `boards.json` are archived.
+- **Smaller fixes:**
+  - An `applied.txt` line that can never match is reported.
+  - `slug_probe.py` stops when its file is missing, instead of probing other names.
+  - The three scripts report config mistakes the same way, in one line naming `pipeline_config.json`. A JSON syntax error used to give a traceback in board fetch.
+- **Tests:** 116, up from 87.
+- **Checked:**
+  - On today's data with a stand-in model, the committed and new screener sent the same 22 requests and wrote identical files.
+  - Against the live APIs, board fetch left identical folders.
+  - `verdicts.py` gave the same figures for the 10-22 and 10-23 runs.
 - **Ranking prompt, from the 10-23 shortlist review:** Node.js no longer counts as part of the candidate's stack. The model had cited it as a core-stack match on three shortlist rows.
   - A required Node.js backend is now one gap. A full-stack role that otherwise fits stays in the 60–74 band, below 75+.
   - A backend role built mainly on Node.js is plausible but flawed. Node.js listed only as a plus doesn't lower a score.
@@ -223,14 +252,11 @@ Quick fixes and score stabilization from a code review.
 |-------|----------|--------|-------------|
 | Pass-2 scores share a ranking with pass-1 scores | Medium | Only listings with a description (board rows) are re-scored against posting text, so board rows can crowd digest rows out of the top 25. Much smaller since 2026-10-22: the 10-23 scheduled run's top 25 had 18 board and 7 digest rows, and the verdicts so far show no digest "yes" row below the cut. | Separate shortlist sections, only if `verdicts.py` shows digest "yes" rows below the cut |
 | Every run re-scores everything in the recency window | Medium | Each day re-scores all digest listings from the last `recency_days` plus every live board posting, though ~97% were scored the day before. The 10-23 scheduled run took 4 min 41 s; runs took ~25 min before 2026-10-22. | Score cache keyed by listing |
-| Applied cuts and verdicts follow the title, not the posting | Medium | Both are keyed by title and employer. Board files now follow edits to their posting, so when a board posting's title changes, a job marked applied comes back into the ranking and its verdict no longer matches. Between Oct 10 and 23, 8 of 182 board titles changed. Every job marked applied so far is a board row. | Match board rows by posting URL as well, looked up in the ranked JSON of the run each feedback file judges |
 | Scores depend on batch-mates | Medium | The same listing scored in a different batch of 30 moves ~6 points on average (8% move 20+), against ~1.2 for a repeat of the same batch. The per-batch quota is gone (2026-10-22), but the model still grades partly against the other listings in its request. | Score each new listing in its own request, together with the score cache |
 | Dedup key ignores location | Medium | Same title+employer in another city is dropped. The kept copy is the board row when there is one, otherwise the newest digest. | Add location to the key where the location strings are comparable |
-| UIDVALIDITY not tracked | Medium | If the server resets UIDVALIDITY (e.g. a local mail server rebuilds its cache), UIDs restart at 1 and new digests are silently skipped as duplicates | Record UIDVALIDITY; warn or re-ingest when it changes |
-| Silent parser failure on format change | Medium | Screener finds 0 jobs without warning | Canary check: count `View` lines per file |
 | Lever descriptions not captured | Low | Lever postings never reach pass 2. No Lever boards are configured today. | Probe the Lever schema when a Lever board is added |
 | `slug_probe.py` "VERIFIED" only means the slug has jobs | Low | A generic name (e.g. "Google") can match a different company's board | Check the company on the board before adding to `boards.json` |
-| Board configuration problems are hard to see | Low | The board fetch log doesn't say how many postings a board returned, so an empty board looks like one whose postings were all filtered out. One configured board has returned no postings on recent runs. Also, a board removed from `boards.json`, or given a new slug, leaves its postings in `raw_boards/`, where they're screened daily with frozen text. No such files exist today. | Log the fetched count; archive the files of boards that are no longer configured |
+| One configured board returns no postings | Low | Its line in `logs/boards.log` reads "0 fetched" (checked 2026-10-23), which suggests a stale slug | Check the slug with `slug_probe.py`, or remove the entry |
 | Remote-by-timezone locations dropped | Low | e.g. Greenhouse "Eastern or Central Timezone" fails the location filter | Add timezone phrases to the remote check if needed |
 
 ---
@@ -239,8 +265,8 @@ Quick fixes and score stabilization from a code review.
 
 ```
 jobScreensApplications/
-├── job_ingest.py                # IMAP fetcher, read-only,
-│                                #   writes digests to raw/job_uid_<UID>.txt
+├── job_ingest.py                # IMAP fetcher, read-only, writes digests
+│                                #   to raw/job_uv<UIDVALIDITY>_uid<UID>.txt
 ├── board_fetch.py               # Public board APIs -> raw_boards/<platform>_<id>.txt
 │                                #   Filters: title patterns/keywords, metro cities,
 │                                #   remote/US check, pay floor
@@ -348,8 +374,9 @@ The wrappers are gitignored. Both run under `cmd` (no Git Bash) and contain no m
 4. Check Task Scheduler's **Last Run Result** and `logs/` after the first automated nights:
    - `logs/errors.log` gets one timestamped line per failed step (`ingest FAILED`, `board fetch FAILED`, `screen FAILED`), after retries.
    - The scripts exit non-zero on failure. `board_fetch.py` tries every board first, then exits 1 if any failed.
-   - **No shortlist for today** means scoring failed completely (Ollama down or model missing; see `logs/screen.log`) or a wrapper path/env-var problem. A missing model fails on the first attempt (`screen FAILED rc=1`); Ollama being down fails after three (`rc=2 attempts=3`).
-   - **A WARNING line at the top of the shortlist** means some batches failed and those listings are ranked 0.
+   - **No shortlist for today** means scoring failed completely (Ollama down, model missing, or a request Ollama rejects; see `logs/screen.log`) or a wrapper path/env-var problem. A missing model or a rejected request fails on the first attempt (`screen FAILED rc=1`); Ollama being down fails after three (`rc=2 attempts=3`).
+   - **A WARNING line at the top of the shortlist** means some pass-1 batches failed and those listings are ranked 0, or that a recent digest parsed to no listings.
+   - **A NOTE line** means some pass-2 batches failed, so those rows kept their pass-1 scores. The run is logged as `screen FAILED rc=1`.
 
 ---
 
@@ -438,20 +465,17 @@ Agreed 2026-10-22, in this order:
    - Record `model` and the prompt hash in `ranked_<date>.json`.
    - Re-score every board posting against its text, not just the top `rerank_top_n`.
    - Measure per-listing request time before building. The estimate is a few seconds each: ~15–30 min for the first full run, ~1–2 min daily after that.
-   - Before rewriting the scoring loop, add tests that run the screener end to end with a stand-in model. They pin its exit codes and the rule that a run with nothing scored writes nothing. Decide then whether a failed pass 2 should exit 1. Today it exits 0, with only a note in the shortlist.
+   - Done 2026-10-23, before the rewrite: tests run the screener end to end with a stand-in model. They pin its exit codes and the rule that a run with nothing scored writes nothing, and the rewrite must keep them passing. A failed pass 2 now exits 1.
 4. **Judge it** with `python verdicts.py`, and check day-to-day stability: a listing's score shouldn't move unless its listing, the prompt, or the model changed.
 
 After that, as needed:
-- **Match board rows by URL for applied cuts and verdicts**, so an edited title doesn't bring an applied job back. It changes no scores, so it doesn't wait for verdicts.
-- **Board fetch:** log how many postings each board returned. Archive the files of boards removed from `boards.json` before pruning the first one.
 - **Separate board and digest sections** in the shortlist, only if the verdicts show digest "yes" rows below the cut.
 - **Visibility for Ollama outages:** a `FAILED_<date>.md` marker written by the wrapper after its last attempt, and possibly starting Ollama before a retry. The preflight check is done (10-23).
 - **The 10-14 scheduling miss** (an update restart with no one signed in). Two fixes, both settings rather than code:
   - turn on Windows' "Use my sign-in info to automatically finish setting up after an update";
   - or add an "At log on" trigger to both tasks. Ingest is safe to repeat; screening would then need a guard so it doesn't redo a finished day.
 - **The 10-22 miss** (Ollama not running): make sure Ollama starts at login.
-- **Parser canary** for digest format drift.
-- **UIDVALIDITY tracking.**
+- **The board that returns no postings** (see Known Issues).
 
 Success metric for automation: zero manual intervention; shortlist present in `out/` by 7:00 AM each weekday.
 

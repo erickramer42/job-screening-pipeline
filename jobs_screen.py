@@ -17,14 +17,15 @@ import json
 import os
 import re
 import sys
+import urllib.error
 import urllib.request
 from datetime import date, datetime, timezone
 from pathlib import Path
 
 import verdicts
 from location_filter import location_matcher
-from pipeline_common import (DESC_MARKER, load_config, parse_email_date,
-                             write_atomic)
+from pipeline_common import (DESC_MARKER, configure_from_file,
+                             parse_email_date, write_atomic)
 
 SHORTLIST_SIZE = 25
 # Glob pattern per source dir: digests are job_uid_<UID>.txt; board
@@ -174,52 +175,51 @@ configure({"excluded_employers": [], "excluded_title_patterns": [],
 # Jobs already applied to (applied_path): one per line, the posting URL,
 # or "Title | Employer" for digest rows, which have no link. "#" starts
 # a comment. Rows flagged "a" in the feedback files ([a], [m,a], ...)
-# count as well. They're
-# cut before ranking and listed in their own shortlist section for as
-# long as they're still posted. Read by load_inputs()
+# count as well, matched by posting URL too for board rows. They're cut
+# before ranking and listed in their own shortlist section for as long
+# as they're still posted. Read by load_inputs()
 APPLIED_URLS, APPLIED_PAIRS = set(), set()
 
 def load_applied(path):
     """(urls, listing keys) from the applied list at path; a missing
     file means none. "Title | Employer" lines are split like verdict
-    lines, so a pipe in a title is fine."""
+    lines, so a pipe in a title is fine. A line that is neither a URL
+    nor a listing could never match, so it's reported and ignored."""
     urls, pairs = set(), set()
-    if path.exists():
-        for ln in path.read_text(encoding="utf-8").splitlines():
-            ln = re.split(r"(?:^|\s)#", ln, maxsplit=1)[0].strip()
-            if not ln:
-                continue
-            listing = (None if ln.lower().startswith("http")
-                       else verdicts.split_listing(ln))
-            if listing:
-                pairs.add(verdicts.listing_key(*listing))
-            else:
-                urls.add(ln)
+    if not path.exists():
+        return urls, pairs
+    lines = path.read_text(encoding="utf-8").splitlines()
+    for n, raw in enumerate(lines, 1):
+        ln = re.split(r"(?:^|\s)#", raw, maxsplit=1)[0].strip()
+        if not ln:
+            continue
+        if ln.lower().startswith("http"):
+            urls.add(ln)
+            continue
+        listing = verdicts.split_listing(ln)
+        if listing:
+            pairs.add(verdicts.listing_key(*listing))
+        else:
+            hint = (" (text after \" #\" is a comment)"
+                    if ln != raw.strip() else "")
+            print(f"[WARN] {path}:{n}: neither a URL nor \"Title | "
+                  f"Employer\"{hint}; line ignored")
     return urls, pairs
 
-def parse_metadata_url(lines):
-    """URL from the '# Metadata' block, or "" (digest files have none).
-    Stops at the block's closing '---', so body text can't supply it."""
+def metadata(lines):
+    """The '# Metadata' block's "Key: value" lines as a dict, the first
+    of each key winning; {} for a file without the block. Stops at the
+    block's closing '---', so body text can't supply a value. Board
+    files have a URL: line, digest files a Date: line."""
+    meta = {}
     if lines and lines[0] == "# Metadata":
         for ln in lines:
             if ln == "---":
                 break
-            if ln.startswith("URL: "):
-                return ln[5:].strip()
-    return ""
-
-def parse_metadata_date(lines):
-    """Date header from a digest file's metadata block, as an aware
-    datetime. Board files have no Date: line, so this returns None for
-    them; unparsable digest dates also return None (callers keep those
-    rows rather than silently dropping them)."""
-    if lines and lines[0] == "# Metadata":
-        for ln in lines:
-            if ln == "---":
-                break
-            if ln.startswith("Date: "):
-                return parse_email_date(ln[6:].strip())
-    return None
+            key, sep, value = ln.partition(": ")
+            if sep:
+                meta.setdefault(key, value.strip())
+    return meta
 
 def role_excerpt(description, max_chars):
     """Best scoring window from a posting description, capped hard.
@@ -259,6 +259,12 @@ def copy_rank(row):
     newest digest."""
     return (row["source"] == "raw_boards", row["_dt"] or NEWEST)
 
+def is_stale(dt, now):
+    """True for a digest Date older than the recency window. An unknown
+    date is never stale: such rows are kept, not silently dropped."""
+    return bool(RECENCY_DAYS and dt is not None
+                and (now - dt).days > RECENCY_DAYS)
+
 def parse_jobs():
     """Jobs arrive as 4-line quadruples ending in 'View':
     title / employer / location / View.
@@ -267,8 +273,14 @@ def parse_jobs():
     a posting can be both in a digest and on a board) is kept once per
     (title, employer), choosing the copy by copy_rank. Staleness is
     judged on the kept copy, so a listing still advertised in a recent
-    digest is never aged out because an older digest also had it."""
-    best = {}
+    digest is never aged out because an older digest also had it.
+
+    Returns (jobs, unparsed). unparsed names the digest files inside the
+    recency window that have text but yield no listing: the sign of a
+    change in the digest's format, which would otherwise drop its
+    listings without a word."""
+    best, unparsed = {}, []
+    now = datetime.now(timezone.utc)
     for src_dir, pattern in SOURCE_DIRS:
         if not src_dir.exists():
             continue
@@ -283,9 +295,12 @@ def parse_jobs():
                 cut, desc = len(all_lines), ""
             raw_lines = [ln.strip() for ln in all_lines[:cut]
                          if ln.strip()]
-            url = parse_metadata_url(raw_lines)
-            digest_dt = (parse_metadata_date(raw_lines)
-                         if src_dir.name == "raw" else None)
+            meta = metadata(raw_lines)
+            url = meta.get("URL", "")
+            is_digest = src_dir.name == "raw"
+            digest_dt = (parse_email_date(meta.get("Date", ""))
+                         if is_digest else None)
+            found = 0
             for i, ln in enumerate(raw_lines):
                 if ln.lower() != "view" or i < 3:
                     continue
@@ -295,6 +310,7 @@ def parse_jobs():
                 if any(x.lower() in KNOWN_NOISE
                        for x in (title, employer, location)):
                     continue
+                found += 1
                 row = {
                     "title": title,
                     "employer": employer,
@@ -308,21 +324,27 @@ def parse_jobs():
                 key = verdicts.listing_key(title, employer)
                 if key not in best or copy_rank(row) > copy_rank(best[key]):
                     best[key] = row
+            # A digest saved without a text part has no body: not a sign
+            # of anything. The body starts after the metadata block
+            body = raw_lines[raw_lines.index("---") + 1:] \
+                if "---" in raw_lines else raw_lines
+            if is_digest and body and not found \
+                    and not is_stale(digest_dt, now):
+                unparsed.append(f.name)
 
-    now = datetime.now(timezone.utc)
     jobs = list(best.values())
     for j in jobs:
         dt = j.pop("_dt")
         j["_undated"] = bool(RECENCY_DAYS and j["source"] == "raw"
                              and dt is None)
-        j["_stale"] = bool(RECENCY_DAYS and dt is not None
-                           and (now - dt).days > RECENCY_DAYS)
-    return jobs
+        j["_stale"] = is_stale(dt, now)
+    return jobs, unparsed
 
 def hard_filter(jobs):
     kept, rejected = [], []
     for j in jobs:
-        if (j["url"] in APPLIED_URLS
+        # Digest rows have no URL, and "" must never match one
+        if ((j["url"] and j["url"] in APPLIED_URLS)
                 or verdicts.listing_key(j["title"], j["employer"])
                 in APPLIED_PAIRS):
             j["reject_reason"] = "applied"
@@ -358,12 +380,17 @@ SYSTEM_PROMPT = ""
 
 def load_inputs():
     """Read the files the configuration names: the ranking prompt (the
-    run stops without it), the applied list, and the "a" verdicts."""
+    run stops without it), the applied list, and the "a" verdicts. An
+    "a" verdict on a board row cuts it by posting URL as well, so an
+    edited title doesn't bring the job back."""
     global SYSTEM_PROMPT, APPLIED_URLS, APPLIED_PAIRS
     SYSTEM_PROMPT = load_system_prompt()
     APPLIED_URLS, APPLIED_PAIRS = load_applied(APPLIED_PATH)
-    APPLIED_PAIRS |= {key for key, v in verdicts.load_verdicts().items()
-                      if v["applied"]}
+    for key, v in verdicts.load_verdicts().items():
+        if v["applied"]:
+            APPLIED_PAIRS.add(key)
+            if v["url"]:
+                APPLIED_URLS.add(v["url"])
 
 # Appended to the system prompt for pass 2 only. Generic mechanics
 # (how to use excerpts, small-batch behavior) belong here, like the
@@ -373,6 +400,12 @@ def load_inputs():
 # its batch and would keep scores from being reused across runs
 INDEPENDENT_SCORING = ("Score each job on its own: its score must not "
                        "depend on the other jobs in this list.")
+# The response format both passes ask for. The request text is part of
+# what's scored, so a change here changes scores
+RESPONSE_FORMAT = ('Respond with STRICT JSON only, format: {"scores": '
+                   '[{"index": <int>, "score": <int 0-100>, "reason": '
+                   '"<one short sentence>"}]}. '
+                   f"{INDEPENDENT_SCORING} Include every index exactly once.")
 
 RERANK_ADDENDUM = """
 
@@ -395,11 +428,31 @@ MAX_ATTEMPTS = 3
 # per attempt (greedy decoding would repeat a bad response on retry)
 SEED = 42
 # Failures of the connection itself (Ollama down, timeout, a response
-# cut off mid-body). These fail the batch; everything wrong with the
-# CONTENT of a response is a ValueError and gets a retry instead.
+# cut off mid-body, a 5xx answer). These fail the batch; everything
+# wrong with the CONTENT of a response is a ValueError and gets a retry
+# instead.
 TRANSPORT_ERRORS = (OSError, http.client.HTTPException)
 # Consecutive failed batches before a pass gives up (Ollama down/wedged)
 MAX_FAIL_STREAK = 3
+
+class RequestRejected(Exception):
+    """Ollama answered a chat request with a 4xx: the request itself is
+    wrong (model_thinking on for a model that can't think, say), so
+    every request would be rejected alike and no retry can help."""
+
+def http_error_text(e):
+    """An HTTPError with the start of Ollama's error body, which names
+    the cause; urllib's own text is only "Bad Request" and the like."""
+    try:
+        body = e.read().decode("utf-8", errors="replace")
+    except OSError:
+        body = ""
+    try:
+        body = json.loads(body).get("error") or body
+    except (ValueError, AttributeError):
+        pass
+    detail = " ".join(str(body).split())[:300]
+    return f"HTTP {e.code} {e.reason}" + (f": {detail}" if detail else "")
 
 def sampling_options(attempt):
     if attempt == 1 and not MODEL_THINKING:
@@ -408,8 +461,9 @@ def sampling_options(attempt):
 
 def ollama_chat(system, user, attempt=1):
     """One chat completion; returns the model's content string.
-    Raises TRANSPORT_ERRORS on connection failure and ValueError when
-    the body isn't a chat response."""
+    Raises TRANSPORT_ERRORS on connection failure or a 5xx answer,
+    RequestRejected on a 4xx, and ValueError when the body isn't a chat
+    response."""
     payload = {
         "model": MODEL,
         "messages": [
@@ -426,8 +480,13 @@ def ollama_chat(system, user, attempt=1):
         data=json.dumps(payload).encode(),
         headers={"Content-Type": "application/json"},
     )
-    with urllib.request.urlopen(req, timeout=600) as resp:
-        data = json.load(resp)  # non-JSON body: JSONDecodeError (ValueError)
+    try:
+        with urllib.request.urlopen(req, timeout=600) as resp:
+            data = json.load(resp)  # non-JSON: JSONDecodeError (ValueError)
+    except urllib.error.HTTPError as e:
+        if 400 <= e.code < 500:
+            raise RequestRejected(http_error_text(e)) from None
+        raise OSError(http_error_text(e)) from None
     content = (data.get("message") or {}).get("content") \
         if isinstance(data, dict) else None
     if not isinstance(content, str):
@@ -530,7 +589,9 @@ def request_scores(system, user, batch):
     """Score one batch with retries. Returns {index: {"score",
     "reason"}}: complete as soon as one attempt covers every index,
     otherwise the most complete attempt (possibly {}). Every problem
-    with a response's content is retried; TRANSPORT_ERRORS propagate."""
+    with a response's content is retried. TRANSPORT_ERRORS propagate,
+    unless an earlier attempt returned scores: those are returned, like
+    any partial result. RequestRejected always propagates."""
     best = {}
     for attempt in range(1, MAX_ATTEMPTS + 1):
         try:
@@ -540,6 +601,12 @@ def request_scores(system, user, batch):
             print(f"    [attempt {attempt}] unusable response ({e}) "
                   f"— retrying")
             continue
+        except TRANSPORT_ERRORS as e:
+            if not best:
+                raise
+            print(f"    [attempt {attempt}] request failed ({e}) — keeping "
+                  f"{len(best)} scores from an earlier attempt")
+            return best
         if len(scores) > len(best):
             best = scores
         missing = len(batch) - len(scores)
@@ -566,11 +633,8 @@ def score_batch(batch):
         f'{i}: {j["title"]} | {j["employer"]} | {j["location"]}'
         for i, j in enumerate(batch)
     )
-    user = ("Score every job below for fit. Respond with STRICT JSON "
-            'only, format: {"scores": [{"index": <int>, "score": '
-            '<int 0-100>, "reason": "<one short sentence>"}]}. '
-            f"{INDEPENDENT_SCORING} "
-            f"Include every index exactly once.\n\nJobs:\n{listing}")
+    user = (f"Score every job below for fit. {RESPONSE_FORMAT}\n\n"
+            f"Jobs:\n{listing}")
     return request_scores(SYSTEM_PROMPT, user, batch)
 
 def score_rerank(batch):
@@ -580,22 +644,19 @@ def score_rerank(batch):
         ex = role_excerpt(j["description"], EXCERPT_CHARS)
         blocks.append(f'{i}: {j["title"]} | {j["employer"]} | '
                       f'{j["location"]}\nPOSTING: {ex}')
-    user = ("Re-score every job below for fit using the posting text. "
-            "Respond with STRICT JSON "
-            'only, format: {"scores": [{"index": <int>, "score": '
-            '<int 0-100>, "reason": "<one short sentence>"}]}. '
-            f"{INDEPENDENT_SCORING} "
-            f"Include every index exactly once.\n\nJobs:\n"
-            + "\n---\n".join(blocks))
+    user = (f"Re-score every job below for fit using the posting text. "
+            f"{RESPONSE_FORMAT}\n\nJobs:\n" + "\n---\n".join(blocks))
     return request_scores(SYSTEM_PROMPT + RERANK_ADDENDUM, user, batch)
 
 def run_batches(label, batches, scorer, apply):
     """Score batches in order with scorer(batch) and hand usable
     results to apply(batch, scores). A batch whose request fails
     (TRANSPORT_ERRORS) or yields no usable scores is left as-is and
-    counted as failed; MAX_FAIL_STREAK failures in a row abort the pass.
-    Returns (ok, failed, aborted); batches never attempted after an
-    abort count as failed."""
+    counted as failed. The pass is aborted after MAX_FAIL_STREAK
+    failures in a row, or at once when Ollama rejects a request, since
+    it would reject them all. Returns (ok, failed, aborted), where
+    aborted is None, "failures" or "rejected"; batches never attempted
+    after an abort count as failed."""
     ok = streak = 0
     for n, batch in enumerate(batches, 1):
         try:
@@ -604,12 +665,16 @@ def run_batches(label, batches, scorer, apply):
                      f"no usable scores after {MAX_ATTEMPTS} attempts")
         except TRANSPORT_ERRORS as e:
             scores, error = {}, e
+        except RequestRejected as e:
+            print(f"  {label} {n} FAILED: Ollama rejected the request "
+                  f"({e}); aborting.")
+            return ok, len(batches) - ok, "rejected"
         if error:
             print(f"  {label} {n} FAILED: {error}")
             streak += 1
             if streak >= MAX_FAIL_STREAK:
                 print(f"  {streak} consecutive failures; aborting.")
-                return ok, len(batches) - ok, True
+                return ok, len(batches) - ok, "failures"
             continue
         apply(batch, scores)
         tag = ("" if len(scores) == len(batch)
@@ -617,7 +682,7 @@ def run_batches(label, batches, scorer, apply):
         print(f"  {label} {n}: {len(scores)}/{len(batch)} scored{tag}")
         ok += 1
         streak = 0
-    return ok, len(batches) - ok, False
+    return ok, len(batches) - ok, None
 
 def attach_caps(jobs):
     """Each listing's score_cap (the lowest matching score_caps entry)
@@ -688,20 +753,17 @@ def shortlist_rows(ranked):
     return rows, collections.Counter({names[e]: n for e, n in more.items()})
 
 def main():
-    try:
-        configure(load_config())
-    except KeyError as e:
-        print(f"[ERROR] pipeline_config.json has no {e} key; it's required.")
-        sys.exit(1)
-    except (ValueError, re.error) as e:
-        print(f"[ERROR] pipeline_config.json: {e}")
-        sys.exit(1)
+    configure_from_file(configure)
     load_inputs()
-    jobs = parse_jobs()
+    jobs, unparsed = parse_jobs()
     if not jobs:
-        print("No job rows parsed from raw/ or raw_boards/. Did you "
-              "re-ingest with the new extractor?")
+        print("No job rows parsed from raw/ or raw_boards/. Are both "
+              "folders empty, or has a file format changed?")
         sys.exit(1)
+    if unparsed:
+        print(f"[WARN] {len(unparsed)} recent digest file(s) have text but "
+              f"no listings: {', '.join(unparsed)}. Has the digest "
+              f"format changed?")
 
     fresh, stale_rows, undated = [], [], 0
     for j in jobs:
@@ -745,6 +807,12 @@ def main():
     ok, failed, aborted = run_batches("batch", batches, score_batch,
                                       apply_pass1)
     if n_batches and not ok:
+        if aborted == "rejected":
+            # 1: a retry would send the same request
+            print("[ERROR] Ollama rejected the scoring request, and a "
+                  "retry can't fix that: check model_thinking, num_ctx "
+                  "and SCREEN_MODEL. No shortlist written.")
+            sys.exit(1)
         print(f"[ERROR] No batch scored. Is Ollama running at {OLLAMA_URL} "
               f"with {MODEL} pulled? No shortlist written.")
         # 2, not 1: nothing was written, so run_screen.bat can safely
@@ -801,6 +869,10 @@ def main():
         md.append(f"**NOTE: {rerank_failed} re-scoring batch(es) failed "
                   f"or were skipped; those rows kept their pass-1 "
                   f"score.**\n\n")
+    if unparsed:
+        md.append(f"**WARNING: {len(unparsed)} recent digest file(s) have "
+                  f"text but no listings ({md_cell(', '.join(unparsed))}). "
+                  f"Has the digest format changed?**\n\n")
     md.append(f"{len(kept)} ranked, {len(rejected)} auto-cut. "
               f"Board postings link directly; digest rows need the "
               f"email. Rows marked ▲ were re-scored against the "
@@ -847,9 +919,15 @@ def main():
     print(f"Wrote {md_path} (top {len(rows)} of {len(kept)})")
     if feedback_path.exists():
         print(f"Verdicts go in {feedback_path}")
+    # Exit 1 for a partial run: the wrapper logs it, and doesn't retry,
+    # since a retry would score everything again
     if failed:
         print(f"[ERROR] {failed} of {n_batches} batches failed; "
               f"shortlist is incomplete.")
+    if rerank_failed:
+        print(f"[ERROR] {rerank_failed} re-scoring batch(es) failed or were "
+              f"skipped; those rows are ranked on their pass-1 scores.")
+    if failed or rerank_failed:
         sys.exit(1)
 
 if __name__ == "__main__":

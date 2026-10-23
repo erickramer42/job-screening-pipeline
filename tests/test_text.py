@@ -1,12 +1,18 @@
 """Tests for the shared helpers: html_text, location_filter and
 pipeline_common."""
+import contextlib
+import io
+import re
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
+import pipeline_common
 from html_text import html_to_text
 from location_filter import location_matcher
-from pipeline_common import parse_email_date, write_atomic
+from pipeline_common import (configure_from_file, parse_email_date,
+                             write_atomic)
 
 class HtmlToText(unittest.TestCase):
     def test_cells_and_blocks_become_lines(self):
@@ -62,6 +68,39 @@ class EmailDate(unittest.TestCase):
         for value in ("", "not a date", None):
             with self.subTest(value=value):
                 self.assertIsNone(parse_email_date(value))
+
+class ConfigureFromFile(unittest.TestCase):
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.config = Path(tmp.name) / "pipeline_config.json"
+        patcher = mock.patch.object(pipeline_common, "CONFIG_FILE",
+                                    self.config)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_a_good_config_is_passed_on(self):
+        self.config.write_text('{"metro_cities": []}', encoding="utf-8")
+        seen = []
+        configure_from_file(seen.append)
+        self.assertEqual(seen, [{"metro_cities": []}])
+
+    def test_config_mistakes_stop_with_one_line_naming_the_file(self):
+        def configure(cfg):
+            re.compile(cfg["pattern"])
+        for name, text in (("JSON syntax", '{"pattern": "a",}'),
+                           ("missing key", "{}"),
+                           ("bad regex", '{"pattern": "("}')):
+            with self.subTest(name):
+                self.config.write_text(text, encoding="utf-8")
+                out = io.StringIO()
+                with contextlib.redirect_stdout(out), \
+                        self.assertRaises(SystemExit) as cm:
+                    configure_from_file(configure)
+                self.assertEqual(cm.exception.code, 1)
+                lines = out.getvalue().splitlines()
+                self.assertEqual(len(lines), 1)
+                self.assertIn("pipeline_config.json", lines[0])
 
 class WriteAtomic(unittest.TestCase):
     def test_replaces_and_leaves_no_temp_file(self):

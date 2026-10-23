@@ -85,12 +85,13 @@ Each of these was measured before and after the change. [STATUS.md](STATUS.md) h
 - **Unattended runs.** Windows Task Scheduler runs ingest overnight, then board fetch and screening at 06:00. The wrapper scripts retry and log.
 - **An exit-code contract with the scheduler:**
   - The screener exits 2 only when nothing was scored and nothing was written, for example because Ollama wasn't running. That's the only case the wrapper retries.
-  - A partial run writes the shortlist with a warning, and exits 1.
-  - A preflight check tells an Ollama outage apart from a model that isn't installed.
+  - A partial run, in either pass, still writes the shortlist, flagged at the top, and exits 1.
+  - A preflight check tells an Ollama outage apart from a model that isn't installed, and a request Ollama rejects stops the run with its reason instead of being retried.
 - **Atomic writes.** Every file is written through a temporary file, so a killed run never leaves a truncated one.
-- **87 `unittest` tests**, which need no network and no personal config. They include the contracts between stages:
+- **116 `unittest` tests**, which need no network and no personal config. They include the contracts between stages:
   - what ingest and board fetch write must parse in the screener;
-  - the board-file layout is pinned byte for byte.
+  - the board-file layout is pinned byte for byte;
+  - each exit code, with the screener run end to end against a stand-in model.
 
 ## Quick start
 

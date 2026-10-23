@@ -1,6 +1,7 @@
 """Tests for board_fetch.py: the board-file layout, pay parsing, and when
 a posting's file is written, rewritten or archived. The board APIs are
 replaced by fixtures; nothing goes over the network."""
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -133,10 +134,29 @@ class SyncBoard(unittest.TestCase):
         with mock.patch.object(bf, "fetch_board", return_value=board), \
                 mock.patch.object(bf, "fetch_smartrecruiters_detail",
                                   return_value=detail) as fetch_detail, \
-                mock.patch("builtins.print"):
+                mock.patch("builtins.print") as printed:
             bf.sync_board({"platform": platform, "slug": "example",
                            "company": "Example Co"})
+        self.printed = [c.args[0] for c in printed.call_args_list]
         return fetch_detail
+
+    def run_main(self, boards):
+        """main() with this boards.json; every board returns one posting."""
+        config = self.out.parent / "boards.json"
+        config.write_text(json.dumps(boards), encoding="utf-8")
+        with mock.patch.object(bf, "CONFIG", config), \
+                mock.patch.object(bf, "configure_from_file",
+                                  lambda configure: configure(CONFIG)), \
+                mock.patch.object(bf, "fetch_board",
+                                  return_value=greenhouse_board()), \
+                mock.patch("builtins.print"):
+            return bf.main()
+
+    def other_board_file(self, name="greenhouse_9.txt",
+                         source="greenhouse/another"):
+        f = self.out / name
+        f.write_text(f"# Metadata\nSource: {source}\n", encoding="utf-8")
+        return f
 
     def test_unchanged_posting_is_not_rewritten(self):
         self.sync(greenhouse_board())
@@ -160,7 +180,7 @@ class SyncBoard(unittest.TestCase):
     def test_written_file_parses_in_the_screener(self):
         self.sync(greenhouse_board())
         with mock.patch.object(js, "SOURCE_DIRS", [(self.out, "*.txt")]):
-            (job,) = js.parse_jobs()
+            (job,), _ = js.parse_jobs()
         self.assertEqual((job["title"], job["employer"], job["location"],
                           job["url"]),
                          ("Senior Engineer", "Example Co", "Springfield",
@@ -169,11 +189,38 @@ class SyncBoard(unittest.TestCase):
 
     def test_closed_posting_is_archived_and_other_boards_kept(self):
         self.sync(greenhouse_board())
-        other = self.out / "greenhouse_9.txt"
-        other.write_text("# Metadata\nSource: greenhouse/another\n",
-                         encoding="utf-8")
+        other = self.other_board_file()
         self.sync({"jobs": []})
         self.assertTrue((self.out / "archive" / "greenhouse_1.txt").exists())
+        self.assertTrue(other.exists())
+
+    def test_the_board_line_counts_what_was_fetched(self):
+        # An empty board and a filtered one both have 0 live postings
+        self.sync({"jobs": []})
+        self.assertTrue(self.printed[-1].startswith(
+            "  Example Co: 0 fetched, 0 new"))
+        self.sync(greenhouse_board(title="Sales Engineer"))
+        self.assertTrue(self.printed[-1].startswith(
+            "  Example Co: 1 fetched, 0 new"))
+
+    def test_files_of_a_board_no_longer_configured_are_archived(self):
+        other = self.other_board_file()
+        no_source = self.out / "notes.txt"
+        no_source.write_text("Senior Engineer\n", encoding="utf-8")
+        board = {"platform": "greenhouse", "slug": "example",
+                 "company": "Example Co"}
+        self.assertEqual(self.run_main([board]), 0)
+        self.assertTrue((self.out / "greenhouse_1.txt").exists())
+        self.assertTrue((self.out / "archive" / other.name).exists())
+        self.assertTrue(no_source.exists())
+
+    def test_nothing_is_archived_as_unconfigured_beside_a_bad_entry(self):
+        # The malformed entry might be the board those files belong to
+        other = self.other_board_file()
+        board = {"platform": "greenhouse", "slug": "example",
+                 "company": "Example Co"}
+        self.assertEqual(self.run_main([board, {"company": "Another"}]), 1)
+        self.assertTrue((self.out / "greenhouse_1.txt").exists())
         self.assertTrue(other.exists())
 
     def test_filters(self):

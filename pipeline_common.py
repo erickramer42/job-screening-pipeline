@@ -5,6 +5,7 @@ parsing, and atomic file writes. Importing it reads no files.
 """
 import json
 import os
+import re
 import sys
 from datetime import timezone
 from email.utils import parsedate_to_datetime
@@ -26,6 +27,23 @@ def load_config():
               "pipeline_config.example.json and fill in your values.")
         sys.exit(1)
     return json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
+
+def configure_from_file(configure):
+    """Load pipeline_config.json and pass it to a script's configure().
+    A config mistake stops the run with one line naming the file, and
+    exit code 1: a missing required key (KeyError), a bad value or JSON
+    syntax (ValueError), or an invalid regular expression (re.error)."""
+    try:
+        configure(load_config())
+        return
+    except KeyError as e:
+        print(f"[ERROR] {CONFIG_FILE} has no {e} key; it's required.")
+    except re.error as e:
+        print(f"[ERROR] {CONFIG_FILE}: bad regular expression ({e}) in "
+              f"{e.pattern!r}")
+    except ValueError as e:
+        print(f"[ERROR] {CONFIG_FILE}: {e}")
+    sys.exit(1)
 
 def parse_email_date(value):
     """An email Date header as an aware datetime, taken as UTC when it

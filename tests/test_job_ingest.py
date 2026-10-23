@@ -1,6 +1,7 @@
 """Tests for job_ingest.py: reading a message's body and headers, the
-digest file it writes (and that the screener parses it), and the
-settings checks. No mail server is involved."""
+digest file it writes (and that the screener parses it), file names,
+a run against a stand-in mailbox, and the settings checks. No mail
+server is involved."""
 import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
@@ -67,7 +68,7 @@ class DigestContract(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             raw_dir = Path(tmp) / "raw"
             raw_dir.mkdir()
-            (raw_dir / "job_uid_7.txt").write_text(
+            (raw_dir / ji.digest_name("41", "7")).write_text(
                 ji.digest_record(subject, sender, date, "7",
                                  html_to_text(body)), encoding="utf-8")
             js.configure({"excluded_employers": [],
@@ -75,12 +76,96 @@ class DigestContract(unittest.TestCase):
                           "metro_cities": [], "recency_days": 30})
             with mock.patch.object(js, "SOURCE_DIRS",
                                    [(raw_dir, "job_*.txt")]):
-                jobs = js.parse_jobs()
+                jobs, unparsed = js.parse_jobs()
         self.assertEqual(sorted((j["title"], j["employer"], j["location"])
                                 for j in jobs),
                          [("Data Engineer", "Beta & Co", "Remote"),
                           ("Senior Engineer", "Acme", "Springfield")])
         self.assertFalse(any(j["_stale"] or j["_undated"] for j in jobs))
+        self.assertEqual(unparsed, [])
+
+class FakeMailbox:
+    """Stands in for imaplib.IMAP4_SSL: one folder of {uid: raw message},
+    and the commands it was sent."""
+    def __init__(self, messages, uidvalidity=b"41"):
+        self.messages, self.uidvalidity = messages, uidvalidity
+        self.commands = []
+
+    def __call__(self, *args, **kwargs):  # the constructor
+        return self
+
+    def __getattr__(self, name):  # login, close, logout, store, ...
+        return lambda *args, **kwargs: self.commands.append((name, args))
+
+    def select(self, folder, readonly=False):
+        self.commands.append(("select", (folder, readonly)))
+        return "OK", [str(len(self.messages)).encode()]
+
+    def response(self, code):
+        return code, [self.uidvalidity]
+
+    def uid(self, command, *args):
+        self.commands.append(("uid " + command, args))
+        if command == "search":
+            return "OK", [" ".join(self.messages).encode()]
+        return "OK", [(b"1 (BODY[] {1}", self.messages[args[0]]), b")"]
+
+class Run(unittest.TestCase):
+    """main() against FakeMailbox, writing to a temporary raw/."""
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.raw = Path(tmp.name) / "raw"
+        sent = format_datetime(datetime.now(timezone.utc) - timedelta(days=1))
+        self.message = raw_message(
+            b"Senior Engineer\r\nAcme\r\nSpringfield\r\nView\r\n", date=sent)
+        cfg = {"imap_host": "imap.example.com", "mail_folder": "Jobs",
+               "recency_days": 30}
+        for target, name, value in (
+                (ji, "RAW_DIR", self.raw),
+                (ji, "configure_from_file", lambda c: c(cfg))):
+            patcher = mock.patch.object(target, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        env = mock.patch.dict("os.environ", {"EMAIL_USER": "user",
+                                             "EMAIL_PASSWORD": "secret"})
+        env.start()
+        self.addCleanup(env.stop)
+        self.addCleanup(ji.configure, {})
+
+    def run_main(self, mailbox):
+        with mock.patch.object(ji.imaplib, "IMAP4_SSL", mailbox), \
+                mock.patch("builtins.print"):
+            return ji.main()
+
+    def test_new_digests_are_named_by_uidvalidity_and_uid(self):
+        self.raw.mkdir()
+        # Written before UIDVALIDITY was in the name: renamed, not fetched
+        (self.raw / "job_uid_5.txt").write_text("old", encoding="utf-8")
+        mailbox = FakeMailbox({"5": self.message, "6": self.message})
+        self.assertEqual(self.run_main(mailbox), 0)
+        self.assertEqual(sorted(p.name for p in self.raw.iterdir()),
+                         ["job_uv41_uid5.txt", "job_uv41_uid6.txt"])
+        self.assertEqual((self.raw / "job_uv41_uid5.txt").read_text(
+            encoding="utf-8"), "old")
+        self.assertNotIn(("uid fetch", ("5", "(BODY.PEEK[])")),
+                         mailbox.commands)
+
+    def test_the_mailbox_is_only_read(self):
+        mailbox = FakeMailbox({"6": self.message})
+        self.run_main(mailbox)
+        names = {name for name, _ in mailbox.commands}
+        self.assertIn(("select", ("Jobs", True)), mailbox.commands)
+        self.assertFalse(names & {"store", "uid store", "expunge",
+                                  "uid expunge", "copy", "uid copy",
+                                  "uid move", "append", "delete"})
+        self.assertTrue(all("PEEK" in args[1] for name, args in
+                            mailbox.commands if name == "uid fetch"))
+
+    def test_no_uidvalidity_stops_the_run(self):
+        mailbox = FakeMailbox({"6": self.message}, uidvalidity=None)
+        self.assertEqual(self.run_main(mailbox), 1)
+        self.assertEqual(list(self.raw.iterdir()), [])
 
 class Configure(unittest.TestCase):
     def tearDown(self):

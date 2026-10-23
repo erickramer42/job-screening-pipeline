@@ -1,9 +1,12 @@
-"""Tests for slug_probe.py: slug guesses, and telling "no board" apart
-from "couldn't ask". The network is mocked."""
+"""Tests for slug_probe.py: slug guesses, the input file, and telling
+"no board" apart from "couldn't ask". The network is mocked."""
 import io
 import json
+import sys
+import tempfile
 import unittest
 import urllib.error
+from pathlib import Path
 from unittest import mock
 
 import slug_probe
@@ -18,6 +21,23 @@ class SlugVariants(unittest.TestCase):
         self.assertEqual(slug_probe.slug_variants("Cisco")[0], "cisco")
         self.assertEqual(slug_probe.slug_variants("Costco")[0], "costco")
         self.assertIn("acme", slug_probe.slug_variants("Acme Technologies"))
+
+class Candidates(unittest.TestCase):
+    def test_names_come_from_the_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "targets.txt"
+            path.write_text("Acme\n\n Beta Co \n", encoding="utf-8")
+            with mock.patch.object(sys, "argv", ["slug_probe.py", str(path)]):
+                self.assertEqual(slug_probe.candidates(), ["Acme", "Beta Co"])
+
+    def test_a_missing_file_stops_rather_than_probing_other_names(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            argv = ["slug_probe.py", str(Path(tmp) / "targest.txt")]
+            with mock.patch.object(sys, "argv", argv), \
+                    mock.patch("builtins.print"), \
+                    self.assertRaises(SystemExit) as cm:
+                slug_probe.candidates()
+        self.assertEqual(cm.exception.code, 1)
 
 class Probe(unittest.TestCase):
     def test_jobs_mean_a_board(self):
