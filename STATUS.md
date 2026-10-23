@@ -9,7 +9,7 @@ This project automates discovery, triage, and ranking of job postings from two s
 
 The goal is a focused daily application routine (~10 highest-quality matches per day). Applications are not submitted automatically.
 
-Setup, usage, and the configuration reference are in [README.md](README.md). This file tracks project state and planned work.
+[README.md](README.md) is the project overview. Setup and operation are in [docs/USAGE.md](docs/USAGE.md), and the settings reference is in [docs/CONFIGURATION.md](docs/CONFIGURATION.md). This file tracks project state and planned work.
 
 ### Philosophy
 - **Human-in-the-loop:** Agent discovers and ranks; the candidate applies manually at company career pages
@@ -32,10 +32,10 @@ Setup, usage, and the configuration reference are in [README.md](README.md). Thi
 | Board fetch (`board_fetch.py`) | ✅ Operational | Pulls `boards.json` companies into `raw_boards/` and filters by title, metro-area/US-remote location, and pay floor. Stores each posting's description (Greenhouse, Ashby, SmartRecruiters; not Lever). Closed postings move to `raw_boards/archive/`. A posting's file is rewritten whenever the posting changes or the file format is older. |
 | Slug discovery (`slug_probe.py`) | ✅ Operational | Guesses board slugs for company names (e.g. `targets.txt`) and prints `boards.json` lines for slugs that return jobs |
 | Job parsing (`jobs_screen.py` parser) | ✅ Operational | Reads title/employer/location quadruples from `raw/` and `raw_boards/`. Keeps one copy per listing (board copy first, then newest digest) and cuts digests older than `recency_days`. |
-| Hard filters | ✅ Operational | Blocks the employers and title patterns listed in `pipeline_config.json` |
+| Hard filters | ✅ Operational | Cuts the employers and title patterns listed in `pipeline_config.json`, digest listings outside the search area, and jobs already applied to (`applied.txt`, or an `a` flag in `feedback/`) |
 | LLM ranking | ✅ Operational | Pass 1 scores every survivor 0–100 from title/employer/location. Pass 2 re-scores the top `rerank_top_n` listings that have a description, using a role-section excerpt. Thinking is off and the first attempt is greedy, so scores are repeatable; `score_caps` (by employer, title or posting text) are enforced after each pass. Malformed responses are retried; 3 consecutive failed batches stop a pass. |
 | Output generation | ✅ Operational | Produces `out/shortlist_YYYY-MM-DD.md` and JSON. Board rows include direct posting links; ▲ marks pass-2 scores. |
-| Scheduled runs | ✅ Operational | Task Scheduler runs ingest at 01:00 and 05:00, and board fetch + screening at 06:00. Tasks wake the computer, run after a missed start, and the wrappers retry (see [Automation](#automation)). Verified across 2026-10-09 to 10-22, with two misses. On 10-14 no task ran: a Windows Update restart at 00:33 left no one signed in until 08:52, and the missed-start catch-up didn't run the tasks after sign-in. On 10-22 screening failed all 3 attempts because Ollama wasn't running. Both are open items (see Next Milestones). |
+| Scheduled runs | ✅ Operational | Task Scheduler runs ingest at 01:00 and 05:00, and board fetch + screening at 06:00. Tasks wake the computer, run after a missed start, and the wrappers retry (see [Automation](#automation)). Verified across 2026-10-09 to 10-23, with two misses. On 10-14 no task ran: a Windows Update restart at 00:33 left no one signed in until 08:52, and the missed-start catch-up didn't run the tasks after sign-in. On 10-22 screening failed all 3 attempts because Ollama wasn't running. Both are open items (see Next Milestones). |
 
 ### Recent Changes (2026-10-23)
 - **Ranking prompt, from the 10-23 shortlist review:** Node.js no longer counts as part of the candidate's stack. The model had cited it as a core-stack match on three shortlist rows.
@@ -54,7 +54,7 @@ Setup, usage, and the configuration reference are in [README.md](README.md). Thi
   - Now a file is rewritten whenever its text would change. SmartRecruiters descriptions, which cost a request per posting, are fetched again only when the listing lines change.
   - Files are written through a temporary file, so an interrupted run can't leave a truncated one.
   - **Checked** on a scratch copy against the live APIs: the first run rewrote exactly those 40 files (plus 1 new posting) and left the rest byte-identical; a second run rewrote nothing.
-- **Tests:** `python -m unittest` runs a stdlib suite in `tests/` (26 tests): deduplication, applied jobs, batch order, hard filters, score caps, the per-employer limit, and the verdict files. It needs no personal config.
+- **Tests:** `python -m unittest` runs a stdlib suite in `tests/`: deduplication, applied jobs, batch order, hard filters, score caps, the per-employer limit, and the verdict files. It needs no personal config.
 - **Screener:**
   - Config, prompt and applied-list loading moved from import time into `main()`, so the module can be imported and tested without personal files.
   - Checked: with a stand-in model on today's data, the old and new code sent the same 22 requests and wrote byte-identical outputs.
@@ -77,7 +77,7 @@ Setup, usage, and the configuration reference are in [README.md](README.md). Thi
 - **Config:** pass 1's batch size (`pass1_batch`, 30) and the context window (`num_ctx`, 8192) moved from code into config, with the same defaults.
 - **JSON:** a re-scored row that was capped in pass 1 keeps the model's own pass-1 score as `pass1_capped_from`.
 - **`slug_probe.py`:** a network failure is reported as a failed lookup, and the script exits 1. It used to report "no board found" for every company. The `boards.json` lines it prints are now valid JSON even for a name with quotes.
-- **Tests:** 82 now. Added: model-response handling, the pass-2 excerpt, the board-file layout and rewrite rules, email decoding, the slug probe, and the contract that what ingest and board fetch write parses in the screener.
+- **Tests:** 87 now, up from 26 at the start of the day. Added: model-response handling, the pass-2 excerpt, the board-file layout and rewrite rules, email decoding, the slug probe, combined verdict flags, and the contract that what ingest and board fetch write parses in the screener.
 - **Checked:**
   - The committed and new code ran on the same data, the screener with a stand-in model and board fetch against the live APIs.
   - The screener sent the same 22 requests and wrote identical outputs, apart from the new field. Board fetch left identical board folders.
@@ -91,12 +91,13 @@ Setup, usage, and the configuration reference are in [README.md](README.md). Thi
   - A row whose flags can't be read is now reported with its file and line number, instead of being skipped.
   - `verdicts.py` leaves a listing cut as applied out of its figures. A "yes" you applied to isn't counted as ranked last.
 - **`.gitignore`** also covers `pipeline_config.before-*.json`, the backups of the personal config taken before a rule change.
+- **Docs:** README.md is now a short project overview. Its setup and operating guide moved to `docs/USAGE.md`, and its settings reference to `docs/CONFIGURATION.md`.
 - **Tuning notes from the 10-23 review:**
   - **Ranking prompt:** the profile's core is the backend stack. TypeScript/React is secondary, and the technologies the candidate lacks are named.
     - A posting that requires one of those technologies is a real gap, and so is a front-end-led role.
     - A full-stack role with a Node.js backend that otherwise fits stays in 60–74.
   - **`score_caps`:** five new rules cap a required skill the candidate lacks: Spark/Databricks, Rails, C#/.NET and production AWS at 50, Node.js at 65.
-    - A rule matches a posting line that names the skill with years or strong wording, doesn't call it optional, and isn't a list of alternatives. README shows the pattern.
+    - A rule matches a posting line that names the skill with years or strong wording, doesn't call it optional, and isn't a list of alternatives. [docs/CONFIGURATION.md](docs/CONFIGURATION.md#score-caps) shows the pattern.
     - On 10-23 data they caught 8 of the 11 "no" rows on the shortlist, and no "maybe" row.
   - **Two flags, no cap:** `fde` for Forward Deployed titles, and `perm` for labor-certification-style requirements ("at least N years of prior work experience in each of the following").
   - **"Re-check postings are still open":** already done for board rows, since board fetch runs right before screening and archives closed postings. The posting that closed on 10-23 was still open at 06:00 and closed later that day. Digest rows have no link to check.
@@ -220,14 +221,16 @@ Quick fixes and score stabilization from a code review.
 ### Pending / Known Issues
 | Issue | Priority | Impact | Planned Fix |
 |-------|----------|--------|-------------|
-| Pass-2 scores share a ranking with pass-1 scores | Medium | Only listings with a description (board rows) are re-scored against posting text, so board rows can crowd digest rows out of the top 25. Much smaller since 2026-10-22: 17 board and 8 digest rows, and no buried digest "yes" rows in the verdicts so far. | Separate shortlist sections, only if `verdicts.py` shows digest "yes" rows below the cut |
-| Every run re-scores everything in the recency window | Medium | Each day re-scores all digest listings from the last `recency_days` plus every live board posting, though ~97% were scored the day before. A run takes ~5–9 min since 2026-10-22. | Score cache keyed by listing |
+| Pass-2 scores share a ranking with pass-1 scores | Medium | Only listings with a description (board rows) are re-scored against posting text, so board rows can crowd digest rows out of the top 25. Much smaller since 2026-10-22: the 10-23 scheduled run's top 25 had 18 board and 7 digest rows, and the verdicts so far show no digest "yes" row below the cut. | Separate shortlist sections, only if `verdicts.py` shows digest "yes" rows below the cut |
+| Every run re-scores everything in the recency window | Medium | Each day re-scores all digest listings from the last `recency_days` plus every live board posting, though ~97% were scored the day before. The 10-23 scheduled run took 4 min 41 s; runs took ~25 min before 2026-10-22. | Score cache keyed by listing |
+| Applied cuts and verdicts follow the title, not the posting | Medium | Both are keyed by title and employer. Board files now follow edits to their posting, so when a board posting's title changes, a job marked applied comes back into the ranking and its verdict no longer matches. Between Oct 10 and 23, 8 of 182 board titles changed. Every job marked applied so far is a board row. | Match board rows by posting URL as well, looked up in the ranked JSON of the run each feedback file judges |
 | Scores depend on batch-mates | Medium | The same listing scored in a different batch of 30 moves ~6 points on average (8% move 20+), against ~1.2 for a repeat of the same batch. The per-batch quota is gone (2026-10-22), but the model still grades partly against the other listings in its request. | Score each new listing in its own request, together with the score cache |
 | Dedup key ignores location | Medium | Same title+employer in another city is dropped. The kept copy is the board row when there is one, otherwise the newest digest. | Add location to the key where the location strings are comparable |
 | UIDVALIDITY not tracked | Medium | If the server resets UIDVALIDITY (e.g. a local mail server rebuilds its cache), UIDs restart at 1 and new digests are silently skipped as duplicates | Record UIDVALIDITY; warn or re-ingest when it changes |
 | Silent parser failure on format change | Medium | Screener finds 0 jobs without warning | Canary check: count `View` lines per file |
 | Lever descriptions not captured | Low | Lever postings never reach pass 2. No Lever boards are configured today. | Probe the Lever schema when a Lever board is added |
 | `slug_probe.py` "VERIFIED" only means the slug has jobs | Low | A generic name (e.g. "Google") can match a different company's board | Check the company on the board before adding to `boards.json` |
+| Board configuration problems are hard to see | Low | The board fetch log doesn't say how many postings a board returned, so an empty board looks like one whose postings were all filtered out. One configured board has returned no postings on recent runs. Also, a board removed from `boards.json`, or given a new slug, leaves its postings in `raw_boards/`, where they're screened daily with frozen text. No such files exist today. | Log the fetched count; archive the files of boards that are no longer configured |
 | Remote-by-timezone locations dropped | Low | e.g. Greenhouse "Eastern or Central Timezone" fails the location filter | Add timezone phrases to the remote check if needed |
 
 ---
@@ -261,8 +264,11 @@ jobScreensApplications/
 ├── feedback/                    # Daily verdict files, feedback/<date>.md (gitignored)
 ├── run_ingest.bat               # Task Scheduler wrappers (gitignored)
 ├── run_screen.bat
-├── README.md                    # Setup, usage, and config reference
+├── README.md                    # Project overview
 ├── STATUS.md                    # This file: project state and roadmap
+├── docs/
+│   ├── USAGE.md                 # Setup, running, outputs, review loop
+│   └── CONFIGURATION.md         # Settings reference
 ├── raw/                         # Ingested email digests (gitignored)
 ├── raw_boards/                  # One file per live board posting, with its
 │                                #   description (gitignored)
@@ -292,7 +298,7 @@ Apply manually at company career pages. Afterwards:
 - Fill in `feedback/<date>.md`: a y/m/n verdict per row, with notes after `::`. Add `a` when you've applied (`[m,a]`, or `[a]` alone); it cuts the job from future rankings.
 - Add jobs applied to outside the shortlist to `applied.txt` (URL, or `Title | Employer` for digest rows).
 - Run `python verdicts.py` after changing the prompt or config, to see whether the ranking moved toward your verdicts.
-- Turn repeated notes into config rules or prompt changes (see README, "Reviewing the shortlist").
+- Turn repeated notes into config rules or prompt changes (see [Reviewing the shortlist](docs/USAGE.md#reviewing-the-shortlist)).
 
 Adding boards: put company names in `targets.txt` and run `python slug_probe.py targets.txt`. Check that each VERIFIED board really belongs to that company, then paste the lines into `boards.json`.
 
@@ -332,7 +338,7 @@ The wrappers are gitignored. Both run under `cmd` (no Git Bash) and contain no m
 - **Trigger:** daily at the times above. **Action:** the wrapper, which sets its own working directory.
 - **Wake the computer to run this task:** on. **Run as soon as possible after a missed start:** on, so a run missed while the PC was off or logged out happens at the next opportunity.
 - **Can start on battery and keeps running on battery:** on.
-- **Time limit:** 2 h for ingest, 8 h for screening. A full run on 2026-10-22 data (275 ranked listings, 22 batches) took 9.4 min. The limit stops a hung run before the next day's run, which would otherwise be skipped ("do not start a new instance").
+- **Time limit:** 2 h for ingest, 8 h for screening. A full run on 2026-10-22 data (275 ranked listings, 22 batches) took 9.4 min, and the 10-23 scheduled run took 4 min 41 s. The limit stops a hung run before the next day's run, which would otherwise be skipped ("do not start a new instance").
 - **Runs only while the user is logged on.** This is deliberate: the local mail server and Ollama run in the user's session, so a logged-off run couldn't reach them. With catch-up on, a missed run starts once the user logs on.
 
 ### Prerequisites for unattended runs
@@ -394,7 +400,7 @@ IMAP host, port, STARTTLS, and folder live in `pipeline_config.json`, along with
 - **Batch size:** lower `pass1_batch` (30) in `pipeline_config.json` to 20 or 15 if pass-1 responses come back truncated
 - **Model choice:** swap `SCREEN_MODEL` for a smaller model (speed) or larger one (quality)
 - **Board file format:** bump `FILE_FORMAT` in `board_fetch.py` after changing what it writes; every live posting is rewritten on the next run.
-- **Model thinking:** `model_thinking` in `pipeline_config.json`. Off (the default) is fast and repeatable. On is about 4× slower, varies from run to run, and can overflow the context. See README.
+- **Model thinking:** `model_thinking` in `pipeline_config.json`. Off (the default) is fast and repeatable. On is about 4× slower, varies from run to run, and can overflow the context. See [docs/CONFIGURATION.md](docs/CONFIGURATION.md#model-thinking).
 - **Score caps:** `score_caps` in `pipeline_config.json` enforces the prompt's hard limits after each pass, by employer, title, or posting text, and flags the rows it matches.
 - **Shortlist crowding:** `shortlist_per_employer` in `pipeline_config.json`.
 - **Cost control:** with a 30-day window, the data on disk on 2026-10-22 parsed to 353 unique listings, with 78 cut and 275 ranked (10 pass-1 batches plus 12 pass-2 batches, 9.4 min). A score cache would cut daily scoring to new listings (see Known Issues).
@@ -432,9 +438,12 @@ Agreed 2026-10-22, in this order:
    - Record `model` and the prompt hash in `ranked_<date>.json`.
    - Re-score every board posting against its text, not just the top `rerank_top_n`.
    - Measure per-listing request time before building. The estimate is a few seconds each: ~15–30 min for the first full run, ~1–2 min daily after that.
+   - Before rewriting the scoring loop, add tests that run the screener end to end with a stand-in model. They pin its exit codes and the rule that a run with nothing scored writes nothing. Decide then whether a failed pass 2 should exit 1. Today it exits 0, with only a note in the shortlist.
 4. **Judge it** with `python verdicts.py`, and check day-to-day stability: a listing's score shouldn't move unless its listing, the prompt, or the model changed.
 
 After that, as needed:
+- **Match board rows by URL for applied cuts and verdicts**, so an edited title doesn't bring an applied job back. It changes no scores, so it doesn't wait for verdicts.
+- **Board fetch:** log how many postings each board returned. Archive the files of boards removed from `boards.json` before pruning the first one.
 - **Separate board and digest sections** in the shortlist, only if the verdicts show digest "yes" rows below the cut.
 - **Visibility for Ollama outages:** a `FAILED_<date>.md` marker written by the wrapper after its last attempt, and possibly starting Ollama before a retry. The preflight check is done (10-23).
 - **The 10-14 scheduling miss** (an update restart with no one signed in). Two fixes, both settings rather than code:
