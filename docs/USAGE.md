@@ -17,11 +17,14 @@ jobs_screen.py   raw/ + raw_boards/     ->  recency + hard filters -> pass 1 -> 
    - A file is named for the folder's UIDVALIDITY and the message's UID. If the server ever resets its UIDs, the window is ingested again, rather than new digests being skipped as already saved.
 2. **Board fetch** pulls each configured board. It keeps postings whose titles match your patterns and whose location is in your metro area or remote within the US.
    - It drops postings whose published pay range tops out below your floor.
-   - Some Greenhouse boards give only the work arrangement as the location ("Hybrid", "In-Office", "Distributed"). For those, the posting's office locations are added, as in `Hybrid: Springfield, ST`, and the filter reads them; "Distributed" counts as remote.
+   - Some Greenhouse boards give only the work arrangement as the location ("Hybrid", "In-Office", "Distributed"). For those, the posting's office locations are added, as in `Hybrid: Springfield, ST`, and the filter reads them.
+     - Offices in your area come first, then the rest by name. At most three are named, and the others are counted (`; +4 more`). So the location line stays short and doesn't change if the board lists its offices in another order. A posting kept with the full list is still kept.
+     - "Distributed" counts as remote. With no country field, a remote posting is kept only when its text names a metro city or the US, so a "Distributed" posting is kept when one of its offices does, and dropped when it has none.
+     - An office labeled remote ("Remote Spain") is left out of a Hybrid or In-Office location, since that isn't where the job is worked. On a Distributed posting, it's kept.
    - Postings that close, or stop passing the filters, move to `raw_boards/archive/`. So do the files of a board you remove from `boards.json`.
    - Each posting's description is stored below the listing, from every supported platform, along with the date the board first published it.
    - A posting's file is rewritten whenever its text would change: the employer edited the title, location, pay or description, or an older version of the script wrote the file.
-   - SmartRecruiters descriptions cost a request per posting, so they're fetched again only when the listing lines change.
+   - SmartRecruiters descriptions cost a request per posting, so they're fetched again only when the listing lines change. A new published date alone rewrites the file but keeps its description.
    - Files are written through a temporary file, so an interrupted run never leaves a truncated one.
 3. **Screen** reads both folders and cuts excluded employers and title patterns. It also cuts digest listings outside your area, using the same metro-or-US-remote rule that board fetch applies to postings.
    - **Duplicates and staleness:** a listing that appears in several files is kept once.
@@ -120,6 +123,7 @@ They write their fixtures to a temporary folder, mock the network, and need no p
 - `out/shortlist_<date>.md` is the top 25 as a table: score, flags, title, employer, location, posted date, link, and the model's one-line reason.
   - A ▲ before the score marks a listing re-scored in pass 2.
   - Posted is the date the board first published the posting. Digest rows show `-`. Board postings are exempt from `recency_days`, so this is how to spot one that has been open for months.
+    - Lever's API has no publish date, so a Lever row shows the date the posting was created, which can be before it went live.
   - Flags come from `score_caps` rules; `capped` means a rule lowered the model's score.
   - With `shortlist_per_employer` set, a line under the table counts the postings left out for that limit.
   - Jobs in `applied.txt` that are still posted are listed after the table.

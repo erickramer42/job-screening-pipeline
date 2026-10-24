@@ -19,6 +19,7 @@ from email.utils import format_datetime
 from pathlib import Path
 from unittest import mock
 
+import board_fetch
 import jobs_screen as js
 import pipeline_common
 
@@ -47,16 +48,9 @@ def digest_text(days_old, *listings):
     return "\n".join(lines) + "\n"
 
 def board_text(title, employer, location, url, description="", posted=""):
-    """A board file in board_fetch.py's layout."""
-    lines = ["# Metadata", "Source: greenhouse/example",
-             f"Company: {employer}", f"URL: {url}"]
-    if posted:
-        lines.append(f"Posted: {posted}")
-    lines += ["Format: 3", "---", "", title, employer, location, "View"]
-    text = "\n".join(lines) + "\n"
-    if description:
-        text += f"\n{js.DESC_MARKER}\n{description}\n"
-    return text
+    """A board file, as board_fetch.py writes it."""
+    return board_fetch.record_text("greenhouse", "example", employer, url,
+                                   posted, title, location, description)
 
 class SourceFiles(unittest.TestCase):
     """Each test gets empty raw/ and raw_boards/ folders."""
@@ -98,7 +92,7 @@ class ListingIdentity(SourceFiles):
             posted="2026-09-01"))
         jobs = {j["title"]: j for j in js.parse_jobs()[0]}
         self.assertEqual(jobs["Senior Engineer"]["posted"], "2026-09-01")
-        self.assertEqual(jobs["Data Engineer"]["posted"], "")
+        self.assertNotIn("posted", jobs["Data Engineer"])
 
     def test_newest_digest_copy_is_kept_and_judged_for_staleness(self):
         self.write(self.raw, "job_uid_1.txt", digest_text(
@@ -648,9 +642,9 @@ class MainRun(SourceFiles):
                                 "Backend Engineer": "2026-09-02",
                                 "Data Engineer": "-",
                                 "Platform Engineer": "-"})
-        self.assertEqual({j["title"]: j["posted"]
-                          for j in self.ranked()["ranked"]}["Senior Engineer"],
-                         "2026-09-01")
+        ranked = {j["title"]: j for j in self.ranked()["ranked"]}
+        self.assertEqual(ranked["Senior Engineer"]["posted"], "2026-09-01")
+        self.assertNotIn("posted", ranked["Data Engineer"])
 
     def test_ollama_unreachable_writes_nothing(self):
         with mock.patch("urllib.request.urlopen",

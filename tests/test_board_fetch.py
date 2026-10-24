@@ -106,23 +106,60 @@ class Parsing(unittest.TestCase):
                                 "minValue": 60, "maxValue": 70},
                                {"compensationType": "Salary",
                                 "currencyCode": "EUR", "interval": "1 YEAR",
-                                "minValue": 1, "maxValue": 2}]}}]}
+                                "minValue": 1, "maxValue": 2},
+                               "not a tier",
+                               {"compensationType": "Salary",
+                                "currencyCode": "USD", "interval": "1 YEAR",
+                                "minValue": 130000, "maxValue": "n/a"}]}}]}
         (row,) = bf.flatten(board, "ashby", "example")
         self.assertEqual((row.pay, row.pay_min, row.pay_max),
                          ("$124,800-$145,600", 124800, 145600))
         self.assertIs(row.remote, False)
 
+    def test_annual_range(self):
+        table = {"year": 1, "hour": 2080}
+        for tiers, expected in (
+                ([(100000, 120000, "USD", "year")],
+                 ("$100,000-$120,000", 100000, 120000)),
+                ([(50, 60, "USD", "hour"), (110000, 130000, "USD", "year")],
+                 ("$104,000-$130,000", 104000, 130000)),
+                # A max that is missing, 0 or not a number is the min
+                ([(130000, 0, "USD", "year")],
+                 ("$130,000-$130,000", 130000, 130000)),
+                ([(130000, None, "USD", "year")],
+                 ("$130,000-$130,000", 130000, 130000)),
+                ([(130000, "160k", "USD", "year")],
+                 ("$130,000-$130,000", 130000, 130000)),
+                ([(1, 2, "EUR", "year"), (1, 2, "USD", "month"),
+                  ("100k", 2, "USD", "year"), (True, 2, "USD", "year"),
+                  (1, 2, "USD", ["year"])],
+                 ("", None, None)),
+                ([], ("", None, None))):
+            with self.subTest(tiers=tiers):
+                self.assertEqual(bf.annual_range(tiers, table), expected)
+
     def test_greenhouse_arrangement_only_location_reads_the_offices(self):
+        # With no metro cities configured every place passes, so the
+        # offices are in name order
         offices = [{"name": "HQ", "location": "Springfield, ST"},
                    {"name": "Riverton office", "location": None},
-                   {"name": "HQ", "location": "Springfield, ST"}]
+                   {"name": "HQ", "location": "Springfield, ST"},
+                   {"name": "Annex", "location": {"city": "Springfield"}},
+                   {"name": None, "location": 5}]
         cases = [
             ("Hybrid", offices,
-             ("Hybrid: Springfield, ST; Riverton office", None)),
+             ("Hybrid: Annex; Riverton office; Springfield, ST", None)),
             ("Hybrid; In-Office", offices[:1],
              ("Hybrid; In-Office: Springfield, ST", None)),
             ("Distributed", [{"location": "United States"}],
              ("Distributed: United States", True)),
+            # A remote-labeled office counts only on "Distributed"
+            ("In-Office", [{"name": "Remote US", "location": None},
+                           {"location": "Springfield, ST"}],
+             ("In-Office: Springfield, ST", None)),
+            ("Hybrid", [{"name": "Remote US"}], ("Hybrid", None)),
+            ("Distributed", [{"name": "Remote US"}],
+             ("Distributed: Remote US", True)),
             # A name with a place, or a bare "Remote", is kept as it is
             ("Remote", offices, ("Remote", None)),
             ("Springfield", offices, ("Springfield", None)),
@@ -133,6 +170,33 @@ class Parsing(unittest.TestCase):
         for name, offs, expected in cases:
             with self.subTest(name=name):
                 self.assertEqual(bf.greenhouse_location(name, offs), expected)
+
+    def test_offices_in_the_area_come_first_and_the_rest_are_counted(self):
+        bf.configure(CONFIG)
+        self.addCleanup(bf.configure, {"metro_cities": [],
+                                       "included_title_patterns": [],
+                                       "excluded_keywords": []})
+        def offices(*places):
+            return [{"location": p} for p in places]
+        cases = [
+            ("Hybrid", offices("Zeta, XY", "Alpha, XY", "Beta, XY",
+                               "Gamma, XY", "Springfield, ST"),
+             ("Hybrid: Springfield, ST; Alpha, XY; Beta, XY; +2 more", None)),
+            ("Distributed", offices("Toronto, ON", "Austin, XY", "Berlin",
+                                    "United States", "Paris"),
+             ("Distributed: United States; Austin, XY; Berlin; +2 more",
+              True)),
+            ("Hybrid", offices("Gamma, XY", "Alpha, XY", "Beta, XY"),
+             ("Hybrid: Alpha, XY; Beta, XY; Gamma, XY", None)),
+        ]
+        for name, offs, expected in cases:
+            with self.subTest(offices=offs):
+                location, remote = bf.greenhouse_location(name, offs)
+                self.assertEqual((location, remote), expected)
+                # The filter's verdict is the one the full list gets
+                full = f"{name}: {'; '.join(o['location'] for o in offs)}"
+                self.assertEqual(bf.location_ok(location, remote, None),
+                                 bf.location_ok(full, remote, None))
 
     def test_lever_description_pay_and_date(self):
         def posting(salary):
@@ -146,7 +210,10 @@ class Parsing(unittest.TestCase):
                     "lists": [{"text": "What You'll Do",
                                "content": "<li>Build things</li>"
                                           "<li>Run them</li>"},
-                              "not a list"],
+                              "not a list",
+                              # Already holds an entity: decoded once
+                              {"text": "Pay &amp; Perks",
+                               "content": "<li>Equity</li>"}],
                     "additional": "<div>Pay is $1 &lt; $2</div>",
                     "salaryRange": salary}
         (row,) = bf.flatten([posting(
@@ -157,12 +224,17 @@ class Parsing(unittest.TestCase):
         self.assertEqual((row.remote, row.country), (False, "US"))
         self.assertEqual(bf.description_text("lever", row.raw_description),
                          "About Example Co & us\nWhat You'll Do\n"
-                         "Build things\nRun them\nPay is $1 < $2")
+                         "Build things\nRun them\nPay & Perks\nEquity\n"
+                         "Pay is $1 < $2")
         for salary, pay in (
                 ({"min": 60, "max": 70, "currency": "USD",
                   "interval": "per-hour-wage"}, "$124,800-$145,600"),
                 ({"min": 90000, "currency": "USD",
                   "interval": "per-year-salary"}, "$90,000-$90,000"),
+                # A max of 0 is missing, not a $0 top that the floor cuts
+                ({"min": 130000, "max": 0, "currency": "USD",
+                  "interval": "per-year-salary"}, "$130,000-$130,000"),
+                ([130000, 160000], ""), ("$130k", ""),
                 ({"min": 1, "max": 2, "currency": "GBP",
                   "interval": "per-year-salary"}, ""),
                 ({"min": 1, "max": 2, "currency": "USD",
@@ -274,6 +346,7 @@ class SyncBoard(unittest.TestCase):
                          ("Senior Engineer", "Example Co", "Springfield",
                           "https://example.com/1"))
         self.assertEqual(job["description"], "About the role\nBuild things.")
+        self.assertEqual(job["posted"], "2026-09-01")
 
     def test_closed_posting_is_archived_and_other_boards_kept(self):
         self.sync(greenhouse_board())
@@ -353,8 +426,9 @@ class SyncBoard(unittest.TestCase):
                       (self.out / "lever_l1.txt").read_text(encoding="utf-8"))
 
     def test_smartrecruiters_description_fetched_only_when_needed(self):
-        def board(name):
-            return {"content": [{"id": "abc", "name": name, "location": {
+        def board(name, released="2026-09-01T00:00:00.000Z"):
+            return {"content": [{"id": "abc", "name": name,
+                                 "releasedDate": released, "location": {
                 "city": "Springfield", "remote": False, "country": "us"}}]}
         detail = {"jobAd": {"sections": {"jobDescription": {
             "title": "Job Description", "text": "Build things."}}}}
@@ -364,10 +438,21 @@ class SyncBoard(unittest.TestCase):
         self.assertEqual(self.sync(board("Senior Engineer"),
                                    "smartrecruiters", detail).call_count, 0)
         self.assertEqual(self.write_calls.call_count, 1)
-        # Edited listing: the description is fetched again
-        self.assertEqual(self.sync(board("Lead Engineer"),
-                                   "smartrecruiters", detail).call_count, 1)
+        # Re-released: the file gets the new date, and keeps its
+        # description without a request
+        self.assertEqual(self.sync(board("Senior Engineer",
+                                         "2026-10-01T00:00:00.000Z"),
+                                   "smartrecruiters", detail).call_count, 0)
         self.assertEqual(self.write_calls.call_count, 2)
+        text = (self.out / "smartrecruiters_abc.txt").read_text(
+            encoding="utf-8")
+        self.assertIn("\nPosted: 2026-10-01\n", text)
+        self.assertTrue(text.endswith("Job Description\nBuild things.\n"))
+        # Edited listing: the description is fetched again
+        self.assertEqual(self.sync(board("Lead Engineer",
+                                         "2026-10-01T00:00:00.000Z"),
+                                   "smartrecruiters", detail).call_count, 1)
+        self.assertEqual(self.write_calls.call_count, 3)
 
 class Configure(unittest.TestCase):
     def tearDown(self):

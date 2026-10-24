@@ -19,7 +19,7 @@ Both `_env` keys must be valid variable names (letters, digits, underscores). In
 
 ## Search area (`board_fetch.py` and `jobs_screen.py`)
 
-Board fetch applies these to postings, using the platforms' structured remote and country fields where they exist. A Greenhouse location that names only the work arrangement ("Hybrid", "In-Office", "Distributed") is matched with the posting's office locations added. The screener applies these rules to digest listings before ranking, using the location text alone.
+Board fetch applies these to postings, using the platforms' structured remote and country fields where they exist. A Greenhouse location that names only the work arrangement ("Hybrid", "In-Office", "Distributed") is matched with the posting's office locations added. "Distributed" counts as remote, so with no country field it needs an office that names a metro city or the US, such as "Distributed: United States"; a bare "Distributed" is dropped. The screener applies these rules to digest listings before ranking, using the location text alone.
 
 | Key | Purpose | Example |
 |-----|---------|---------|
@@ -30,7 +30,7 @@ Board fetch applies these to postings, using the platforms' structured remote an
 
 | Key | Purpose | Example |
 |-----|---------|---------|
-| `pay_floor` | Annual base salary in USD. A posting is cut only when the **top** of its published range is below this; postings without published pay are kept. Pay is read from Greenhouse pay-transparency sections, and from Ashby and Lever salary data in USD, with hourly rates × 2080. SmartRecruiters postings never have pay parsed. Missing or `0` disables the cut. | `100000` |
+| `pay_floor` | Annual base salary in USD. A posting is cut only when the **top** of its published range is below this; postings without published pay are kept. Pay is read from Greenhouse pay-transparency sections, and from Ashby and Lever salary data in USD, with hourly rates × 2080. A range with a missing or `0` top is read as its minimum. SmartRecruiters postings never have pay parsed. Missing or `0` disables the cut. | `100000` |
 | `included_title_patterns` | Python regular expressions. A board posting is fetched only if its title matches at least one, ignoring case. Matching is by substring, so `"analyst"` also matches "Analysts". An empty list fetches every title. Applies to board postings only. | `["analyst", "data ?engineer"]` |
 | `excluded_keywords` | Plain phrases, checked after `included_title_patterns`. A board posting is skipped if its title contains one as a whole word, ignoring case: `"sales engineer"` blocks "Sales Engineer II" but not "Sales Platform Engineer". Applies to board postings only. | `["intern", "recruiter", "sales engineer"]` |
 

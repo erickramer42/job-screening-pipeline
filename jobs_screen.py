@@ -324,12 +324,14 @@ def parse_jobs():
                     "location": location,
                     "source_file": f.name,
                     "url": url,
-                    # When the board first published it; board files only
-                    "posted": meta.get("Posted", ""),
                     "source": src_dir.name,
                     "description": desc,
                     "_dt": digest_dt,
                 }
+                # When the board first published it: board rows only,
+                # and only when the board gave a date
+                if meta.get("Posted"):
+                    row["posted"] = meta["Posted"]
                 key = verdicts.listing_key(title, employer)
                 if key not in best or copy_rank(row) > copy_rank(best[key]):
                     best[key] = row

@@ -26,11 +26,16 @@ description prose can never be misread as a listing. Text conversion
 Greenhouse location: some boards put only the work arrangement in
 location.name ("Hybrid", "In-Office", "Distributed") and the city in
 the posting's offices. For such a name the offices are appended:
-"Hybrid: Springfield, ST". Every other name is used as it is.
+"Hybrid: Springfield, ST". Those in the search area come first, in
+name order, and only the first MAX_OFFICES are named ("; +4 more").
+Remote-labeled offices are left out, except on "Distributed". Every
+other name is used as it is.
 
 Each posting's file is rewritten whenever its text would change: the
 employer edited the posting, FILE_FORMAT was bumped (files carry a
 'Format:' line), or a SmartRecruiters detail fetch failed last time.
+A new Posted: date alone rewrites the file but keeps a SmartRecruiters
+description, so a re-released posting costs no detail request.
 Files move to raw_boards/archive/ when their posting closes or stops
 passing the filters, or when their board leaves boards.json.
 """
@@ -60,12 +65,14 @@ LEVER_ANNUALIZE = {"per-year-salary": 1, "per-hour-wage": 2080}
 # entities decoded after tag stripping. 3: a Posted: line; no Title:
 # or Pay: line, which nothing read
 FILE_FORMAT = 3
-# A Greenhouse location.name that states only how the job is worked.
-# Not "remote": a bare "Remote" already counts as US remote
-PLACELESS_RE = re.compile(
-    r"(?:hybrid|in[- ]?office|on[- ]?site|distributed|flexible)"
-    r"(?:[\s;,/]+(?:hybrid|in[- ]?office|on[- ]?site|distributed"
-    r"|flexible))*", re.I)
+# A Greenhouse location.name that states only how the job is worked,
+# in one or more of these words. Not "remote": a bare "Remote" already
+# counts as US remote
+ARRANGEMENT = r"(?:hybrid|in[- ]?office|on[- ]?site|distributed|flexible)"
+PLACELESS_RE = re.compile(rf"{ARRANGEMENT}(?:[\s;,/]+{ARRANGEMENT})*", re.I)
+# Offices named on such a location; the rest are counted. Keeps the
+# location line short in every prompt, and stable if the API reorders
+MAX_OFFICES = 3
 
 API_TEMPLATES = {
     "greenhouse":
@@ -252,11 +259,30 @@ class Posting(NamedTuple):
     raw_description: str = ""
     posted: str = ""        # YYYY-MM-DD, or "" when unknown
 
+def is_number(value):
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+def annual_range(tiers, table):
+    """(pay, lo, hi) from salary tiers given as (min, max, currency,
+    interval), annualized by table; ("", None, None) when no tier is
+    USD at an interval in table, the only ones comparable to PAY_FLOOR.
+    A max that is missing, 0 or not a number counts as the min."""
+    ranges = [(lo * table[interval],
+               (hi if is_number(hi) and hi else lo) * table[interval])
+              for lo, hi, currency, interval in tiers
+              if currency == "USD" and isinstance(interval, str)
+              and interval in table and is_number(lo)]
+    if not ranges:
+        return "", None, None
+    lo = int(min(r[0] for r in ranges))
+    hi = int(max(r[1] for r in ranges))
+    return f"${lo:,}-${hi:,}", lo, hi
+
 def posted_date(value):
     """YYYY-MM-DD from an ISO timestamp, or from epoch milliseconds
     (Lever); "" for anything else. The date alone, so a re-stamped time
     of day doesn't rewrite the file."""
-    if isinstance(value, (int, float)) and not isinstance(value, bool):
+    if is_number(value):
         try:
             return datetime.fromtimestamp(value / 1000,
                                           timezone.utc).date().isoformat()
@@ -266,18 +292,37 @@ def posted_date(value):
         return value[:10]
     return ""
 
+def office_place(office):
+    """An office's location, else its name; "" when neither is text."""
+    for key in ("location", "name"):
+        value = office.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return ""
+
 def greenhouse_location(name, offices):
     """(location, remote) for a Greenhouse posting. A name that states
     only the work arrangement gets its offices' locations appended, and
     "Distributed" counts as remote. Any other name is kept as it is,
-    with remote unknown."""
+    with remote unknown.
+
+    The offices that pass location_ok on their own come first, so the
+    ones named always include one that passes when any does: the
+    filter's verdict is the same as for the full list."""
     if not (isinstance(name, str) and PLACELESS_RE.fullmatch(name.strip())):
         return name, None
-    places = dict.fromkeys(
-        (o.get("location") or o.get("name") or "").strip()
-        for o in offices or [] if isinstance(o, dict))
-    places.pop("", None)
     remote = True if re.search("distributed", name, re.I) else None
+    places = {office_place(o) for o in offices or [] if isinstance(o, dict)}
+    places.discard("")
+    if not remote:
+        # A remote-labeled office ("Remote Spain") isn't where a Hybrid
+        # or In-Office job is worked, and "Remote US" would pass it as
+        # US remote
+        places = {p for p in places if not REMOTE_RE.search(p)}
+    places = sorted(places, key=lambda p: (not location_ok(p, remote),
+                                           p.lower(), p))
+    if len(places) > MAX_OFFICES:
+        places[MAX_OFFICES:] = [f"+{len(places) - MAX_OFFICES} more"]
     if places:
         name = f"{name}: {'; '.join(places)}"
     return name, remote
@@ -307,27 +352,24 @@ def flatten(board, platform, slug):
                     or [cats.get("location") or "Unknown"])
             # Verified schema (2026-10-23, live boards): salaryRange ->
             # min, max, currency, interval ("per-year-salary",
-            # "per-hour-wage", ...). Only USD per year or hour compares
-            # to PAY_FLOOR
-            sal = j.get("salaryRange") or {}
-            pay = ""
-            lo = hi = None
-            if (sal.get("currency") == "USD"
-                    and sal.get("interval") in LEVER_ANNUALIZE
-                    and isinstance(sal.get("min"), (int, float))):
-                k = LEVER_ANNUALIZE[sal["interval"]]
-                top = sal.get("max")
-                lo = int(sal["min"] * k)
-                hi = int((top if isinstance(top, (int, float))
-                          else sal["min"]) * k)
-                pay = f"${lo:,}-${hi:,}"
+            # "per-hour-wage", ...). Anything else is pay unknown
+            sal = j.get("salaryRange")
+            if not isinstance(sal, dict):
+                sal = {}
+            pay, lo, hi = annual_range(
+                [(sal.get("min"), sal.get("max"), sal.get("currency"),
+                  sal.get("interval"))], LEVER_ANNUALIZE)
             # The body, then each list under its heading, then the
-            # closing text; <br> keeps the parts on separate lines
+            # closing text; <br> keeps the parts on separate lines. A
+            # heading is plain text that may hold entities already, so
+            # it's decoded before it's escaped into the markup
             parts = [j.get("description") or ""]
-            parts += [f"<h3>{html_mod.escape(lst.get('text') or '')}</h3>"
-                      f"<ul>{lst.get('content') or ''}</ul>"
-                      for lst in j.get("lists") or []
-                      if isinstance(lst, dict)]
+            for lst in j.get("lists") or []:
+                if isinstance(lst, dict):
+                    heading = html_mod.escape(html_mod.unescape(
+                        str(lst.get("text") or "")))
+                    parts.append(f"<h3>{heading}</h3>"
+                                 f"<ul>{lst.get('content') or ''}</ul>")
             parts.append(j.get("additional") or "")
             jobs.append(Posting(
                 id=j.get("id", ""), title=j.get("text", ""),
@@ -339,28 +381,19 @@ def flatten(board, platform, slug):
                 posted=posted_date(j.get("createdAt"))))
     elif platform == "ashby":
         for j in board.get("jobs", []):
-            pay = ""
-            lo = hi = None
             # Verified schema (2026-10-10, live board):
             # compensation.summaryComponents[] ->
             #   compensationType ("Salary"|"EquityPercentage"|...),
             #   minValue/maxValue, currencyCode, interval
-            # Only USD is comparable to PAY_FLOOR (boards mix EUR/GBP/
-            # CAD/JPY); other currencies/intervals stay "pay unknown"
+            # Boards mix EUR/GBP/CAD/JPY; only USD tiers count, and the
+            # range spans all of them
             comps = ((j.get("compensation") or {})
                      .get("summaryComponents") or [])
-            salary_tiers = [c for c in comps
-                            if c.get("compensationType") == "Salary"
-                            and c.get("currencyCode") == "USD"
-                            and c.get("interval") in ANNUALIZE
-                            and isinstance(c.get("minValue"), (int, float))]
-            if salary_tiers:
-                lo = int(min(c["minValue"] * ANNUALIZE[c["interval"]]
-                             for c in salary_tiers))
-                hi = int(max((c.get("maxValue") or c["minValue"])
-                             * ANNUALIZE[c["interval"]]
-                             for c in salary_tiers))
-                pay = f"${lo:,}-${hi:,}"
+            pay, lo, hi = annual_range(
+                [(c.get("minValue"), c.get("maxValue"), c.get("currencyCode"),
+                  c.get("interval")) for c in comps
+                 if isinstance(c, dict)
+                 and c.get("compensationType") == "Salary"], ANNUALIZE)
             locs = [j.get("location") or "Unknown"] + [
                 s["location"] for s in j.get("secondaryLocations") or []
                 if s.get("location")]
@@ -477,13 +510,16 @@ def sync_board(board_cfg):
         if platform == "smartrecruiters":
             # The description costs one detail request per posting, so
             # the stored one is kept while the listing lines are
-            # unchanged. A file without one (its fetch failed) retries.
-            # A failed fetch costs the text, not the posting: it still
-            # writes and ranks.
-            head = record_text(platform, slug, company, p.url, p.posted,
+            # unchanged; the Posted: line isn't one of them, so a
+            # re-release keeps it. A file without one (its fetch failed)
+            # retries. A failed fetch costs the text, not the posting:
+            # it still writes and ranks.
+            head = record_text(platform, slug, company, p.url, "",
                                p.title, loc_line, "")
             old_head, _, old_desc = (old or "").partition(
                 f"\n{DESC_MARKER}\n")
+            old_head = re.sub(r"^Posted: .*\n", "", old_head, count=1,
+                              flags=re.M)
             desc = old_desc.removesuffix("\n") if old_head == head else ""
             if not desc and p.id:
                 try:

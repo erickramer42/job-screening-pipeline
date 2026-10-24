@@ -38,6 +38,20 @@ The goal is a focused daily application routine (~10 highest-quality matches per
 | Scheduled runs | ✅ Operational | Task Scheduler runs ingest at 01:00 and 05:00, and board fetch + screening at 06:00. Tasks wake the computer, run after a missed start, and the wrappers retry (see [Automation](#automation)). Verified across 2026-10-09 to 10-23, with two misses. On 10-14 no task ran: a Windows Update restart at 00:33 left no one signed in until 08:52, and the missed-start catch-up didn't run the tasks after sign-in. On 10-22 screening failed all 3 attempts because Ollama wasn't running. Since 2026-10-23 both tasks also start at log on, the screening wrapper starts Ollama before a retry, and a failed morning leaves `out/FAILED_<date>.md`. |
 
 ### Recent Changes (2026-10-23)
+- **Board fetch, from the review of the public-boards work:**
+  - **Multi-office locations are short and stable:** a Greenhouse location built from offices names the in-area ones first, then the rest by name, at most three, and counts the others (`; +4 more`). So the line no longer grows with every office or changes when the API reorders them. Which postings pass the filter is unchanged.
+  - **Remote-labeled offices** ("Remote <country>") are left out of a Hybrid or In-Office location, so a "Remote US" office can't pass a hybrid job as US remote. The 26 such offices on the live boards today are all outside the US, on postings the filter drops anyway.
+  - **A SmartRecruiters re-release** (only the published date changed) rewrites the file but keeps its description, instead of costing a detail request.
+  - **Pay:** Lever and Ashby share one pay reader. A Lever range whose top is 0 is read as its minimum, as Ashby's already was, instead of being cut by the pay floor. A malformed Lever `salaryRange`, Ashby pay tier or Greenhouse office no longer fails the whole board.
+  - **Lever headings** that already hold an entity (`&amp;`) are no longer escaped twice.
+  - **JSON:** `posted` is set only on rows with a date; digest rows no longer carry `"posted": ""`.
+  - **Docs:** a Lever row's Posted date is the creation date, and a "Distributed" posting is kept only when an office names a metro city or the US.
+  - **Tests:** 143, up from 141. The board-file contract test checks the Posted date too, and the screener tests build board files with board fetch's own `record_text`.
+  - **Checked** against the live APIs, on copies of `raw_boards/`:
+    - The committed and new board fetch gave the same counts on every board. 258 of 281 files were identical; the other 23 differed only in the location line, which went from at most 264 characters to 124 and names a subset of the old offices.
+    - A second run of the new code rewrote nothing.
+    - With a stand-in model, the screener sent the same 25 requests, with 22 pass-1 lines changed, in their location only.
+    - The next scheduled run rewrites those files once, with the format-3 rewrite already due, so the 10-24 → 10-25 stability baseline isn't affected.
 - **Board postings whose location is only "Hybrid", "In-Office" or "Distributed" are no longer lost:**
   - One configured Greenhouse board puts the work arrangement in the location field and the city only in the posting's offices. None of its 216 title-matching postings passed the area filter, so the board counted as having "none in the area".
   - For such a location, board fetch now adds the office locations (`Hybrid: <city>`), and "Distributed" counts as remote. Every other location is unchanged.
