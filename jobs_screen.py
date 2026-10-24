@@ -9,6 +9,10 @@ Pass 2 (rerank): the top N description-bearing rows re-scored with a
 role-marker excerpt from the stored posting text, so blind-pass
 ambiguity (opaque titles, non-tech employers) can be resolved with
 actual requirements. Pass-1 score is preserved as pass1_score.
+
+The shortlist has two sections, each ranked on its own: listings with
+posting text, and listings without it ("Needs lookup"), whose scores
+rest on the title alone.
 """
 import collections
 import hashlib
@@ -27,7 +31,6 @@ from location_filter import location_matcher
 from pipeline_common import (DESC_MARKER, configure_from_file,
                              parse_email_date, write_atomic)
 
-SHORTLIST_SIZE = 25
 # Glob pattern per source dir: digests are job_uid_<UID>.txt; board
 # postings are <platform>_<id>.txt (greenhouse_123, ashby_abc, ...)
 SOURCE_DIRS = [
@@ -117,6 +120,7 @@ def configure(cfg):
     broken config stops the run before anything is parsed."""
     global PROMPT_PATH, RECENCY_DAYS, PASS1_BATCH, RERANK_TOP_N
     global RERANK_BATCH, EXCERPT_CHARS, SHORTLIST_PER_EMPLOYER, KNOWN_NOISE
+    global SHORTLIST_SIZE, LOOKUP_SIZE, NO_VERDICT_CAP
     global EXCLUDED_EMPLOYER_RE, EXCLUDE_TITLE_RES, location_ok
     global SCORE_CAPS, SCORE_CAPS_SHA, APPLIED_PATH, MODEL_THINKING, NUM_CTX
     PROMPT_PATH = Path(cfg.get("prompt_path", "screening_prompt.txt"))
@@ -136,6 +140,16 @@ def configure(cfg):
     # At most this many shortlist rows from one employer (0: no limit).
     # The ones passed over are counted under the table and stay in the JSON
     SHORTLIST_PER_EMPLOYER = int(cfg.get("shortlist_per_employer", 0))
+    # The shortlist's sections: rows with posting text, then rows
+    # without it ("Needs lookup"). A title-only score rests on far less
+    # evidence, so the two are never ranked against each other
+    SHORTLIST_SIZE = int(cfg.get("shortlist_size", 15))
+    LOOKUP_SIZE = int(cfg.get("lookup_size", 10))
+    # A listing whose latest verdict is "n" is held at this score once
+    # both passes are done (null: no cap), so it stays in the ranking
+    # but off the top. See apply_verdict_caps
+    cap = cfg.get("no_verdict_cap", 50)
+    NO_VERDICT_CAP = None if cap is None else int(cap)
     KNOWN_NOISE = BASE_NOISE | {x.lower()
                                 for x in cfg.get("digest_noise_lines", [])}
 
@@ -186,6 +200,10 @@ configure({"excluded_employers": [], "excluded_title_patterns": [],
 # before ranking and listed in their own shortlist section for as long
 # as they're still posted. Read by load_inputs()
 APPLIED_URLS, APPLIED_PAIRS = set(), set()
+# Listings whose latest verdict in the feedback files is "n", by posting
+# URL too for board rows, like the applied ones. Held at NO_VERDICT_CAP
+# (apply_verdict_caps). Read by load_inputs()
+NO_URLS, NO_PAIRS = set(), set()
 
 def load_applied(path):
     """(urls, listing keys) from the applied list at path; a missing
@@ -391,17 +409,23 @@ SYSTEM_PROMPT = ""
 
 def load_inputs():
     """Read the files the configuration names: the ranking prompt (the
-    run stops without it), the applied list, and the "a" verdicts. An
-    "a" verdict on a board row cuts it by posting URL as well, so an
-    edited title doesn't bring the job back."""
-    global SYSTEM_PROMPT, APPLIED_URLS, APPLIED_PAIRS
+    run stops without it), the applied list, and the verdicts: "a" ones
+    to cut, "n" ones to cap. A verdict on a board row matches it by
+    posting URL as well, so an edited title doesn't lose it."""
+    global SYSTEM_PROMPT, APPLIED_URLS, APPLIED_PAIRS, NO_URLS, NO_PAIRS
     SYSTEM_PROMPT = load_system_prompt()
     APPLIED_URLS, APPLIED_PAIRS = load_applied(APPLIED_PATH)
+    NO_URLS, NO_PAIRS = set(), set()
     for key, v in verdicts.load_verdicts().items():
         if v["applied"]:
-            APPLIED_PAIRS.add(key)
-            if v["url"]:
-                APPLIED_URLS.add(v["url"])
+            urls, pairs = APPLIED_URLS, APPLIED_PAIRS
+        elif v["verdict"] == "n":
+            urls, pairs = NO_URLS, NO_PAIRS
+        else:
+            continue
+        pairs.add(key)
+        if v["url"]:
+            urls.add(v["url"])
 
 # Appended to the system prompt for pass 2 only. Generic mechanics
 # (how to use excerpts, small-batch behavior) belong here, like the
@@ -721,6 +745,29 @@ def set_score(job, score, reason):
     job["score"] = score
     job["reason"] = reason
 
+def apply_verdict_caps(jobs):
+    """Hold each listing whose latest verdict is "n" at NO_VERDICT_CAP,
+    and flag it "judged no". Done after both passes, so pass 2 picks and
+    batches the same rows it would without the verdicts. A lowered row
+    keeps its score as verdict_capped_from: verdicts.py judges the
+    ranking on that, since the cap comes from the verdicts themselves.
+    Returns how many scores were lowered."""
+    if NO_VERDICT_CAP is None:
+        return 0
+    lowered = 0
+    for j in jobs:
+        # Digest rows have no URL, and "" must never match one
+        if not ((j["url"] and j["url"] in NO_URLS)
+                or verdicts.listing_key(j["title"], j["employer"])
+                in NO_PAIRS):
+            continue
+        j["flags"] = j.get("flags", []) + ["judged no"]
+        if j["score"] > NO_VERDICT_CAP:
+            j["verdict_capped_from"] = j["score"]
+            j["score"] = NO_VERDICT_CAP
+            lowered += 1
+    return lowered
+
 def apply_pass1(batch, scores):
     for idx, s in scores.items():
         set_score(batch[idx], s["score"], s["reason"])
@@ -750,6 +797,8 @@ def run_record(started):
             "pass1_batch": PASS1_BATCH, "rerank_top_n": RERANK_TOP_N,
             "rerank_batch": RERANK_BATCH, "excerpt_chars": EXCERPT_CHARS,
             "recency_days": RECENCY_DAYS,
+            "no_verdict_cap": NO_VERDICT_CAP,
+            "shortlist_size": SHORTLIST_SIZE, "lookup_size": LOOKUP_SIZE,
             "shortlist_per_employer": SHORTLIST_PER_EMPLOYER}
 
 def without_text(rows):
@@ -767,15 +816,15 @@ def md_cell(text, limit=None):
         text = text[:limit]
     return text.replace("|", r"\|")
 
-def shortlist_rows(ranked):
-    """The top SHORTLIST_SIZE rows, at most SHORTLIST_PER_EMPLOYER from
-    any one employer (ignoring case). Also returns how many rows each
-    employer had passed over for that limit before the list filled,
-    under the employer's first spelling."""
+def shortlist_rows(ranked, size):
+    """The top size rows, at most SHORTLIST_PER_EMPLOYER from any one
+    employer (ignoring case). Also returns how many rows each employer
+    had passed over for that limit before the list filled, under the
+    employer's first spelling."""
     rows, shown, more = [], collections.Counter(), collections.Counter()
     names = {}
     for j in ranked:
-        if len(rows) == SHORTLIST_SIZE:
+        if len(rows) == size:
             break
         emp = j["employer"].lower()
         names.setdefault(emp, j["employer"])
@@ -785,6 +834,27 @@ def shortlist_rows(ranked):
         shown[emp] += 1
         rows.append(j)
     return rows, collections.Counter({names[e]: n for e, n in more.items()})
+
+def shortlist_table(rows, first):
+    """A shortlist section's Markdown table lines, numbered from first,
+    or a line saying the section is empty."""
+    if not rows:
+        return ["No listings.\n"]
+    lines = ["| # | Score | Flags | Title | Employer | Location | Posted "
+             "| Link | Reason |\n",
+             "|---|-------|-------|-------|----------|----------|--------"
+             "|------|--------|\n"]
+    for i, j in enumerate(rows, first):
+        mark = "▲ " if j.get("rescored") else ""
+        lowered = "capped_from" in j or "verdict_capped_from" in j
+        flags = j.get("flags", []) + (["capped"] if lowered else [])
+        lines.append(f"| {i} | {mark}{j['score']} | {', '.join(flags)} | "
+                     f"{md_cell(j['title'])} | {md_cell(j['employer'])} | "
+                     f"{md_cell(j['location'])} | "
+                     f"{md_cell(j.get('posted') or '-')} | "
+                     f"{md_cell(j.get('url') or '-')} | "
+                     f"{md_cell(j['reason'], 80)} |\n")
+    return lines
 
 def write_verdict_template(path, stamp, rows):
     """The day's feedback file for the owner (verdicts.py). A new file
@@ -910,10 +980,22 @@ def main():
     capped = sum("capped_from" in j for j in kept)
     if capped:
         print(f"Score caps lowered {capped} score(s).")
+    judged = apply_verdict_caps(kept)
+    if judged:
+        print(f"\"No\" verdicts held {judged} score(s) at {NO_VERDICT_CAP}.")
+        kept.sort(key=lambda j: j["score"], reverse=True)
 
-    # The JSON records what the shortlist showed, so verdicts.py judges
-    # each run by its own list rather than by today's config
-    rows, more = shortlist_rows(kept)
+    # Rows with posting text, then the rest, each section ranked on its
+    # own. Numbering runs on through both, so the verdict template and
+    # shortlist_rank need no section. The JSON records what the
+    # shortlist showed, so verdicts.py judges each run by its own list
+    # rather than by today's config
+    main_rows, more = shortlist_rows(
+        [j for j in kept if j.get("description")], SHORTLIST_SIZE)
+    lookup_rows, more_lookup = shortlist_rows(
+        [j for j in kept if not j.get("description")], LOOKUP_SIZE)
+    more += more_lookup
+    rows = main_rows + lookup_rows
     for i, j in enumerate(rows, 1):
         j["shortlist_rank"] = i
 
@@ -943,22 +1025,16 @@ def main():
     md.append(f"{len(kept)} ranked, {len(rejected)} auto-cut. "
               f"Board postings link directly; digest rows need the "
               f"email. Rows marked ▲ were re-scored against the "
-              f"posting text. Flags come from score_caps rules; "
-              f"\"capped\" means a rule lowered the model's score.\n\n")
-    md.append("| # | Score | Flags | Title | Employer | Location | Posted "
-              "| Link | Reason |\n")
-    md.append("|---|-------|-------|-------|----------|----------|--------"
-              "|------|--------|\n")
-    for i, j in enumerate(rows, 1):
-        mark = "▲ " if j.get("rescored") else ""
-        flags = j.get("flags", []) + (["capped"] if "capped_from" in j
-                                      else [])
-        md.append(f"| {i} | {mark}{j['score']} | {', '.join(flags)} | "
-                  f"{md_cell(j['title'])} | {md_cell(j['employer'])} | "
-                  f"{md_cell(j['location'])} | "
-                  f"{md_cell(j.get('posted') or '-')} | "
-                  f"{md_cell(j.get('url') or '-')} | "
-                  f"{md_cell(j['reason'], 80)} |\n")
+              f"posting text. Flags come from score_caps rules and your "
+              f"verdicts; \"capped\" means a rule or a \"no\" verdict "
+              f"lowered the model's score.\n\n")
+    md.append("## With posting text\n\n")
+    md += shortlist_table(main_rows, 1)
+    md.append("\n## Needs lookup\n\nNo posting text to read, so these "
+              "are scored on title, employer and location alone, and "
+              "ranked on their own. Open the posting before judging "
+              "one.\n\n")
+    md += shortlist_table(lookup_rows, len(main_rows) + 1)
     if more:
         md.append("\nMore from: "
                   + ", ".join(f"{md_cell(e)} (+{n})"
@@ -975,7 +1051,8 @@ def main():
     write_atomic(md_path, "".join(md))
 
     print(f"\nWrote {json_path}")
-    print(f"Wrote {md_path} (top {len(rows)} of {len(kept)})")
+    print(f"Wrote {md_path} ({len(main_rows)} rows with posting text, "
+          f"{len(lookup_rows)} to look up, of {len(kept)})")
     # The owner may have the feedback file open in an editor. It's a
     # convenience, so failing to write it doesn't fail the run
     feedback_path = (TEMPLATE_DIR or verdicts.FEEDBACK_DIR) / f"{stamp}.md"

@@ -29,22 +29,30 @@ verdicts.py <-- the owner's verdicts in feedback/<date>.md <--+
    - **Pass 1:** the model scores every remaining listing 0–100 from its title, employer and location.
    - **Pass 2:** the top listings that have posting text are re-scored with an excerpt of the posting's role section.
    - **Hard limits:** after each pass, limits are enforced in code. For example, a posting that requires a skill the candidate lacks is capped at 50.
-   - **Output:** it writes the shortlist (Markdown), the full ranking with every cut and its reason (JSON), and a verdict template.
-4. **Evaluate:** the owner marks shortlist rows yes, maybe, no or applied. `verdicts.py` then scores any run against those verdicts.
+   - **Output:** it writes the shortlist (Markdown), the full ranking with every cut and its reason (JSON), and a verdict template. The shortlist ranks listings without posting text in their own "Needs lookup" section, since a title alone is weak evidence.
+4. **Evaluate:** the owner marks shortlist rows yes, maybe, no or applied. `verdicts.py` then scores any run against those verdicts. A "no" holds that listing down on later shortlists.
 
 ## Sample output
 
 The rows are placeholders, laid out in the real shortlist's format:
 
+**With posting text**
+
 | # | Score | Flags | Title | Employer | Location | Posted | Link | Reason |
 |---|-------|-------|-------|----------|----------|--------|------|--------|
 | 1 | ▲ 86 |  | Senior Backend Engineer | Acme Robotics | Springfield, ST ($150,000-$180,000) | 2026-10-20 | https://… | Python services and distributed systems at the core; level fits. |
-| 2 | 72 |  | Software Engineer III | Initech | Remote - US | - | - | Backend title at the right level; stack unknown from the listing. |
-| 3 | ▲ 50 | rails, capped | Senior Platform Engineer | Globex | Hybrid: Springfield, ST | 2026-08-03 | https://… | Strong platform fit, but requires 5+ years of Rails. |
+| 2 | ▲ 50 | rails, capped | Senior Platform Engineer | Globex | Hybrid: Springfield, ST | 2026-08-03 | https://… | Strong platform fit, but requires 5+ years of Rails. |
+
+**Needs lookup**
+
+| # | Score | Flags | Title | Employer | Location | Posted | Link | Reason |
+|---|-------|-------|-------|----------|----------|--------|------|--------|
+| 3 | 72 |  | Software Engineer III | Initech | Remote - US | - | - | Backend title at the right level; stack unknown from the listing. |
+| 4 | 50 | judged no, capped | Senior Cloud Engineer | Umbrella Corp | Springfield, ST | - | - | Senior title at a direct employer; cloud stack unclear. |
 
 - ▲ marks a score revised against the posting text in pass 2.
-- `rails` is a config rule's flag, and `capped` means that rule lowered the model's score.
-- Posted is the date the board published the posting. Digest rows have neither a date nor a link.
+- `rails` is a config rule's flag, and `capped` means that rule lowered the model's score. `judged no` marks a listing the owner ruled out on an earlier day, held at 50.
+- Posted is the date the board published the posting. Digest rows have neither a date nor a link, so they always land under Needs lookup.
 
 ## Design decisions
 

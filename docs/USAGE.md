@@ -42,6 +42,8 @@ jobs_screen.py   raw/ + raw_boards/     ->  recency + hard filters -> pass 1 -> 
      - A rule can carry a flag, such as "clearance", which the shortlist shows.
    - **Already applied:** listings in `applied.txt`, or marked `a` in a feedback file, are cut before ranking and listed in their own shortlist section. A board row marked `a` is matched by its posting URL too, so it stays cut if the employer edits the title.
    - **Pass 2:** re-scores the top `rerank_top_n` listings that have a description, in small batches. Each one comes with an excerpt from the posting's role section.
+   - **"No" verdicts:** after both passes, a listing whose latest verdict is `n` is held at `no_verdict_cap` (50) and flagged `judged no`. It stays in the ranking, below the listings you haven't ruled out. A board row is matched by its posting URL too. The cap comes after pass 2, so it doesn't change which listings pass 2 re-scores, or any model score.
+   - **Two shortlist sections:** listings with posting text fill the main section (`shortlist_size`, 15). Listings without it, which is every digest row plus any board posting whose description is missing, go in a "Needs lookup" section (`lookup_size`, 10). Each section is ranked on its own, since a title-only score rests on far less evidence.
 
 The scripts share three small modules:
 - `html_text.py`: the HTML-to-text conversion, used by ingest and board fetch.
@@ -120,13 +122,16 @@ They write their fixtures to a temporary folder, mock the network, and need no p
 
 ## Outputs
 
-- `out/shortlist_<date>.md` is the top 25 as a table: score, flags, title, employer, location, posted date, link, and the model's one-line reason.
+- `out/shortlist_<date>.md` has two tables, each with score, flags, title, employer, location, posted date, link, and the model's one-line reason:
+  - **With posting text:** the top `shortlist_size` (15) listings that have a description.
+  - **Needs lookup:** the top `lookup_size` (10) listings without one, scored on title, employer and location alone. Open the posting before judging one.
+  - Rows are numbered on through both tables, as in the verdict template.
   - A ▲ before the score marks a listing re-scored in pass 2.
   - Posted is the date the board first published the posting. Digest rows show `-`. Board postings are exempt from `recency_days`, so this is how to spot one that has been open for months.
     - Lever's API has no publish date, so a Lever row shows the date the posting was created, which can be before it went live.
-  - Flags come from `score_caps` rules; `capped` means a rule lowered the model's score.
-  - With `shortlist_per_employer` set, a line under the table counts the postings left out for that limit.
-  - Jobs in `applied.txt` that are still posted are listed after the table.
+  - Flags come from `score_caps` rules, plus `judged no` for a listing your latest verdict ruled out. `capped` means a rule or that verdict lowered the model's score.
+  - With `shortlist_per_employer` set, it applies to each table on its own, and a line under the tables counts the postings left out for that limit.
+  - Jobs in `applied.txt` that are still posted are listed after the tables.
   - `feedback/<date>.md` is written alongside, ready for your verdicts.
   - Board rows link straight to the posting. Digest rows have no link, so open the digest email to find them.
 - `out/ranked_<date>.json` holds:
@@ -134,6 +139,7 @@ They write their fixtures to a temporary folder, mock the network, and need no p
   - **Every ranked listing**, with its score and reason, plus these fields where they apply:
     - re-scored listings: `pass1_score`, `rescored`, and the `excerpt` pass 2 sent, plus `pass1_capped_from` when a cap lowered the pass-1 score;
     - listings that match a cap rule: `score_cap` and `flags`, plus `capped_from` if the cap lowered the score;
+    - listings judged `n`: the `judged no` flag, plus `verdict_capped_from` if `no_verdict_cap` lowered the score. Compare runs' scores on that field when it's there, since it's the score before the verdict;
     - shortlisted listings: `shortlist_rank`;
     - board listings: `posted`, when the board gives a date.
   - **Every cut listing**, with its `reject_reason`: `applied`, `excluded employer`, `excluded title pattern`, `outside area`, or `stale digest`.
@@ -188,13 +194,14 @@ A short daily loop keeps the ranking honest, and gives it something to be measur
    - A later line on the same listing updates your verdict rather than replacing it. `[a]` alone keeps the earlier y/m/n, an empty note keeps the earlier note, and "applied" stays set once given.
    - Other lines are free notes, ignored by the parser.
    - **A rerun the same day:** while the file is still the untouched template, it's rewritten for the rerun's rows. Once you've filled anything in, only the rows new to the list are appended, under a `# Rerun at HH:MM` comment; nothing already in the file changes. The `feedback/` folder is gitignored.
+   - **An `n` holds the listing down** at `no_verdict_cap` (50) on later shortlists, flagged `judged no`, until a later verdict changes it. It isn't cut, so you can still come back to it.
 2. **Record applications.** An `a` flag cuts that listing from future rankings, and `verdicts.py` then leaves it out of its figures, since the ranker no longer places it. For jobs you applied to outside the shortlist, add a line to `applied.txt`:
    - the posting's URL for a board row;
    - `Title | Employer` for a digest row, since those have no link.
 
    Lines starting with `#`, and anything after ` #`, are comments. A `Title | Employer` line is split at the last pipe, so a title that contains one is fine. A line that is neither a URL nor `Title | Employer` is reported with its line number and ignored. Applied jobs are skipped when ranking. While the posting stays up, they're listed under "Already applied, still posted".
 3. **Measure:** `python verdicts.py` scores the latest run against every verdict so far; pass a file (`python verdicts.py out/ranked_<date>.json`) to score another run. It reports:
-   - how often the run's scores order a pair of your verdicts the way you did, with equal scores counting half: 50% is random, 100% is your order;
+   - how often the run's scores order a pair of your verdicts the way you did, with equal scores counting half: 50% is random, 100% is your order. A listing held down by your `n` counts with its score from before that cap, since the cap is your verdict, not the ranker's judgment;
    - how many y/m/n listings made the shortlist;
    - the "yes" listings it missed and the "no" listings it let in. A listed row shows its place on the shortlist, and a missed row says when the per-employer limit held it out.
 

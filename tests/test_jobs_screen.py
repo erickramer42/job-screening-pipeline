@@ -467,9 +467,80 @@ class Shortlist(unittest.TestCase):
         js.configure({**CONFIG, "shortlist_per_employer": 1})
         ranked = [{"title": f"Role {i}", "employer": e}
                   for i, e in enumerate(["Acme", "ACME", "Beta", "acme"])]
-        rows, more = js.shortlist_rows(ranked)
+        rows, more = js.shortlist_rows(ranked, 25)
         self.assertEqual([j["title"] for j in rows], ["Role 0", "Role 2"])
         self.assertEqual(dict(more), {"Acme": 2})
+
+    def test_a_section_stops_at_its_size(self):
+        ranked = [{"title": f"Role {i}", "employer": f"Co {i}"}
+                  for i in range(4)]
+        rows, more = js.shortlist_rows(ranked, 2)
+        self.assertEqual([j["title"] for j in rows], ["Role 0", "Role 1"])
+        self.assertEqual(more, {})
+
+class VerdictCaps(unittest.TestCase):
+    """A listing judged "n" is held at no_verdict_cap after scoring."""
+    def tearDown(self):
+        js.configure(CONFIG)
+
+    def jobs(self):
+        return [{"title": "Senior Engineer", "employer": "Acme", "url": "",
+                 "score": 80},
+                {"title": "Data Engineer", "employer": "Beta",
+                 "url": "https://example.com/1", "score": 40},
+                {"title": "Lead Engineer", "employer": "Gamma", "url": "",
+                 "score": 90}]
+
+    def capped(self, cfg):
+        js.configure(cfg)
+        jobs = self.jobs()
+        with mock.patch.object(js, "NO_PAIRS", {("senior engineer", "acme")}), \
+                mock.patch.object(js, "NO_URLS", {"https://example.com/1"}):
+            lowered = js.apply_verdict_caps(jobs)
+        return lowered, jobs
+
+    def test_a_no_caps_by_listing_or_url_and_flags_it(self):
+        lowered, jobs = self.capped(CONFIG)
+        senior, data, lead = jobs
+        self.assertEqual(lowered, 1)
+        self.assertEqual((senior["score"], senior["verdict_capped_from"],
+                          senior["flags"]), (50, 80, ["judged no"]))
+        # Already under the cap: flagged, not lowered
+        self.assertEqual((data["score"], data["flags"]), (40, ["judged no"]))
+        self.assertNotIn("verdict_capped_from", data)
+        self.assertNotIn("flags", lead)
+
+    def test_null_turns_the_cap_off(self):
+        lowered, jobs = self.capped({**CONFIG, "no_verdict_cap": None})
+        self.assertEqual(lowered, 0)
+        self.assertEqual([j["score"] for j in jobs], [80, 40, 90])
+        self.assertFalse(any("flags" in j for j in jobs))
+
+    def test_only_the_latest_verdict_counts_and_applied_wins(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        root = Path(tmp.name)
+        feedback = root / "feedback"
+        feedback.mkdir()
+        (feedback / "2026-01-01.md").write_text(
+            "1 [n] Senior Engineer | Acme ::\n"
+            "2 [n] Data Engineer | Beta ::\n"
+            "3 [n,a] Lead Engineer | Gamma ::\n", encoding="utf-8")
+        (feedback / "2026-01-02.md").write_text(
+            "1 [m] Data Engineer | Beta ::\n", encoding="utf-8")
+        prompt = root / "prompt.txt"
+        prompt.write_text("Rank jobs.", encoding="utf-8")
+        js.configure({**CONFIG, "prompt_path": str(prompt),
+                      "applied_path": str(root / "none.txt")})
+        with mock.patch.object(js.verdicts, "FEEDBACK_DIR", feedback), \
+                mock.patch.object(js.verdicts, "RUNS_DIR", root), \
+                mock.patch.object(js, "APPLIED_URLS", set()), \
+                mock.patch.object(js, "APPLIED_PAIRS", set()), \
+                mock.patch.object(js, "NO_URLS", set()), \
+                mock.patch.object(js, "NO_PAIRS", set()):
+            js.load_inputs()
+            self.assertEqual(js.NO_PAIRS, {("senior engineer", "acme")})
+            self.assertIn(("lead engineer", "gamma"), js.APPLIED_PAIRS)
 
 class VerdictTemplate(unittest.TestCase):
     """write_verdict_template on a new file, and on a same-day rerun."""
@@ -684,6 +755,68 @@ class MainRun(SourceFiles):
                       self.shortlist())
         self.assertEqual(self.ranked()["rerank_failed_batches"], 2)
         self.assertIn("[ERROR] 2 re-scoring batch(es) failed", printed)
+
+    def test_rows_without_posting_text_have_their_own_section(self):
+        self.assertEqual(self.run_main(FakeModel())[0], 0)
+        text = self.shortlist()
+        main, lookup = text.split("## Needs lookup")
+        def numbered(section):
+            return [(ln.split(" | ")[0], ln.split(" | ")[3])
+                    for ln in section.splitlines()
+                    if ln.startswith("| ") and ln[2].isdigit()]
+        # Every score is 60, so only the sections decide the split.
+        # Numbering runs on through both, as in the template
+        self.assertEqual({t for _, t in numbered(main)},
+                         {"Senior Engineer", "Backend Engineer"})
+        self.assertEqual([n for n, _ in numbered(main)], ["| 1", "| 2"])
+        self.assertEqual({t for _, t in numbered(lookup)},
+                         {"Data Engineer", "Platform Engineer"})
+        self.assertEqual([n for n, _ in numbered(lookup)], ["| 3", "| 4"])
+        ranks = {j["title"]: j["shortlist_rank"]
+                 for j in self.ranked()["ranked"]}
+        template = (self.feedback / f"{self.stamp}.md").read_text(
+            encoding="utf-8")
+        for title, n in ranks.items():
+            self.assertIn(f"{n} [?] {title} |", template)
+
+    def test_a_section_size_comes_from_config(self):
+        config = json.loads(pipeline_common.CONFIG_FILE.read_text(
+            encoding="utf-8"))
+        pipeline_common.CONFIG_FILE.write_text(json.dumps(
+            {**config, "shortlist_size": 1, "lookup_size": 0}),
+            encoding="utf-8")
+        self.assertEqual(self.run_main(FakeModel())[0], 0)
+        ranked = self.ranked()
+        self.assertEqual(sum("shortlist_rank" in j for j in ranked["ranked"]),
+                         1)
+        self.assertEqual((ranked["run"]["shortlist_size"],
+                          ranked["run"]["lookup_size"]), (1, 0))
+        self.assertIn("## Needs lookup", self.shortlist())
+        self.assertIn("No listings.", self.shortlist())
+
+    def test_a_no_verdict_caps_the_listing_after_both_passes(self):
+        self.feedback.mkdir()
+        (self.feedback / "2026-01-01.md").write_text(
+            "1 [n] Senior Engineer | Acme ::\n"
+            "2 [n] Data Engineer | Beta ::\n", encoding="utf-8")
+        model = FakeModel()
+        code, printed = self.run_main(model)
+        self.assertEqual(code, 0)
+        # Pass 2 still re-scored both board rows: the cap comes after it
+        self.assertEqual(len(model.requests), 4)
+        ranked = {j["title"]: j for j in self.ranked()["ranked"]}
+        for title in ("Senior Engineer", "Data Engineer"):
+            self.assertEqual((ranked[title]["score"],
+                              ranked[title]["verdict_capped_from"],
+                              ranked[title]["flags"]),
+                             (50, 60, ["judged no"]))
+        self.assertEqual(ranked["Backend Engineer"]["score"], 60)
+        self.assertEqual(ranked["Backend Engineer"]["shortlist_rank"], 1)
+        self.assertEqual(ranked["Senior Engineer"]["shortlist_rank"], 2)
+        self.assertEqual(self.ranked()["run"]["no_verdict_cap"], 50)
+        self.assertIn("| 2 | ▲ 50 | judged no, capped | Senior Engineer |",
+                      self.shortlist())
+        self.assertIn("\"No\" verdicts held 2 score(s) at 50.", printed)
 
     def test_a_digest_without_listings_is_flagged_in_the_shortlist(self):
         self.write(self.raw, "job_uid_2.txt", digest_text(1) + "New layout\n")

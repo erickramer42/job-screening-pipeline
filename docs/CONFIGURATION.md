@@ -59,7 +59,10 @@ Board fetch applies these to postings, using the platforms' structured remote an
 | `model_thinking` | Let a thinking model reason before it answers. See [Model thinking](#model-thinking) below. | `false` |
 | `num_ctx` | The model's context window per request, in tokens. It must hold the prompt, the batch and the response. | `8192` |
 | `score_caps` | Upper score limits applied in code after each pass, for example `[{"employers": ["Acme Staffing"], "max_score": 50}]`. Optional. See [Score caps](#score-caps). | `[]` |
-| `shortlist_per_employer` | At most this many shortlist rows from one employer, for example `3`; the rest are counted under the table and stay in the JSON. `0` or missing means no limit. | `0` |
+| `shortlist_size` | Rows in the shortlist's main section: the top listings that have posting text. | `15` |
+| `lookup_size` | Rows in the "Needs lookup" section: the top listings without posting text (digest rows, and any board posting whose description is missing), ranked on their own. `0` leaves the section empty. | `10` |
+| `shortlist_per_employer` | At most this many rows from one employer in each shortlist section, for example `3`; the rest are counted under the tables and stay in the JSON. `0` or missing means no limit. | `0` |
+| `no_verdict_cap` | The highest score for a listing whose latest verdict in `feedback/` is `n`. It's applied after both passes, so it doesn't change what pass 2 re-scores. `null` turns it off. | `50` |
 
 The pass-2 excerpt starts at the posting's role section: a heading such as "What you'll do", "Responsibilities" or "Job description". Failing that, it starts at a similar phrase in the first half of the description. Mentions inside closing EEO or pay text are ignored. It's cut at a sentence or line end.
 

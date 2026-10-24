@@ -26,7 +26,9 @@ name so it can't be mistaken for the separator.
 
 The evaluation reads only the ranked JSON: no config, no model. Each
 run is judged by the shortlist it showed (its rows' shortlist_rank);
-runs written before that field existed showed their top 25.
+runs written before that field existed showed their top 25. The
+screener caps a listing judged "n" (no_verdict_cap), and ordering is
+judged on its score from before that cap.
 
     python verdicts.py                              # latest run in out/
     python verdicts.py out/ranked_2026-10-22.json
@@ -218,12 +220,19 @@ def evaluate(ranked_path, verdicts):
     row_by_url = {j["url"]: listing_key(j["title"], j["employer"])
                   for j in ranked + data["rejected"] if j.get("url")}
 
+    # A "no" verdict caps its listing in later runs. Ordering is judged
+    # on the score from before that cap: the cap is the verdicts' own
+    # doing, so counting it would credit the ranker with them
+    def model_score(j):
+        return j.get("verdict_capped_from", j["score"])
+
     seen = []  # (grade, score, the run's key, the verdict's key)
     for key, v in verdicts.items():
         row = row_by_url.get(v.get("url")) or key
         if v["verdict"] in GRADES and (row in rank or row in cut):
             seen.append((GRADES[v["verdict"]],
-                         rank[row][1]["score"] if row in rank else cut_score,
+                         model_score(rank[row][1]) if row in rank
+                         else cut_score,
                          row, key))
     applied = sum(v["applied"] for v in verdicts.values())
     print(f"{ranked_path}: {len(verdicts)} verdicts, {len(seen)} on listings "
@@ -235,6 +244,12 @@ def evaluate(ranked_path, verdicts):
     if total:
         print(f"ordering agreement: {agree / total:.0%} of {total} pairs "
               f"(50% is random, 100% is your order)")
+    held = sum("verdict_capped_from" in rank[r][1]
+               for _, _, r, _ in seen if r in rank)
+    if held:
+        print(f"  {held} listing(s) held down by an earlier \"no\": ordering "
+              f"uses their scores from before that cap; the shortlist "
+              f"counts below don't")
     for verdict, grade in GRADES.items():
         rows = [r for g, _, r, _ in seen if g == grade]
         if rows:

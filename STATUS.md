@@ -34,8 +34,27 @@ The goal is a focused daily application routine (~10 highest-quality matches per
 | Job parsing (`jobs_screen.py` parser) | ✅ Operational | Reads title/employer/location quadruples from `raw/` and `raw_boards/`. Keeps one copy per listing (board copy first, then newest digest) and cuts digests older than `recency_days`. A recent digest with text but no listings gets a warning in the shortlist. |
 | Hard filters | ✅ Operational | Cuts the employers and title patterns listed in `pipeline_config.json`, digest listings outside the search area, and jobs already applied to (`applied.txt`, or an `a` flag in `feedback/`, which follows a board posting by URL) |
 | LLM ranking | ✅ Operational | Pass 1 scores every survivor 0–100 from title/employer/location. Pass 2 re-scores the top `rerank_top_n` listings that have a description, using a role-section excerpt. Thinking is off and the first attempt is greedy, so scores are repeatable; `score_caps` (by employer, title or posting text) are enforced after each pass. Malformed responses are retried; 3 consecutive failed batches stop a pass. |
-| Output generation | ✅ Operational | Produces `out/shortlist_YYYY-MM-DD.md` and JSON. Board rows include direct posting links and their posted date; ▲ marks pass-2 scores. The JSON records the model, prompt and settings behind the run. |
+| Output generation | ✅ Operational | Produces `out/shortlist_YYYY-MM-DD.md` and JSON. The shortlist has two sections, each ranked on its own: listings with posting text, and a "Needs lookup" section for those without. Board rows include direct posting links and their posted date; ▲ marks pass-2 scores. A listing judged "no" is held at 50 on later days. The JSON records the model, prompt and settings behind the run. |
 | Scheduled runs | ✅ Operational | Task Scheduler runs ingest at 01:00 and 05:00, and board fetch + screening at 06:00. Tasks wake the computer, run after a missed start, and the wrappers retry (see [Automation](#automation)). Verified across 2026-10-09 to 10-23, with two misses. On 10-14 no task ran: a Windows Update restart at 00:33 left no one signed in until 08:52, and the missed-start catch-up didn't run the tasks after sign-in. On 10-22 screening failed all 3 attempts because Ollama wasn't running. Since 2026-10-23 both tasks also start at log on, the screening wrapper starts Ollama before a retry, and a failed morning leaves `out/FAILED_<date>.md`. |
+
+### Recent Changes (2026-10-24)
+- **The shortlist has a "Needs lookup" section** (review H1, fixed):
+  - Listings with posting text fill the main section (`shortlist_size`, 15), and listings without it get their own (`lookup_size`, 10). Each section is ranked on its own. That's every digest row, plus any board posting whose description is missing.
+  - **Why:** on 10-24, two digest rows held #1 and #2 (82 and 78) on their title alone, and both were "no" once looked up. Across the verdicts so far, digest rows drew 0 "yes", 9 "maybe" and 6 "no", against 5, 9 and 28 for board rows.
+  - **A score cap was tried first** and set aside: capping digest rows at 60 changed which rows were listed on neither day, and ordering agreement by only 1–2 points (in-sample). A cap at 50 dropped the "maybe" digest rows too.
+  - The per-employer limit applies within each section. Rows are numbered on through both, as in the verdict template.
+- **A "no" verdict holds a listing down:**
+  - On later shortlists, a listing whose latest verdict is `n` is held at `no_verdict_cap` (50) and flagged `judged no`. It isn't cut, so it can still be applied to.
+  - The cap comes after both passes, so it changes no model score and not which rows pass 2 re-scores.
+  - The JSON keeps the model's score as `verdict_capped_from`. `verdicts.py` judges ordering on that, since the cap comes from the verdicts themselves.
+- **The 10-24 → 10-25 stability baseline is unaffected:** same prompt and caps, and the same model scores. Compare on `verdict_capped_from` where it's set.
+- **Checked:** `main()` ran on 10-24 data with a stand-in model returning the 10-24 run's model scores, into scratch folders.
+  - Pass 2 re-scored the same 60 rows as the real run.
+  - 15 scores were held at 50, and "no" rows on the shortlist went from 13 to 7, all at 50 at the bottom of their section (in-sample by construction).
+  - In the main section, those were the last 5 of 15 rows: after the per-employer limit, only 10 rows with posting text scored above 50.
+  - Ordering agreement: 63% → 62%. The difference is two listings newly marked applied, which leave the comparison.
+- **Digest employers on public boards:** `slug_probe.py` found no Greenhouse, Lever, Ashby or SmartRecruiters board for any of the nine digest employers with a listing scoring 50+ on 10-24. Their postings stay manual lookups.
+- **Tests:** 151, up from 143.
 
 ### Recent Changes (2026-10-23)
 - **Board fetch, from the review of the public-boards work:**
@@ -294,7 +313,6 @@ Quick fixes and score stabilization from a code review.
 ### Pending / Known Issues
 | Issue | Priority | Impact | Planned Fix |
 |-------|----------|--------|-------------|
-| Pass-2 scores share a ranking with pass-1 scores | Medium | Only listings with a description (board rows) are re-scored against posting text, so board rows can crowd digest rows out of the top 25. Much smaller since 2026-10-22: the 10-23 scheduled run's top 25 had 18 board and 7 digest rows, and the verdicts so far show no digest "yes" row below the cut. | Separate shortlist sections, only if `verdicts.py` shows digest "yes" rows below the cut |
 | Every run re-scores everything in the recency window | Medium | Each day re-scores all digest listings from the last `recency_days` plus every live board posting, though ~97% were scored the day before. The 10-23 scheduled run took 4 min 41 s; runs took ~25 min before 2026-10-22. | Score cache keyed by listing |
 | Scores depend on batch-mates | Medium | The same listing scored in a different batch of 30 moves ~6 points on average (8% move 20+), against ~1.2 for a repeat of the same batch. The per-batch quota is gone (2026-10-22), but the model still grades partly against the other listings in its request. | Score each new listing in its own request, together with the score cache |
 | The ranking prompt's profile treats C++ as core stack | Medium | The profile was a flat skills list, so the model credited C++ (about 2 professional years, nearly a decade ago, plus side projects) as a core match: 5 of the 10-24 run's reasons cite it, and C++-centered rows scored up to 78. | A profile tiered by recency and weight, measured 2026-10-24 and parked as `screening_prompt.recency-pending.txt`. It goes live after the 10-25 scheduled run, so the 10-24 → 10-25 stability baseline keeps one prompt. In two scratch runs on 10-24 input it took C++-centered rows to 30–35 and left no reason citing C++ as his skill; ordering agreement 73% against 72% (in-sample), and 5 "no" rows on the shortlist against 9. Known miss: a "yes" posting that accepts Python or C++ fell from 65 to 45, outside pass 2's top `rerank_top_n`, so its text was never read; re-scoring every board posting (milestone 3) fixes that. And a "no" posting in a specialist domain rose from 54 to 78 once the freed pass-2 slots let it in. |
@@ -364,10 +382,10 @@ Credentials come from Windows user environment variables (see [Environment Varia
 
 Review `out/shortlist_<today>.md`. If it's missing, `out/FAILED_<today>.md` says why.
 - Board rows have direct posting links.
-- Digest rows need the original email for their "View" links.
+- Rows under "Needs lookup" were scored on their title alone. Digest rows need the original email for their "View" links.
 
 Apply manually at company career pages. Afterwards:
-- Fill in `feedback/<date>.md`: a y/m/n verdict per row, with notes after `::`. Add `a` when you've applied (`[m,a]`, or `[a]` alone); it cuts the job from future rankings.
+- Fill in `feedback/<date>.md`: a y/m/n verdict per row, with notes after `::`. Add `a` when you've applied (`[m,a]`, or `[a]` alone); it cuts the job from future rankings. An `n` holds the job at 50 on later shortlists.
 - Add jobs applied to outside the shortlist to `applied.txt` (URL, or `Title | Employer` for digest rows).
 - Run `python verdicts.py` after changing the prompt or config, to see whether the ranking moved toward your verdicts.
 - Turn repeated notes into config rules or prompt changes (see [Reviewing the shortlist](docs/USAGE.md#reviewing-the-shortlist)).
@@ -519,11 +537,10 @@ Agreed 2026-10-22, in this order:
 4. **Judge it** with `python verdicts.py`, and check day-to-day stability: a listing's score shouldn't move unless its listing, the prompt, or the model changed.
 
 After that, as needed:
-- **Separate board and digest sections** in the shortlist, only if the verdicts show digest "yes" rows below the cut.
 - **Ollama structured outputs** (a JSON schema as the response format): a scoring change, so it waits for verdicts like any other.
 
-The automation items (the 10-14 and 10-22 misses, a visible failure marker) and the empty board were done on 2026-10-23.
+The automation items (the 10-14 and 10-22 misses, a visible failure marker) and the empty board were done on 2026-10-23. The separate section for listings without posting text was done on 2026-10-24.
 
 Success metric for automation: zero manual intervention; shortlist present in `out/` by 7:00 AM each weekday.
 
-*Last updated: October 23, 2026*
+*Last updated: October 24, 2026*

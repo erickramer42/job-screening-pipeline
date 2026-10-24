@@ -202,6 +202,27 @@ class Evaluate(unittest.TestCase):
         self.assertIn("platform engineer | gamma: rank 4, score 20 [", report)
         self.assertIn("data engineer | beta: shortlist #2, score 80", report)
 
+    def test_ordering_ignores_the_cap_a_no_verdict_put_on(self):
+        # The model put the "no" first; its verdict then held it at 50
+        run = {"ranked": [
+            {"title": "Data Engineer", "employer": "Beta", "score": 70},
+            {"title": "Senior Engineer", "employer": "Acme", "score": 50,
+             "verdict_capped_from": 90}],
+            "rejected": []}
+        v = {("data engineer", "beta"): {"verdict": "y", "applied": False,
+                                         "note": "", "file": "f"},
+             ("senior engineer", "acme"): {"verdict": "n", "applied": False,
+                                           "note": "", "file": "f"}}
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "ranked.json"
+            path.write_text(json.dumps(run), encoding="utf-8")
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                verdicts.evaluate(path, v)
+        self.assertIn("ordering agreement: 0% of 1 pairs", out.getvalue())
+        self.assertIn("1 listing(s) held down by an earlier \"no\"",
+                      out.getvalue())
+
 class OrderingAgreement(unittest.TestCase):
     def test_better_verdict_with_higher_score_agrees(self):
         self.assertEqual(verdicts.ordering_agreement([(2, 60), (0, 50)]),
