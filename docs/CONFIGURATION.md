@@ -53,16 +53,18 @@ Board fetch applies these to postings, using the platforms' structured remote an
 |-----|---------|---------|
 | `recency_days` | Ingest leaves out digests that arrived more than this many days ago, plus one day, since its IMAP search counts arrival dates in whole days. The screener cuts digests older than this many days by their Date header. A listing still present in a newer digest stays. Board postings are exempt, because closed postings are archived instead. Digests with an unreadable date are kept, with a warning. `0` or missing disables the window. | `0` |
 | `pass1_batch` | Listings per pass-1 request. Lower it only if responses come back truncated. | `30` |
-| `rerank_top_n` | How many of the top pass-1 listings that have a description get re-scored in pass 2. `0` turns pass 2 off. | `15` |
+| `rerank_top_n` | How many of the top pass-1 listings that have a description get re-scored in pass 2. Only those can fill the shortlist's main section. `0` turns pass 2 off, which leaves that section empty. | `15` |
 | `rerank_batch` | Listings per pass-2 request. | `5` |
 | `excerpt_chars` | Maximum length of the posting excerpt sent per listing in pass 2. | `1500` |
 | `model_thinking` | Let a thinking model reason before it answers. See [Model thinking](#model-thinking) below. | `false` |
 | `num_ctx` | The model's context window per request, in tokens. It must hold the prompt, the batch and the response. | `8192` |
 | `score_caps` | Upper score limits applied in code after each pass, for example `[{"employers": ["Acme Staffing"], "max_score": 50}]`. Optional. See [Score caps](#score-caps). | `[]` |
-| `shortlist_size` | Rows in the shortlist's main section: the top listings that have posting text. | `15` |
-| `lookup_size` | Rows in the "Needs lookup" section: the top listings without posting text (digest rows, and any board posting whose description is missing), ranked on their own. `0` leaves the section empty. | `10` |
-| `shortlist_per_employer` | At most this many rows from one employer in each shortlist section, for example `3`; the rest are counted under the tables and stay in the JSON. `0` or missing means no limit. | `0` |
-| `no_verdict_cap` | The highest score for a listing whose latest verdict in `feedback/` is `n`. It's applied after both passes, so it doesn't change what pass 2 re-scores. `null` turns it off. | `50` |
+| `shortlist_size` | Rows in the shortlist's main section: the top listings pass 2 re-scored against their posting text. | `15` |
+| `lookup_size` | Rows in the "Needs lookup" section: the top listings with a title-only score (digest rows, and board postings pass 2 didn't re-score), ranked on their own. `0` leaves the section empty. | `10` |
+| `shortlist_per_employer` | At most this many shortlist rows from one employer, across both sections, for example `3`; the rest are counted under the tables and stay in the JSON. `0` or missing means no limit. | `0` |
+| `no_verdict_cap` | The highest score for a listing whose latest verdict in `feedback/` is `n`. At that score it ranks below the listings you haven't judged. It's applied after both passes, so it doesn't change what pass 2 re-scores. `null` turns it off. | `50` |
+
+`rerank_top_n`, `shortlist_size`, `lookup_size` and `shortlist_per_employer` can't be negative: a negative value stops the run as a config mistake.
 
 The pass-2 excerpt starts at the posting's role section: a heading such as "What you'll do", "Responsibilities" or "Job description". Failing that, it starts at a similar phrase in the first half of the description. Mentions inside closing EEO or pay text are ignored. It's cut at a sentence or line end.
 

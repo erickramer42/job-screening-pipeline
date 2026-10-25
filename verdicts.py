@@ -150,6 +150,12 @@ def template_row(n, job):
     employer = job["employer"].replace("|", "\\|")
     return f"{n} [?] {job['title']} | {employer} ::"
 
+def numbered(rows):
+    """(number, row) for template lines: the row's shortlist_rank, so
+    the numbers match the shortlist when the screener leaves rows out,
+    or its place in rows when it has none."""
+    return [(j.get("shortlist_rank", i), j) for i, j in enumerate(rows, 1)]
+
 def template_lines(stamp, rows):
     """The feedback file the screener writes for a day's shortlist."""
     lines = [f"# Feedback on out/shortlist_{stamp}.md",
@@ -158,7 +164,7 @@ def template_lines(stamp, rows):
              "# \"title | employer\" as written: it identifies the listing.",
              "# Other lines are free notes.",
              ""]
-    return lines + [template_row(i, j) for i, j in enumerate(rows, 1)]
+    return lines + [template_row(n, j) for n, j in numbered(rows)]
 
 def is_untouched_template(text, stamp):
     """True for a feedback file as the screener wrote it: the template's
@@ -209,7 +215,17 @@ def evaluate(ranked_path, verdicts):
                 j.get("shortlist_rank", n) for n, j in enumerate(shown, 1)}
     rank = {listing_key(j["title"], j["employer"]): (i, j)
             for i, j in enumerate(ranked, 1)}
-    last_shown = max((rank[k][0] for k in position), default=0)
+    # Which unlisted rows the per-employer limit passed over. A run with
+    # two sections marks them; in an older one-list run, that's any row
+    # ranked above the list's last row. A sectioned run from before the
+    # mark says nothing, rather than guess
+    if "lookup_size" in data.get("run", {}):
+        def employer_limited(i, j):
+            return j.get("employer_limited", False)
+    else:
+        last_shown = max((rank[k][0] for k in position), default=0)
+        def employer_limited(i, j):
+            return i < last_shown
     # Listings cut as applied are left out: that cut isn't the ranker's
     # judgment, so a "yes" you applied to shouldn't count as ranked last
     cut = {listing_key(j["title"], j["employer"]): j["reject_reason"]
@@ -260,11 +276,15 @@ def evaluate(ranked_path, verdicts):
         if row in cut:
             return f"cut ({cut[row]})"
         i, j = rank[row]
+        # The model's score, as ordering counts it, then the cap's
+        score = f"score {model_score(j)}"
+        if "verdict_capped_from" in j:
+            score += f", held at {j['score']}"
         if row in position:
-            return f"shortlist #{position[row]}, score {j['score']}"
-        # Ranked above the list's last row, so the list passed it over
-        held = ", held out by the per-employer limit" if i < last_shown else ""
-        return f"rank {i}, score {j['score']}{held}"
+            return f"shortlist #{position[row]}, {score}"
+        held = (", held out by the per-employer limit"
+                if employer_limited(i, j) else "")
+        return f"rank {i}, {score}{held}"
     misses = [(r, k) for g, _, r, k in seen if g == 2 and r not in position]
     false_hits = [(r, k) for g, _, r, k in seen if g == 0 and r in position]
     for label, pairs in (("yes, but not in the shortlist", misses),

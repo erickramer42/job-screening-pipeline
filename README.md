@@ -29,14 +29,14 @@ verdicts.py <-- the owner's verdicts in feedback/<date>.md <--+
    - **Pass 1:** the model scores every remaining listing 0–100 from its title, employer and location.
    - **Pass 2:** the top listings that have posting text are re-scored with an excerpt of the posting's role section.
    - **Hard limits:** after each pass, limits are enforced in code. For example, a posting that requires a skill the candidate lacks is capped at 50.
-   - **Output:** it writes the shortlist (Markdown), the full ranking with every cut and its reason (JSON), and a verdict template. The shortlist ranks listings without posting text in their own "Needs lookup" section, since a title alone is weak evidence.
+   - **Output:** it writes the shortlist (Markdown), the full ranking with every cut and its reason (JSON), and a verdict template. The shortlist ranks listings that weren't read against their posting text in their own "Needs lookup" section, since a title alone is weak evidence.
 4. **Evaluate:** the owner marks shortlist rows yes, maybe, no or applied. `verdicts.py` then scores any run against those verdicts. A "no" holds that listing down on later shortlists.
 
 ## Sample output
 
 The rows are placeholders, laid out in the real shortlist's format:
 
-**With posting text**
+**Read against the posting**
 
 | # | Score | Flags | Title | Employer | Location | Posted | Link | Reason |
 |---|-------|-------|-------|----------|----------|--------|------|--------|
@@ -98,7 +98,7 @@ Each of these was measured before and after the change. [STATUS.md](STATUS.md) h
   - A partial run, in either pass, still writes the shortlist, flagged at the top, and exits 1.
   - A preflight check tells an Ollama outage apart from a model that isn't installed, and a request Ollama rejects stops the run with its reason instead of being retried.
 - **Atomic writes.** Every file is written through a temporary file, so a killed run never leaves a truncated one.
-- **143 `unittest` tests**, which need no network and no personal config. They include the contracts between stages:
+- **158 `unittest` tests**, which need no network and no personal config. They include the contracts between stages:
   - what ingest and board fetch write must parse in the screener;
   - the board-file layout is pinned byte for byte;
   - each exit code, with the screener run end to end against a stand-in model.

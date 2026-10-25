@@ -459,6 +459,12 @@ class Configure(unittest.TestCase):
         with self.assertRaises(KeyError):
             js.configure(cfg)
 
+    def test_a_negative_count_is_rejected(self):
+        for key in ("shortlist_size", "lookup_size", "shortlist_per_employer",
+                    "rerank_top_n"):
+            with self.subTest(key=key), self.assertRaises(ValueError):
+                js.configure({**CONFIG, key: -1})
+
 class Shortlist(unittest.TestCase):
     def tearDown(self):
         js.configure(CONFIG)
@@ -467,16 +473,40 @@ class Shortlist(unittest.TestCase):
         js.configure({**CONFIG, "shortlist_per_employer": 1})
         ranked = [{"title": f"Role {i}", "employer": e}
                   for i, e in enumerate(["Acme", "ACME", "Beta", "acme"])]
-        rows, more = js.shortlist_rows(ranked, 25)
+        (rows,), more = js.shortlist_rows((ranked, 25))
         self.assertEqual([j["title"] for j in rows], ["Role 0", "Role 2"])
         self.assertEqual(dict(more), {"Acme": 2})
+        self.assertEqual([j["title"] for j in ranked
+                          if j.get("employer_limited")], ["Role 1", "Role 3"])
 
     def test_a_section_stops_at_its_size(self):
         ranked = [{"title": f"Role {i}", "employer": f"Co {i}"}
                   for i in range(4)]
-        rows, more = js.shortlist_rows(ranked, 2)
+        (rows,), more = js.shortlist_rows((ranked, 2))
         self.assertEqual([j["title"] for j in rows], ["Role 0", "Role 1"])
         self.assertEqual(more, {})
+
+    def test_the_per_employer_limit_spans_both_sections(self):
+        js.configure({**CONFIG, "shortlist_per_employer": 2})
+        main = [{"title": f"Board {i}", "employer": "Acme"} for i in range(3)]
+        lookup = [{"title": f"Digest {i}", "employer": "ACME"}
+                  for i in range(3)]
+        (rows, lookup_rows), more = js.shortlist_rows((main, 15),
+                                                      (lookup, 10))
+        self.assertEqual([j["title"] for j in rows], ["Board 0", "Board 1"])
+        self.assertEqual(lookup_rows, [])
+        # One entry under the first spelling, not one per section
+        self.assertEqual(dict(more), {"Acme": 4})
+
+    def test_a_judged_no_ranks_below_others_at_its_score(self):
+        kept = [{"title": "Ruled out", "score": 50, "flags": ["judged no"]},
+                {"title": "Higher", "score": 70},
+                {"title": "Capped by a rule", "score": 50, "flags": ["rails"]},
+                {"title": "Unjudged", "score": 50}]
+        kept.sort(key=js.rank_order, reverse=True)
+        self.assertEqual([j["title"] for j in kept],
+                         ["Higher", "Capped by a rule", "Unjudged",
+                          "Ruled out"])
 
 class VerdictCaps(unittest.TestCase):
     """A listing judged "n" is held at no_verdict_cap after scoring."""
@@ -755,6 +785,24 @@ class MainRun(SourceFiles):
                       self.shortlist())
         self.assertEqual(self.ranked()["rerank_failed_batches"], 2)
         self.assertIn("[ERROR] 2 re-scoring batch(es) failed", printed)
+        # Nothing was read against a posting, so every row is title-only
+        main, lookup = self.shortlist().split("## Needs lookup")
+        self.assertIn("No listings.", main)
+        self.assertIn("| Senior Engineer |", lookup)
+
+    def test_a_board_row_pass2_skipped_goes_under_needs_lookup(self):
+        config = json.loads(pipeline_common.CONFIG_FILE.read_text(
+            encoding="utf-8"))
+        pipeline_common.CONFIG_FILE.write_text(json.dumps(
+            {**config, "rerank_top_n": 1}), encoding="utf-8")
+        self.assertEqual(self.run_main(FakeModel())[0], 0)
+        main, lookup = self.shortlist().split("## Needs lookup")
+        rescored = [j["title"] for j in self.ranked()["ranked"]
+                    if j.get("rescored")]
+        self.assertEqual(len(rescored), 1)
+        self.assertIn(f"| {rescored[0]} |", main)
+        other = ({"Senior Engineer", "Backend Engineer"} - set(rescored)).pop()
+        self.assertIn(f"| {other} |", lookup)
 
     def test_rows_without_posting_text_have_their_own_section(self):
         self.assertEqual(self.run_main(FakeModel())[0], 0)
@@ -817,6 +865,14 @@ class MainRun(SourceFiles):
         self.assertIn("| 2 | ▲ 50 | judged no, capped | Senior Engineer |",
                       self.shortlist())
         self.assertIn("\"No\" verdicts held 2 score(s) at 50.", printed)
+        # Not asked about again; the rest keep their shortlist numbers
+        template = (self.feedback / f"{self.stamp}.md").read_text(
+            encoding="utf-8")
+        self.assertNotIn("Senior Engineer", template)
+        self.assertNotIn("Data Engineer", template)
+        self.assertIn("1 [?] Backend Engineer | Delta ::", template)
+        n = ranked["Platform Engineer"]["shortlist_rank"]
+        self.assertIn(f"{n} [?] Platform Engineer | Gamma ::", template)
 
     def test_a_digest_without_listings_is_flagged_in_the_shortlist(self):
         self.write(self.raw, "job_uid_2.txt", digest_text(1) + "New layout\n")

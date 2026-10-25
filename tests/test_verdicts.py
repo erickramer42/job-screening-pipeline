@@ -68,6 +68,15 @@ class FeedbackFiles(unittest.TestCase):
                                                             r["employer"])
                                        for r in rows})
 
+    def test_template_numbers_rows_by_their_shortlist_rank(self):
+        rows = [{"title": "Senior Engineer", "employer": "Acme",
+                 "shortlist_rank": 1},
+                {"title": "Data Engineer", "employer": "Beta",
+                 "shortlist_rank": 3}]
+        lines = verdicts.template_lines("2026-01-02", rows)
+        self.assertEqual(lines[-2:], ["1 [?] Senior Engineer | Acme ::",
+                                      "3 [?] Data Engineer | Beta ::"])
+
     def test_later_file_wins_and_unfilled_rows_are_skipped(self):
         (self.folder / "2026-01-01.md").write_text(
             "Free notes | not a verdict line\n"
@@ -201,6 +210,48 @@ class Evaluate(unittest.TestCase):
                       "the per-employer limit", report)
         self.assertIn("platform engineer | gamma: rank 4, score 20 [", report)
         self.assertIn("data engineer | beta: shortlist #2, score 80", report)
+
+    def test_a_sectioned_run_names_the_limit_only_where_it_applied(self):
+        # A full main section left out "Senior"; the limit left out
+        # "Lead". Both rank above the last Needs-lookup row
+        run = {"run": {"shortlist_size": 1, "lookup_size": 1},
+               "ranked": [
+            {"title": "Staff Engineer", "employer": "Acme", "score": 90,
+             "shortlist_rank": 1},
+            {"title": "Lead Engineer", "employer": "Acme", "score": 85,
+             "employer_limited": True},
+            {"title": "Senior Engineer", "employer": "Beta", "score": 80},
+            {"title": "Data Engineer", "employer": "Gamma", "score": 70,
+             "shortlist_rank": 2}],
+            "rejected": []}
+        v = {k: {"verdict": "y", "applied": False, "note": "", "file": "f"}
+             for k in (("lead engineer", "acme"), ("senior engineer", "beta"))}
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "ranked.json"
+            path.write_text(json.dumps(run), encoding="utf-8")
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                verdicts.evaluate(path, v)
+        report = out.getvalue()
+        self.assertIn("lead engineer | acme: rank 2, score 85, held out by "
+                      "the per-employer limit", report)
+        self.assertIn("senior engineer | beta: rank 3, score 80 [", report)
+
+    def test_a_held_down_row_shows_the_models_score(self):
+        run = {"ranked": [
+            {"title": "Senior Engineer", "employer": "Acme", "score": 50,
+             "verdict_capped_from": 90, "shortlist_rank": 1}],
+            "rejected": []}
+        v = {("senior engineer", "acme"): {"verdict": "n", "applied": False,
+                                           "note": "", "file": "f"}}
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "ranked.json"
+            path.write_text(json.dumps(run), encoding="utf-8")
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                verdicts.evaluate(path, v)
+        self.assertIn("senior engineer | acme: shortlist #1, score 90, "
+                      "held at 50", out.getvalue())
 
     def test_ordering_ignores_the_cap_a_no_verdict_put_on(self):
         # The model put the "no" first; its verdict then held it at 50
