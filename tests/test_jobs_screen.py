@@ -356,7 +356,16 @@ class ModelResponses(unittest.TestCase):
         with mock.patch.object(js, "ollama_chat", chat), \
                 mock.patch("builtins.print"):
             self.assertEqual(js.request_scores("s", "u", [{}, {}]),
-                             {0: {"score": 70, "reason": "a"}})
+                             {0: {"score": 70, "reason": "a", "attempt": 1}})
+
+    def test_the_answering_attempt_is_recorded(self):
+        answers = iter(["not json", json.dumps({"scores": [
+            {"index": 0, "score": 55, "reason": "b"}]})])
+        with mock.patch.object(js, "ollama_chat",
+                               lambda system, user, attempt=1: next(answers)), \
+                mock.patch("builtins.print"):
+            self.assertEqual(js.request_scores("s", "u", [{}]),
+                             {0: {"score": 55, "reason": "b", "attempt": 2}})
 
     def test_a_failed_first_attempt_fails_the_batch(self):
         with mock.patch.object(js, "ollama_chat", side_effect=TimeoutError()):
@@ -461,9 +470,20 @@ class Configure(unittest.TestCase):
 
     def test_a_negative_count_is_rejected(self):
         for key in ("shortlist_size", "lookup_size", "shortlist_per_employer",
-                    "rerank_top_n"):
+                    "rerank_top_n", "recency_days", "excerpt_chars",
+                    "score_cache_days"):
             with self.subTest(key=key), self.assertRaises(ValueError):
                 js.configure({**CONFIG, key: -1})
+
+    def test_a_batch_or_context_of_zero_is_rejected_at_startup(self):
+        # 0 used to pass, then stop the run after the Ollama check
+        for key in ("pass1_batch", "rerank_batch", "num_ctx"):
+            with self.subTest(key=key), \
+                    self.assertRaisesRegex(ValueError, "at least 1"):
+                js.configure({**CONFIG, key: 0})
+        for key in ("rerank_top_n", "excerpt_chars", "recency_days"):
+            with self.subTest(key=key):
+                js.configure({**CONFIG, key: 0})  # 0 has a meaning here
 
 class Shortlist(unittest.TestCase):
     def tearDown(self):
@@ -1073,6 +1093,19 @@ class PerListingRerank(MainRunBase):
                          (60, True))
         self.assertEqual((jobs[1]["score"], jobs[1].get("rescored")),
                          (40, None))
+
+    def test_a_retrys_score_is_cached_with_its_attempt(self):
+        fake = FakeModel()
+        def model(system, user, attempt=1):
+            if not pass1(user) and "Acme" in user and attempt == 1:
+                return "not json"
+            return fake(system, user, attempt)
+        with mock.patch("builtins.print"):
+            self.assertEqual(self.run_main(model)[0], 0)
+        entries = json.loads((self.out / "score_cache.json").read_text(
+            encoding="utf-8"))["entries"].values()
+        self.assertEqual(sorted((e["employer"], e["attempt"]) for e in entries),
+                         [("Acme", 2), ("Delta", 1)])
 
     def test_entries_unused_for_score_cache_days_are_dropped(self):
         self.assertEqual(self.run_main(FakeModel())[0], 0)

@@ -85,30 +85,34 @@ def split_listing(text):
     employer = parts[-1].replace("\\|", "|").strip()
     return (title, employer) if title and employer else None
 
-def run_urls(stem):
-    """{listing key: posting URL} for the board rows of
-    RUNS_DIR/ranked_<stem>.json, the run feedback/<stem>.md judges; {}
-    when there's no such run. Digest rows have no URL."""
+def run_listings(stem):
+    """{listing key: posting URL, or "" for a digest row} for every row
+    of RUNS_DIR/ranked_<stem>.json, the run feedback/<stem>.md judges;
+    None when there's no such run."""
     path = RUNS_DIR / f"ranked_{stem}.json"
     if not path.exists():
-        return {}
+        return None
     data = json.loads(path.read_text(encoding="utf-8"))
-    return {listing_key(j["title"], j["employer"]): j["url"]
-            for j in data["ranked"] + data["rejected"] if j.get("url")}
+    return {listing_key(j["title"], j["employer"]): j.get("url") or ""
+            for j in data["ranked"] + data["rejected"]}
 
 def load_verdicts(folder=None):
     """{listing key: {"verdict", "applied", "note", "file", "url"}},
     where verdict is y, m, n or None (applied only), and url is the
     posting's link, or "" for a digest row or a run that's gone. Unfilled
     rows are skipped; a row line that can't be read is reported and
-    skipped. Files are read in name (date) order, and a later line on a
-    listing updates its verdict (see the module docstring). A line is
-    matched to an earlier verdict by URL first, then by title and
-    employer; the verdict is kept under the latest title."""
+    skipped. A line whose listing isn't in the run its file judges is
+    reported too, since its title was most likely edited and the verdict
+    may match nothing, but it's kept: the listing can come back under
+    that title. Files are read in name (date) order, and a later line on a listing
+    updates its verdict (see the module docstring). A line is matched to
+    an earlier verdict by URL first, then by title and employer; the
+    verdict is kept under the latest title."""
     folder = folder or FEEDBACK_DIR
     verdicts, key_by_url = {}, {}
     for f in sorted(folder.glob("*.md")) if folder.exists() else []:
-        urls = run_urls(f.stem)
+        listings = run_listings(f.stem)
+        urls = {k: u for k, u in (listings or {}).items() if u}
         for n, ln in enumerate(f.read_text(encoding="utf-8").splitlines(), 1):
             m = LINE_RE.match(ln)
             if not m:
@@ -127,6 +131,11 @@ def load_verdicts(folder=None):
                       f"flags; line ignored")
                 continue
             key = listing_key(*listing)
+            if listings is not None and key not in listings:
+                print(f"[WARN] {f}:{n}: \"{m.group(3)}\" isn't in "
+                      f"{RUNS_DIR / f'ranked_{f.stem}.json'}, so this "
+                      f"verdict matches no listing. Keep \"title | "
+                      f"employer\" as the template wrote it")
             url = urls.get(key, "")
             # The earlier verdict on this posting: found by URL, so a
             # board row whose title changed still has it, else by key
@@ -299,7 +308,7 @@ def main():
     if len(sys.argv) > 1:
         path = Path(sys.argv[1])
     else:
-        runs = sorted(Path("out").glob("ranked_????-??-??.json"))
+        runs = sorted(RUNS_DIR.glob("ranked_????-??-??.json"))
         if not runs:
             print("No out/ranked_<date>.json yet; pass a file.")
             return 1

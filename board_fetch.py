@@ -43,6 +43,7 @@ import html as html_mod
 import json
 import re
 import sys
+import urllib.error
 import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
@@ -547,15 +548,40 @@ def sync_board(board_cfg):
           f"floor, {archived} archived")
     return new
 
+def load_boards():
+    """boards.json as a list of entries, or None after reporting, in one
+    line like a pipeline_config.json mistake, why it can't be read."""
+    if not CONFIG.exists():
+        print(f"[ERROR] {CONFIG} missing — copy boards.example.json and "
+              f"add your boards.")
+        return None
+    try:
+        boards = json.loads(CONFIG.read_text(encoding="utf-8"))
+    except ValueError as e:
+        print(f"[ERROR] {CONFIG}: {e}")
+        return None
+    if not isinstance(boards, list):
+        print(f"[ERROR] {CONFIG} must be a JSON list of boards, like "
+              f"boards.example.json.")
+        return None
+    return boards
+
+def failure_text(e):
+    """What to log for a board that failed. Only a 404 suggests the
+    boards.json entry: a timeout or a 5xx is the platform's, and any
+    other error is the script's."""
+    hint = (" — check the slug and platform in boards.json"
+            if isinstance(e, urllib.error.HTTPError) and e.code == 404
+            else "")
+    return f"FAILED ({type(e).__name__}: {e}){hint}"
+
 def main():
     configure_from_file(configure)
-    if not CONFIG.exists():
-        print("No boards.json found — copy boards.example.json and "
-              "add your boards.")
+    boards = load_boards()
+    if boards is None:
         return 1
     OUT_DIR.mkdir(exist_ok=True)
 
-    boards = json.loads(CONFIG.read_text(encoding="utf-8"))
     new_jobs = failed = 0
     sources, malformed = set(), False
     # One bad entry or board never stops the others; any failure makes
@@ -570,8 +596,7 @@ def main():
         except Exception as e:
             name = ((board_cfg.get("company") or board_cfg.get("slug"))
                     if isinstance(board_cfg, dict) else None)
-            print(f"  {name or repr(board_cfg)}: FAILED ({e}) — check "
-                  f"slug/platform")
+            print(f"  {name or repr(board_cfg)}: {failure_text(e)}")
             failed += 1
 
     # A malformed entry's files would look unconfigured, so nothing is

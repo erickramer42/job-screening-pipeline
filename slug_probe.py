@@ -17,6 +17,9 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
+# The screener's runs, read in auto mode
+RUNS_DIR = Path("out")
+
 PROBES = {
     "greenhouse":
         "https://boards-api.greenhouse.io/v1/boards/{slug}/jobs",
@@ -62,7 +65,8 @@ def lookup(slug, platform):
     """The board's postings when the slug has a board with postings;
     [] when the platform has no such board (a 4xx answer) or it has no
     jobs. Raises OSError when the platform can't be asked (network down,
-    timeout, a 5xx answer), so an outage isn't reported as "no board"."""
+    timeout, a 5xx answer, or a 429 for too many requests), so an outage
+    or throttling isn't reported as "no board"."""
     url = PROBES[platform].format(slug=slug)
     req = urllib.request.Request(
         url, headers={"User-Agent": "job-pipeline/1.0"})
@@ -70,7 +74,7 @@ def lookup(slug, platform):
         with urllib.request.urlopen(req, timeout=20) as resp:
             data = json.load(resp)
     except urllib.error.HTTPError as e:
-        if 400 <= e.code < 500:
+        if 400 <= e.code < 500 and e.code != 429:
             return []
         raise
     except ValueError:  # not JSON: not a posting API answer
@@ -118,21 +122,21 @@ def candidates():
     # Auto mode: top employers from the latest ranked_<date>.json. The
     # dated pattern skips other files in out/ (a "ranked_v1_..." name
     # would sort after every date and be picked as the latest)
-    out = sorted(Path("out").glob("ranked_????-??-??.json"))
+    out = sorted(RUNS_DIR.glob("ranked_????-??-??.json"))
     if not out:
         print("No candidates file and no ranked_<date>.json — pass a file.")
         sys.exit(1)
+    # Only ranked rows, after score caps: employers in excluded_employers
+    # were cut before ranking, and a staffing agency capped below 60 by
+    # score_caps never reaches the threshold, so neither is probed
     ranked = json.loads(out[-1].read_text(encoding="utf-8"))["ranked"]
     names = [j["employer"] for j in ranked[:200]
              if j.get("score", 0) >= 60]
-    # Dedupe, preserve order, drop staffing noise and unknowns
+    # Dedupe, preserve order, drop the digest's "employer not available"
     seen, result = set(), []
     for n in names:
         key = n.lower()
-        if key not in seen and "not available" not in key \
-                and not any(f in key for f in
-                           ("teksystems", "insight global", "robert half",
-                            "manpower", "ksn")):
+        if key not in seen and "not available" not in key:
             seen.add(key)
             result.append(n)
     print(f"Auto-derived {len(result)} candidate employers "

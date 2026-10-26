@@ -17,6 +17,15 @@ Ordering-agreement figures labelled "in-sample" were measured against the very v
 - **Context use is logged:** each pass logs its largest request against `num_ctx`, warns at the limit, and the JSON's `run.peak_context` records it. Ollama's `prompt_eval_count` counts the whole prompt, even a cached prefix. On 10-26: 4,032 tokens per pass-1 batch and 4,065 per pass-2 batch, of 8,192; a single-listing request uses 2,700 at most.
 - **`jobs_screen.py --rescore`**, and an unknown argument stops the run with exit 1.
 - **Tests:** 186, up from 158.
+- **Fixes from a whole-project review.** None changes a score or a request: on 10-26 data with a stand-in model, the screener sent the same 25 requests and wrote identical files before and after.
+  - **A verdict that matches nothing is reported.** A feedback line whose `title | employer` isn't in the run its file judges, usually because the title was edited, used to count nowhere without a word. It's now a warning with the file and line, from both `verdicts.py` and the screener. On the real files it finds exactly one line, on 10-25.
+  - **No real employer names in the code.** `slug_probe.py`'s auto mode had five staffing agencies hard-coded as names to skip. They were redundant: it reads only ranked listings scoring 60 or more, after `excluded_employers` has cut and `score_caps` has capped. The list is gone.
+  - **Plain-text email bodies keep their text.** Ingest ran every body through the HTML tag stripper, which deleted anything between a `<` and a `>`: `Pay < $100k, bonus > $5k` became `Pay $5k`. Only HTML parts are converted now. Every digest so far is HTML: rebuilt from the mailbox, read-only, all 46 came out identical to the files on disk, apart from the `Job_ID` line retired on 10-22.
+  - **Count settings are checked at startup.** A `pass1_batch` or `rerank_batch` of 0 used to pass, then stop the run after the Ollama check with a traceback. Now `pass1_batch`, `rerank_batch` and `num_ctx` must be at least 1, and `recency_days` and `excerpt_chars` can't be negative.
+  - **`slug_probe.py` treats "too many requests" as a failed lookup,** not as "no board", so a throttled probe can't report a company as boardless.
+  - **Board fetch:** a `boards.json` with a syntax error, or that isn't a list, stops the run with one line instead of a traceback. A failed board's log line names the error, and suggests checking its slug only for an HTTP 404.
+  - **The score cache records which attempt answered.** Only the first is greedy, so an entry from a sampled retry (`"attempt": 2`) may not repeat on `--rescore`.
+  - **Tests:** 196.
 
 ## 2026-10-25
 - **The stability baseline is in:** the 10-24 and 10-25 scheduled runs used one prompt and model. On the 372 listings they shared, unchanged both days, title-only scores moved 2.7 points on average (11 of 309 by 20 or more), and re-scored ones 9.5 (7 of 57). The score cache should bring both to 0.

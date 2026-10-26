@@ -11,7 +11,6 @@ from unittest import mock
 
 import job_ingest as ji
 import jobs_screen as js
-from html_text import html_to_text
 
 def raw_message(body, content_type="text/plain; charset=utf-8",
                 encoding="8bit", subject="Job alerts",
@@ -48,6 +47,18 @@ class ReadMessage(unittest.TestCase):
         raw = raw_message(body, 'multipart/alternative; boundary="b"')
         self.assertIn("plain text", ji.read_message(raw)[3])
 
+    def test_plain_text_keeps_angle_brackets_and_entities(self):
+        raw = raw_message(b"Senior Engineer\r\nPay < $100k, bonus > $5k\r\n"
+                          b"R&amp;D Co\r\nView <https://example.com/1>\r\n")
+        self.assertEqual(ji.read_message(raw)[3],
+                         "Senior Engineer\nPay < $100k, bonus > $5k\n"
+                         "R&amp;D Co\nView <https://example.com/1>")
+
+    def test_html_is_converted_to_one_field_per_line(self):
+        raw = raw_message(b"<p>Senior Engineer</p><p>R&amp;D Co</p>",
+                          "text/html; charset=utf-8")
+        self.assertEqual(ji.read_message(raw)[3], "Senior Engineer\nR&D Co")
+
     def test_no_text_part(self):
         body = (b"--b\r\nContent-Type: application/pdf\r\n\r\n%PDF\r\n"
                 b"--b--\r\n")
@@ -64,13 +75,13 @@ class DigestContract(unittest.TestCase):
                 "<td>Remote</td><td><a href='y'>View</a></td></tr></table>")
         raw = raw_message(html.encode(), "text/html; charset=utf-8",
                           date=sent)
-        subject, sender, date, body = ji.read_message(raw)
+        subject, sender, date, text = ji.read_message(raw)
         with tempfile.TemporaryDirectory() as tmp:
             raw_dir = Path(tmp) / "raw"
             raw_dir.mkdir()
             (raw_dir / ji.digest_name("41", "7")).write_text(
-                ji.digest_record(subject, sender, date, "7",
-                                 html_to_text(body)), encoding="utf-8")
+                ji.digest_record(subject, sender, date, "7", text),
+                encoding="utf-8")
             js.configure({"excluded_employers": [],
                           "excluded_title_patterns": [],
                           "metro_cities": [], "recency_days": 30})

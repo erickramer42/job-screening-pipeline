@@ -123,6 +123,29 @@ class FeedbackFiles(unittest.TestCase):
         # A digest row has no URL, and is matched by title and employer
         self.assertEqual(loaded[("data engineer", "beta")]["url"], "")
 
+    def test_a_line_that_matches_no_listing_in_its_run_is_reported(self):
+        self.write_run("2026-01-01",
+                       ("Senior Engineer (FDE) - Media", "Acme", ""),
+                       ("Data Engineer", "Beta", ""))
+        (self.folder / "2026-01-01.md").write_text(
+            "1 [n] Senior Engineer (FDE) | Acme :: shortened\n"
+            "2 [m] data engineer | BETA ::\n", encoding="utf-8")
+        with mock.patch("builtins.print") as printed:
+            loaded = verdicts.load_verdicts(self.folder)
+        warnings = [c.args[0] for c in printed.call_args_list]
+        self.assertEqual(len(warnings), 1)
+        self.assertIn(":1:", warnings[0])
+        self.assertIn("matches no listing", warnings[0])
+        # Kept: the listing can come back under that title
+        self.assertIn(("senior engineer (fde)", "acme"), loaded)
+
+    def test_a_file_without_its_run_isnt_checked(self):
+        (self.folder / "2026-01-01.md").write_text(
+            "1 [n] Senior Engineer | Acme ::\n", encoding="utf-8")
+        with mock.patch("builtins.print") as printed:
+            verdicts.load_verdicts(self.folder)
+        printed.assert_not_called()
+
     def test_combined_flags(self):
         (self.folder / "2026-01-01.md").write_text(
             "1 [m,a] Senior Engineer | Acme :: maybe, applied anyway\n"

@@ -119,12 +119,15 @@ def score_cap_rule(n, c):
     rule["max_score"] = int(c["max_score"])
     return rule
 
-def count_setting(cfg, key, default):
-    """A whole-number count from config. A negative one is a config
-    mistake: a shortlist section of -1 rows would list every row."""
+def count_setting(cfg, key, default, minimum=0):
+    """A whole-number count from config. One below minimum is a config
+    mistake: a shortlist section of -1 rows would list every row, and a
+    batch of 0 listings can't be sent."""
     n = int(cfg.get(key, default))
-    if n < 0:
-        raise ValueError(f"{key} is {n}; it can't be negative")
+    if n < minimum:
+        need = "can't be negative" if minimum == 0 else \
+            f"it must be at least {minimum}"
+        raise ValueError(f"{key} is {n}; {need}")
     return n
 
 def configure(cfg):
@@ -144,15 +147,15 @@ def configure(cfg):
     # days are rejected as stale before ranking. Board postings are
     # exempt: their freshness is enforced by the archive mechanism in
     # board_fetch.py, not by age. 0 or missing disables the window.
-    RECENCY_DAYS = int(cfg.get("recency_days", 0))
+    RECENCY_DAYS = count_setting(cfg, "recency_days", 0)
     # Listings per pass-1 request. Fewer means shorter responses, which
     # matters only if responses start coming back truncated
-    PASS1_BATCH = int(cfg.get("pass1_batch", 30))
+    PASS1_BATCH = count_setting(cfg, "pass1_batch", 30, minimum=1)
     # Second pass: how many top description-bearing rows to re-score,
     # how many per request, and the excerpt cap fed to the model.
     RERANK_TOP_N = count_setting(cfg, "rerank_top_n", 15)
-    RERANK_BATCH = int(cfg.get("rerank_batch", 5))
-    EXCERPT_CHARS = int(cfg.get("excerpt_chars", 1500))
+    RERANK_BATCH = count_setting(cfg, "rerank_batch", 5, minimum=1)
+    EXCERPT_CHARS = count_setting(cfg, "excerpt_chars", 1500)
     # At most this many shortlist rows from one employer, across both
     # sections (0: no limit). The ones passed over are counted under the
     # tables and stay in the JSON
@@ -204,7 +207,7 @@ def configure(cfg):
     # The model's context window per request, in tokens: the system
     # prompt, the batch, and the response (and with thinking on, the
     # reasoning, which is what used to overflow it)
-    NUM_CTX = int(cfg.get("num_ctx", 8192))
+    NUM_CTX = count_setting(cfg, "num_ctx", 8192, minimum=1)
     # Pass 2 over every listing with posting text, each in its own
     # request, through the score cache (rerank_top_n and rerank_batch are
     # then unused). In a batch, a score moves ~9 points with its
@@ -669,16 +672,20 @@ def parse_scores(text, batch_size, attempt):
 
 def request_scores(system, user, batch):
     """Score one batch with retries. Returns {index: {"score",
-    "reason"}}: complete as soon as one attempt covers every index,
-    otherwise the most complete attempt (possibly {}). Every problem
-    with a response's content is retried. TRANSPORT_ERRORS propagate,
-    unless an earlier attempt returned scores: those are returned, like
-    any partial result. RequestRejected always propagates."""
+    "reason", "attempt"}}: complete as soon as one attempt covers every
+    index, otherwise the most complete attempt (possibly {}). attempt is
+    the one that answered: only the first is greedy, so a later one's
+    score is a sample and needn't repeat. Every problem with a
+    response's content is retried. TRANSPORT_ERRORS propagate, unless an
+    earlier attempt returned scores: those are returned, like any
+    partial result. RequestRejected always propagates."""
     best = {}
     for attempt in range(1, MAX_ATTEMPTS + 1):
         try:
             scores = parse_scores(ollama_chat(system, user, attempt),
                                   len(batch), attempt)
+            for s in scores.values():
+                s["attempt"] = attempt
         except ValueError as e:
             print(f"    [attempt {attempt}] unusable response ({e}) "
                   f"— retrying")
@@ -979,10 +986,13 @@ def rerank_per_listing(kept, aborted, rescore=False):
         nonlocal stored
         apply_rerank(batch, scores)
         j, s = batch[0], scores[0]
+        # attempt > 1: a sampled retry's score, which --rescore may not
+        # reproduce
         score_cache.store(cache, keys[id(j)], s["score"], s["reason"], today,
                           title=j["title"], employer=j["employer"],
                           location=j["location"],
-                          prompt_sha=fingerprint(SYSTEM_PROMPT))
+                          prompt_sha=fingerprint(SYSTEM_PROMPT),
+                          attempt=s.get("attempt", 1))
         stored += 1
         # A first run takes about 15 minutes: keep what's done
         if stored % REPORT_EVERY == 0:

@@ -20,7 +20,7 @@ import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from html_text import html_to_text
+from html_text import html_to_text, normalize_text
 from pipeline_common import configure_from_file, write_atomic
 
 IMAP_TIMEOUT = 60  # seconds per socket operation
@@ -122,24 +122,32 @@ def search_criteria(now=None):
     return f"(SINCE {start.day:02d}-{MONTHS[start.month - 1]}-{start.year})"
 
 def read_message(raw_email):
-    """(subject, sender, date, body) from a raw message. Subject and
+    """(subject, sender, date, text) from a raw message. Subject and
     sender are decoded; the date is the header as the email states it
-    (the parsed form would add a weekday it may not have). The body is
+    (the parsed form would add a weekday it may not have). The text is
     the text/plain part, or failing that the text/html one, decoded by
     the charset it declares (as UTF-8 when Python doesn't know that
-    charset); None when the message has neither."""
+    charset), with one field per line: the title / employer / location
+    / View quadruple jobs_screen.py parses. HTML goes through
+    html_to_text, where table cells and block tags become line breaks;
+    plain text keeps its lines and only has its whitespace normalized,
+    since the tag stripper would delete anything between a "<" and a
+    ">" in it ("Pay < $100k", "<https://...>"). None when the message
+    has neither part."""
     msg = email.message_from_bytes(raw_email, policy=email.policy.default)
     part = msg.get_body(preferencelist=("plain", "html"))
-    body = None
+    text = None
     if part is not None:
         try:
             body = part.get_content()
         except LookupError:  # unknown charset name
             body = part.get_payload(decode=True).decode("utf-8",
                                                         errors="replace")
+        text = (html_to_text(body) if part.get_content_subtype() == "html"
+                else normalize_text(body))
     date = next((v for k, v in msg.raw_items() if k.lower() == "date"), "")
     return (str(msg.get("Subject", "")), str(msg.get("From", "")),
-            date, body)
+            date, text)
 
 def digest_name(uidvalidity, uid):
     """A digest's filename. A UID is unique only within one UIDVALIDITY:
@@ -268,23 +276,17 @@ def main():
             fetch_failures += 1
             continue
 
-        subject, sender, date_raw, body = read_message(raw_email)
-        if body:
-            # One field per line: the title / employer / location / View
-            # quadruple jobs_screen.py parses. Plain text keeps its
-            # lines; in HTML, table cells and block tags become line
-            # breaks, so an HTML digest still yields one field per line
-            clean_text = html_to_text(body)
-        else:
+        subject, sender, date_raw, text = read_message(raw_email)
+        if not text:
             # Still written, with no listings, so the message isn't
             # downloaded again on every run; counted in the summary
             print(f"No body found: {subject[:50]}... ({filepath.name} "
                   f"written without listings)")
             no_body += 1
-            clean_text = ""
+            text = ""
 
         write_atomic(filepath, digest_record(subject, sender, date_raw,
-                                             uid, clean_text))
+                                             uid, text))
         processed += 1
         print(f"Ingested UID {uid}: {subject[:60]}... ({filepath.name})")
 

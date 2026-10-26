@@ -165,7 +165,7 @@ They write their fixtures to a temporary folder, mock the network, and need no p
   - the folder can't be opened, or the server doesn't report its UIDVALIDITY;
   - or a message can't be fetched.
 
-  It gives up on a server that doesn't respond within 60 seconds, and it never falls back to the inbox. Email bodies are decoded with the charset they declare. A message with no text part is saved without listings, so it isn't downloaded again; the summary line counts it.
+  It gives up on a server that doesn't respond within 60 seconds, and it never falls back to the inbox. Email bodies are decoded with the charset they declare. A plain-text body keeps its text as it is; only an HTML body goes through the tag stripper. A message with no text part is saved without listings, so it isn't downloaded again; the summary line counts it.
 - **Before scoring**, the screener checks Ollama.
   - If Ollama can't be reached, it exits with code 2 and writes nothing.
   - If it's running without the model, it exits 1 straight away, since a retry wouldn't help.
@@ -183,7 +183,7 @@ They write their fixtures to a temporary folder, mock the network, and need no p
     - When pass 1 has to stop, pass 2 still takes its cached scores; only its requests are skipped.
     - The cache is saved every 25 new scores and at the end, so a run that stops partway keeps what it scored. The exit-2 path writes nothing, the cache included.
   - **A recent digest yields no listings** though it has text: the shortlist names the file in a warning, since the digest's format has probably changed. The exit code doesn't change.
-- **Board fetch** reports a failed board and moves on to the next one.
+- **Board fetch** stops with one line if `boards.json` is missing, isn't valid JSON, or isn't a list. Otherwise it reports a failed board, with the error, and moves on to the next one. Only an HTTP 404 suggests checking the entry's slug; a timeout or a server error is the platform's.
   - A malformed `boards.json` entry (no slug, unknown platform) is reported and skipped the same way.
   - A failed board's files aren't archived.
   - Each board's log line starts with how many postings the API returned, so an empty board (a stale slug, say) can be told from one whose postings were all filtered out.
@@ -202,7 +202,7 @@ A short daily loop keeps the ranking honest, and gives it something to be measur
    - Replace `?` with `y` (would apply), `m` (maybe) or `n` (no), and add notes after `::`.
    - Add `a` when you've applied, with a comma: `[m,a]` is a maybe you applied to anyway, and `[a]` alone records only the application.
    - A row whose flags can't be read is reported with its file and line number whenever the screener or `verdicts.py` reads the folder. That covers an unknown letter, or two verdicts like `[y,n]`. It isn't skipped silently.
-   - Keep `title | employer` as written: it identifies the listing, so a verdict stays valid on later days. A board row is also matched by its posting URL, from that day's `out/ranked_<date>.json`, so its verdict survives an edit to the title.
+   - Keep `title | employer` as written: it identifies the listing, so a verdict stays valid on later days. A board row is also matched by its posting URL, from that day's `out/ranked_<date>.json`, so its verdict survives the employer editing the title. A line whose listing isn't in that day's run, usually because its title was edited in the file, is reported with its file and line number, since that verdict may match nothing.
    - A later line on the same listing updates your verdict rather than replacing it. `[a]` alone keeps the earlier y/m/n, an empty note keeps the earlier note, and "applied" stays set once given.
    - Other lines are free notes, ignored by the parser.
    - **A rerun the same day:** while the file is still the untouched template, it's rewritten for the rerun's rows. Once you've filled anything in, only the rows new to the list are appended, under a `# Rerun at HH:MM` comment; nothing already in the file changes. The `feedback/` folder is gitignored.
@@ -291,8 +291,8 @@ The script tries common slug spellings on all four platforms and prints a `board
 - **VERIFIED only means the slug has postings.** A generic name can match a different company's board.
   - Greenhouse and SmartRecruiters name the company on their postings, so the line says what the board calls itself, and starts that note with CHECK when it differs from the name you gave.
   - Ashby and Lever don't name it, so open the board and check it before adding the line.
-- A company whose lookup fails (network down, a platform error) is reported as failed rather than as having no board, and the script then exits 1.
-- With no file argument, it takes employers that scored 60 or higher from the latest `out/ranked_*.json`. A file argument that doesn't exist stops the script instead.
+- A company whose lookup fails (network down, a platform error, or "too many requests") is reported as failed rather than as having no board, and the script then exits 1.
+- With no file argument, it takes employers that scored 60 or higher from the latest `out/ranked_*.json`. Those are ranked listings, after score caps, so employers you exclude or cap below 60 (staffing agencies, say) aren't probed. A file argument that doesn't exist stops the script instead.
 
 ## Tuning tips
 

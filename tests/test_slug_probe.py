@@ -30,6 +30,23 @@ class Candidates(unittest.TestCase):
             with mock.patch.object(sys, "argv", ["slug_probe.py", str(path)]):
                 self.assertEqual(slug_probe.candidates(), ["Acme", "Beta Co"])
 
+    def test_auto_mode_takes_ranked_employers_scoring_60_or_more(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp) / "out"
+            out.mkdir()
+            (out / "ranked_2026-01-02.json").write_text(json.dumps({
+                "ranked": [{"employer": "Acme", "score": 80},
+                           {"employer": "ACME", "score": 70},
+                           {"employer": "Not Available", "score": 65},
+                           # Capped by score_caps, as a staffing agency is
+                           {"employer": "Staffing Co", "score": 50},
+                           {"employer": "Beta", "score": 60}],
+                "rejected": []}), encoding="utf-8")
+            with mock.patch.object(sys, "argv", ["slug_probe.py"]), \
+                    mock.patch.object(slug_probe, "RUNS_DIR", out), \
+                    mock.patch("builtins.print"):
+                self.assertEqual(slug_probe.candidates(), ["Acme", "Beta"])
+
     def test_a_missing_file_stops_rather_than_probing_other_names(self):
         with tempfile.TemporaryDirectory() as tmp:
             argv = ["slug_probe.py", str(Path(tmp) / "targest.txt")]
@@ -75,6 +92,9 @@ class Probe(unittest.TestCase):
         for error in (urllib.error.URLError("down"),
                       urllib.error.HTTPError("u", 503, "Unavailable", None,
                                              None),
+                      # Throttled: the board may well exist
+                      urllib.error.HTTPError("u", 429, "Too Many Requests",
+                                             None, None),
                       TimeoutError()):
             with self.subTest(error=type(error).__name__), \
                     mock.patch("urllib.request.urlopen", side_effect=error):

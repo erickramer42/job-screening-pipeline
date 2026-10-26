@@ -4,6 +4,7 @@ replaced by fixtures; nothing goes over the network."""
 import json
 import tempfile
 import unittest
+import urllib.error
 from pathlib import Path
 from unittest import mock
 
@@ -317,6 +318,36 @@ class SyncBoard(unittest.TestCase):
         f = self.out / name
         f.write_text(f"# Metadata\nSource: {source}\n", encoding="utf-8")
         return f
+
+    def test_a_broken_boards_json_is_one_line_not_a_traceback(self):
+        config = self.out.parent / "boards.json"
+        for text, says in (('[{"platform": "greenhouse",', "boards.json:"),
+                           ('{"platform": "greenhouse", "slug": "x"}',
+                            "must be a JSON list")):
+            with self.subTest(text=text):
+                config.write_text(text, encoding="utf-8")
+                with mock.patch.object(bf, "CONFIG", config), \
+                        mock.patch.object(bf, "configure_from_file",
+                                          lambda configure: configure(CONFIG)), \
+                        mock.patch.object(bf, "fetch_board") as fetch, \
+                        mock.patch("builtins.print") as printed:
+                    self.assertEqual(bf.main(), 1)
+                fetch.assert_not_called()
+                (line,) = [c.args[0] for c in printed.call_args_list]
+                self.assertTrue(line.startswith("[ERROR]"))
+                self.assertIn(says, line)
+
+    def test_only_a_404_points_at_the_slug(self):
+        not_found = urllib.error.HTTPError("u", 404, "Not Found", None, None)
+        self.assertIn("check the slug", bf.failure_text(not_found))
+        for error in (TimeoutError("timed out"),
+                      urllib.error.HTTPError("u", 503, "Unavailable", None,
+                                             None),
+                      KeyError("jobs")):
+            with self.subTest(error=type(error).__name__):
+                text = bf.failure_text(error)
+                self.assertNotIn("slug", text)
+                self.assertIn(type(error).__name__, text)
 
     def test_unchanged_posting_is_not_rewritten(self):
         self.sync(greenhouse_board())

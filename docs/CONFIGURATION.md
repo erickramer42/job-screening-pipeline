@@ -66,7 +66,7 @@ Board fetch applies these to postings, using the platforms' structured remote an
 | `shortlist_per_employer` | At most this many shortlist rows from one employer, across both sections, for example `3`; the rest are counted under the tables and stay in the JSON. `0` or missing means no limit. | `0` |
 | `no_verdict_cap` | The highest score for a listing whose latest verdict in `feedback/` is `n`. At that score it ranks below the listings you haven't judged. It's applied after both passes, so it doesn't change what pass 2 re-scores. `null` turns it off. | `50` |
 
-`rerank_top_n`, `shortlist_size`, `lookup_size`, `shortlist_per_employer` and `score_cache_days` can't be negative: a negative value stops the run as a config mistake.
+Count settings are checked at startup, and a value out of range stops the run as a config mistake. `pass1_batch`, `rerank_batch` and `num_ctx` must be at least 1. `recency_days`, `rerank_top_n`, `excerpt_chars`, `shortlist_size`, `lookup_size`, `shortlist_per_employer` and `score_cache_days` can't be negative.
 
 The pass-2 excerpt starts at the posting's role section: a heading such as "What you'll do", "Responsibilities" or "Job description". Failing that, it starts at a similar phrase in the first half of the description. Mentions inside closing EEO or pay text are ignored. It's cut at a sentence or line end.
 
@@ -92,6 +92,7 @@ Pass 1 is always batched. It reads only title, employer and location, and the ot
   - The cache holds the model's own score. `score_caps` and `no_verdict_cap` are applied afterwards, so changing a cap re-scores nothing.
   - **Cost:** about 3.2 s per request with the default model. The first run re-scores every posting, about 15 minutes for 270, on top of pass 1's 4 minutes. After that, a day re-scores only its new or changed postings.
   - `python jobs_screen.py --rescore` sends every pass-2 request again and replaces its cache entry, for example after an Ollama update that could change the model's output.
+  - Each entry records the attempt that answered. Only the first is greedy, so an entry with `"attempt": 2` or more came from a sampled retry, and `--rescore` may not reproduce it.
   - Entries no run has used for `score_cache_days` (30) are dropped when the cache is saved. An unreadable cache file is renamed to `score_cache.json.bad`, and every posting is re-scored.
 
 ## Score caps
