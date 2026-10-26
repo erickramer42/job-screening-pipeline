@@ -102,8 +102,10 @@ def configure(cfg):
     a bad title pattern re.error."""
     global PAY_FLOOR, location_ok, TITLE_RE, TITLE_BLOCK_RE
     # Annual base salary floor: a posting is cut only when the top of
-    # its published range is below it
-    PAY_FLOOR = cfg.get("pay_floor", 0)
+    # its published range is below it. Read as a number here, so a
+    # mistyped value stops the run as a config mistake instead of
+    # failing every board's comparison
+    PAY_FLOOR = int(cfg.get("pay_floor", 0) or 0)
     # Postings in a configured metro city, or remote postings open to
     # the US (the screener applies the same rule to digest rows)
     location_ok = location_matcher(cfg["metro_cities"],

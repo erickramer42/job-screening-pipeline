@@ -152,5 +152,4 @@ Bullets under a "Nice to have" heading still match, because a line can't see its
 | `EMAIL_PASSWORD` (or the name in `email_password_env`) | IMAP password. Required for ingest. | none |
 | `OLLAMA_URL` | Ollama server address. | `http://localhost:11434` |
 | `SCREEN_MODEL` | Ollama model tag used for ranking. | `gemma4:12b` |
-| `EMAIL_IMAP_HOST`, `EMAIL_IMAP_PORT` | Fallbacks, used only when `imap_host` / `imap_port` are missing from the config. | none |
 | `PYTHONUTF8` | Set to `1` on Windows so output redirected to log files is written as UTF-8. Set it in your scheduled-run wrappers, or once with `setx`. | not set |

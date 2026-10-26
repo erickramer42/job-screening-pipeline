@@ -99,7 +99,7 @@ Each of these was measured before and after the change. [docs/CHANGELOG.md](docs
   - A partial run, in either pass, still writes the shortlist, flagged at the top, and exits 1.
   - A preflight check tells an Ollama outage apart from a model that isn't installed, and a request Ollama rejects stops the run with its reason instead of being retried.
 - **Atomic writes.** Every file is written through a temporary file, so a killed run never leaves a truncated one.
-- **196 `unittest` tests**, which need no network and no personal config. They include the contracts between stages:
+- **198 `unittest` tests**, which need no network and no personal config. They include the contracts between stages:
   - what ingest and board fetch write must parse in the screener;
   - the board-file layout is pinned byte for byte;
   - each exit code, with the screener run end to end against a stand-in model.
@@ -127,9 +127,11 @@ Email ingest (`python job_ingest.py`) also needs IMAP credentials in environment
 |------|------|
 | `job_ingest.py` | Reads job-alert emails over IMAP, read-only |
 | `board_fetch.py` | Fetches postings from the public board APIs |
-| `jobs_screen.py` | Parsing, filters, two-pass LLM ranking, and the shortlist |
-| `verdicts.py` | Reads the owner's verdicts and scores a run against them |
+| `jobs_screen.py` | Parsing, filters, and the two LLM passes |
+| `ollama_client.py` | Requests to the local model, and validation and repair of its answers |
+| `shortlist.py` | Writes the Markdown shortlist and the verdict template |
 | `score_cache.py` | Keeps per-listing pass-2 scores between runs |
+| `verdicts.py` | Reads the owner's verdicts and scores a run against them |
 | `html_text.py`, `location_filter.py`, `pipeline_common.py` | Shared code: HTML to text, the search-area rule, config loading and atomic writes |
 | `slug_probe.py` | Finds a company's board on the four platforms |
 | `run_*.bat.example`, `wrapper_helper.py` | The scheduled-run wrappers, and the date decisions they leave to Python |

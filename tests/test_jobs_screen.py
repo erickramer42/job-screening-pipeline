@@ -21,7 +21,9 @@ from unittest import mock
 
 import board_fetch
 import jobs_screen as js
+import ollama_client as client
 import pipeline_common
+import shortlist
 
 CONFIG = {
     "excluded_employers": ["Excluded Co"],
@@ -304,104 +306,14 @@ class ScoreCaps(unittest.TestCase):
         self.assertEqual((j["pass1_score"], j["pass1_capped_from"],
                           j["score"], j["capped_from"]), (50, 72, 50, 80))
 
-class ModelResponses(unittest.TestCase):
-    def test_zero_based_indices_are_kept(self):
-        rows = [(0, 70, "a"), (1, 40, "b")]
-        self.assertEqual(js.align_indices(rows, 2),
-                         {0: {"score": 70, "reason": "a"},
-                          1: {"score": 40, "reason": "b"}})
-
-    def test_one_based_indices_are_shifted(self):
-        self.assertEqual(sorted(js.align_indices([(1, 70, "a"), (2, 40, "b")],
-                                                 2)), [0, 1])
-
-    def test_ambiguous_numbering_is_rejected(self):
-        with self.assertRaises(ValueError):
-            js.align_indices([(1, 70, "a")], 3)
-
-    def test_out_of_range_indices_are_dropped(self):
-        self.assertEqual(list(js.align_indices([(0, 1, ""), (5, 2, "")], 2)),
-                         [0])
-
-    def test_truncated_response_is_salvaged(self):
-        text = ('{"scores": [{"index": 0, "score": 70, "reason": "ok"}, '
-                '{"index": 1, "score": 6')
-        with mock.patch("builtins.print"):
-            self.assertEqual(js.parse_scores(text, 2, 1),
-                             {0: {"score": 70, "reason": "ok"}})
-
-    def test_salvage_never_invents_an_entry(self):
-        with self.assertRaises(ValueError):
-            js.salvage_scores('{"scores": [{"index": 0, "reason": "a } b')
-
-    def test_unusable_responses(self):
-        for text in ("", "   ", "[1, 2]", '{"scores": null}'):
-            with self.subTest(text=text), self.assertRaises(ValueError):
-                js.parse_scores(text, 1, 1)
-
-    def test_scores_are_clamped_and_bad_entries_dropped(self):
-        text = ('{"scores": [{"index": 0, "score": 150, "reason": "x"}, '
-                '{"index": 1, "score": "high"}, "junk"]}')
-        self.assertEqual(js.parse_scores(text, 2, 1),
-                         {0: {"score": 100, "reason": "x"}})
-
-    def test_a_failed_retry_keeps_the_earlier_partial_result(self):
-        answers = iter([json.dumps({"scores": [
-            {"index": 0, "score": 70, "reason": "a"}]}), TimeoutError()])
-        def chat(system, user, attempt=1):
-            answer = next(answers)
-            if isinstance(answer, Exception):
-                raise answer
-            return answer
-        with mock.patch.object(js, "ollama_chat", chat), \
-                mock.patch("builtins.print"):
-            self.assertEqual(js.request_scores("s", "u", [{}, {}]),
-                             {0: {"score": 70, "reason": "a", "attempt": 1}})
-
-    def test_the_answering_attempt_is_recorded(self):
-        answers = iter(["not json", json.dumps({"scores": [
-            {"index": 0, "score": 55, "reason": "b"}]})])
-        with mock.patch.object(js, "ollama_chat",
-                               lambda system, user, attempt=1: next(answers)), \
-                mock.patch("builtins.print"):
-            self.assertEqual(js.request_scores("s", "u", [{}]),
-                             {0: {"score": 55, "reason": "b", "attempt": 2}})
-
-    def test_a_failed_first_attempt_fails_the_batch(self):
-        with mock.patch.object(js, "ollama_chat", side_effect=TimeoutError()):
-            with self.assertRaises(TimeoutError):
-                js.request_scores("s", "u", [{}])
-
-    def http_error(self, code, reason, body):
-        return urllib.error.HTTPError("http://localhost:11434/api/chat",
-                                      code, reason, {}, io.BytesIO(body))
-
-    def test_a_4xx_is_rejected_with_ollamas_reason(self):
-        error = self.http_error(
-            400, "Bad Request",
-            b'{"error": "\\"gemma\\" does not support thinking"}')
-        with mock.patch("urllib.request.urlopen", side_effect=error), \
-                self.assertRaises(js.RequestRejected) as cm:
-            js.ollama_chat("s", "u")
-        self.assertEqual(str(cm.exception), 'HTTP 400 Bad Request: "gemma" '
-                                            'does not support thinking')
-
-    def test_a_5xx_is_a_transport_error_with_ollamas_reason(self):
-        error = self.http_error(500, "Internal Server Error",
-                                b'{"error": "model requires more memory"}')
-        with mock.patch("urllib.request.urlopen", side_effect=error), \
-                self.assertRaises(js.TRANSPORT_ERRORS) as cm:
-            js.ollama_chat("s", "u")
-        self.assertNotIsInstance(cm.exception, js.RequestRejected)
-        self.assertIn("model requires more memory", str(cm.exception))
-
+class RequestText(unittest.TestCase):
     def test_request_text_is_pinned(self):
         # The request text is part of what's scored: changing it changes
         # scores, so a change here should be deliberate
         job = {"title": "Senior Engineer", "employer": "Acme",
                "location": "Springfield",
                "description": "About the role\nBuild things."}
-        with mock.patch.object(js, "request_scores",
+        with mock.patch.object(client, "request_scores",
                                side_effect=lambda system, user, batch: user):
             pass1, pass2 = js.score_batch([job]), js.score_rerank([job])
         reply = ('Respond with STRICT JSON only, format: {"scores": '
@@ -416,13 +328,6 @@ class ModelResponses(unittest.TestCase):
                                 f"the posting text. {reply}\n\nJobs:\n0: "
                                 f"Senior Engineer | Acme | Springfield\n"
                                 f"POSTING: About the role\nBuild things.")
-
-    def test_model_available(self):
-        tags = {"models": [{"name": "gemma4:12b"}, {"name": "other:latest"}]}
-        self.assertTrue(js.model_available(tags, "gemma4:12b"))
-        self.assertTrue(js.model_available(tags, "other"))
-        self.assertFalse(js.model_available(tags, "gemma4"))
-        self.assertFalse(js.model_available({}, "gemma4:12b"))
 
 class RoleExcerpt(unittest.TestCase):
     def test_starts_at_a_heading(self):
@@ -490,10 +395,9 @@ class Shortlist(unittest.TestCase):
         js.configure(CONFIG)
 
     def test_per_employer_limit_ignores_case(self):
-        js.configure({**CONFIG, "shortlist_per_employer": 1})
         ranked = [{"title": f"Role {i}", "employer": e}
                   for i, e in enumerate(["Acme", "ACME", "Beta", "acme"])]
-        (rows,), more = js.shortlist_rows((ranked, 25))
+        (rows,), more = shortlist.shortlist_rows((ranked, 25), per_employer=1)
         self.assertEqual([j["title"] for j in rows], ["Role 0", "Role 2"])
         self.assertEqual(dict(more), {"Acme": 2})
         self.assertEqual([j["title"] for j in ranked
@@ -502,17 +406,16 @@ class Shortlist(unittest.TestCase):
     def test_a_section_stops_at_its_size(self):
         ranked = [{"title": f"Role {i}", "employer": f"Co {i}"}
                   for i in range(4)]
-        (rows,), more = js.shortlist_rows((ranked, 2))
+        (rows,), more = shortlist.shortlist_rows((ranked, 2))
         self.assertEqual([j["title"] for j in rows], ["Role 0", "Role 1"])
         self.assertEqual(more, {})
 
     def test_the_per_employer_limit_spans_both_sections(self):
-        js.configure({**CONFIG, "shortlist_per_employer": 2})
         main = [{"title": f"Board {i}", "employer": "Acme"} for i in range(3)]
         lookup = [{"title": f"Digest {i}", "employer": "ACME"}
                   for i in range(3)]
-        (rows, lookup_rows), more = js.shortlist_rows((main, 15),
-                                                      (lookup, 10))
+        (rows, lookup_rows), more = shortlist.shortlist_rows(
+            (main, 15), (lookup, 10), per_employer=2)
         self.assertEqual([j["title"] for j in rows], ["Board 0", "Board 1"])
         self.assertEqual(lookup_rows, [])
         # One entry under the first spelling, not one per section
@@ -605,7 +508,7 @@ class VerdictTemplate(unittest.TestCase):
         return [{"title": t, "employer": "Acme"} for t in titles]
 
     def write(self, *titles):
-        return js.write_verdict_template(self.path, self.STAMP,
+        return shortlist.write_verdict_template(self.path, self.STAMP,
                                          self.rows(*titles))
 
     def test_a_new_file_gets_the_template(self):
@@ -708,7 +611,7 @@ class MainRunBase(SourceFiles):
         the real Ollama check."""
         out = io.StringIO()
         with contextlib.ExitStack() as stack:
-            stack.enter_context(mock.patch.object(js, "ollama_chat", model))
+            stack.enter_context(mock.patch.object(client, "ollama_chat", model))
             if preflight:
                 stack.enter_context(mock.patch.object(js, "ollama_preflight"))
             stack.enter_context(contextlib.redirect_stdout(out))
@@ -754,7 +657,7 @@ class MainRun(MainRunBase):
         data = self.ranked()
         run = data["run"]
         self.assertEqual((run["model"], run["prompt_sha"], run["pass1_batch"]),
-                         (js.MODEL, js.fingerprint("Rank jobs."), 2))
+                         (client.MODEL, js.fingerprint("Rank jobs."), 2))
         self.assertEqual(run["score_caps_sha"], js.fingerprint(
             json.dumps(CONFIG["score_caps"], sort_keys=True)))
         rows = data["ranked"] + data["rejected"]
@@ -788,7 +691,7 @@ class MainRun(MainRunBase):
         self.assertEqual(self.written(), [])
 
     def test_a_rejected_request_writes_nothing_and_stops_at_once(self):
-        model = FakeModel(js.RequestRejected("HTTP 400 Bad Request: "
+        model = FakeModel(client.RequestRejected("HTTP 400 Bad Request: "
                                              "no thinking"))
         code, printed = self.run_main(model)
         # 1, not 2: the wrapper's retry would send the same request
@@ -1084,7 +987,7 @@ class PerListingRerank(MainRunBase):
                                 ("Senior Engineer", "Zeta",
                                  "About the role\nNew."))]
         model = FakeModel()
-        with mock.patch.object(js, "ollama_chat", model), \
+        with mock.patch.object(client, "ollama_chat", model), \
                 mock.patch("builtins.print"):
             failed, counts = js.rerank_per_listing(jobs, aborted="failures")
         self.assertEqual(model.requests, [])
@@ -1124,26 +1027,9 @@ class ContextUse(unittest.TestCase):
     def setUp(self):
         js.configure(CONFIG)
 
-    def test_a_request_records_its_prompt_and_response_tokens(self):
-        body = json.dumps({"message": {"content": "{}"},
-                           "prompt_eval_count": 2118, "eval_count": 46})
-        with mock.patch.object(js, "CONTEXT_USED", 0), \
-                mock.patch("urllib.request.urlopen",
-                           return_value=io.BytesIO(body.encode())):
-            js.ollama_chat("s", "u")
-            self.assertEqual(js.CONTEXT_USED, 2164)
-
-    def test_a_response_without_counts_records_nothing(self):
-        body = json.dumps({"message": {"content": "{}"}})
-        with mock.patch.object(js, "CONTEXT_USED", 0), \
-                mock.patch("urllib.request.urlopen",
-                           return_value=io.BytesIO(body.encode())):
-            js.ollama_chat("s", "u")
-            self.assertEqual(js.CONTEXT_USED, 0)
-
     def run_pass(self, used):
         def scorer(batch):
-            js.CONTEXT_USED = max(js.CONTEXT_USED, batch[0]["used"])
+            client.CONTEXT_USED = max(client.CONTEXT_USED, batch[0]["used"])
             return {0: {"score": 1, "reason": ""}}
         out = io.StringIO()
         with mock.patch.dict(js.CONTEXT_PEAKS, clear=True), \

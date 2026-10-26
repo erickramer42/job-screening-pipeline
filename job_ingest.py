@@ -55,9 +55,11 @@ def configure(cfg):
     setting that must stop the run: fail closed, no silent defaults."""
     global IMAP_HOST, IMAP_PORT, IMAP_STARTTLS, IMAP_TLS_VERIFY
     global IMAP_CAFILE, RECENCY_DAYS, USER_ENV, PASSWORD_ENV, MAIL_FOLDER
-    IMAP_HOST = cfg.get("imap_host", os.getenv("EMAIL_IMAP_HOST", ""))
+    # Required; main() stops without it. Config only, like every setting
+    # but the credentials
+    IMAP_HOST = cfg.get("imap_host", "")
     # 993 is the standard implicit-TLS IMAP port
-    IMAP_PORT = int(cfg.get("imap_port", os.getenv("EMAIL_IMAP_PORT", "993")))
+    IMAP_PORT = int(cfg.get("imap_port", 993))
     # True for servers that expect a plain connect upgraded with
     # STARTTLS; False (default) uses implicit TLS
     IMAP_STARTTLS = cfg.get("imap_starttls", False)

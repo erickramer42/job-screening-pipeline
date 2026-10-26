@@ -208,6 +208,12 @@ class Configure(unittest.TestCase):
         ji.configure({"imap_host": "127.0.0.1", "imap_tls_verify": False})
         self.assertFalse(ji.tls_context().check_hostname)
 
+    def test_the_imap_host_comes_from_config_only(self):
+        env = {"EMAIL_IMAP_HOST": "imap.example.com", "EMAIL_IMAP_PORT": "143"}
+        with mock.patch.dict("os.environ", env):
+            ji.configure({})
+        self.assertEqual((ji.IMAP_HOST, ji.IMAP_PORT), ("", 993))
+
     def test_verified_tls_by_default(self):
         ji.configure({"imap_host": "imap.example.com"})
         self.assertTrue(ji.tls_context().check_hostname)

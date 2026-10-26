@@ -13,7 +13,7 @@ Ordering-agreement figures labelled "in-sample" were measured against the very v
     - a day with no changed posting takes 4.5 minutes; the first run adds about 15 minutes of pass-2 requests.
   - **Timing:** 3.2 s per single-listing request. Warm repeats are exact (20 listings, three rounds); the first request after the model loads can differ.
   - **Batch mode is unchanged:** on 10-25 data with a stand-in model, the committed and new code sent the same 25 requests and wrote identical files, apart from new fields in the JSON's `run` record. The 10-26 scheduled run already used the new code in batch mode.
-  - **Long runs stall while the PC idles:** the all-listings scratch run took 3 h 20 min for 36 minutes of requests. Ollama was idle through every pause, so the script itself stopped. Sleep is off; the cause isn't confirmed.
+  - **A shared Ollama stalls a long run:** the all-listings scratch run took 3 h 20 min for 36 minutes of requests. Another project was using the same Ollama with a different model: its log shows 144 requests of over a minute (18,410 s in all) and 171 model loads in that window, as the two models swapped in and out. The screener's requests waited their turn. (First written as an idle-PC stall; the server log, read in full, showed otherwise.) So the cache's first fill should run while nothing else uses Ollama. A scratch cache filled during that run shouldn't seed the real one either: the first request after a model load can score differently from a warm one.
 - **Context use is logged:** each pass logs its largest request against `num_ctx`, warns at the limit, and the JSON's `run.peak_context` records it. Ollama's `prompt_eval_count` counts the whole prompt, even a cached prefix. On 10-26: 4,032 tokens per pass-1 batch and 4,065 per pass-2 batch, of 8,192; a single-listing request uses 2,700 at most.
 - **`jobs_screen.py --rescore`**, and an unknown argument stops the run with exit 1.
 - **Tests:** 186, up from 158.
@@ -26,6 +26,13 @@ Ordering-agreement figures labelled "in-sample" were measured against the very v
   - **Board fetch:** a `boards.json` with a syntax error, or that isn't a list, stops the run with one line instead of a traceback. A failed board's log line names the error, and suggests checking its slug only for an HTTP 404.
   - **The score cache records which attempt answered.** Only the first is greedy, so an entry from a sampled retry (`"attempt": 2`) may not repeat on `--rescore`.
   - **Tests:** 196.
+- **`jobs_screen.py` is split in three,** without changing what it does. It had grown to about 1,200 lines doing five jobs. Now:
+  - `ollama_client.py` holds the model requests, the retries, and the checks and repairs on the model's answers. It only raises errors; what they mean for the run's exit code stays in the screener, along with the Ollama preflight.
+  - `shortlist.py` writes the Markdown shortlist and the verdict template.
+  - `jobs_screen.py` (about 900 lines) keeps parsing, filtering, the two passes and the run itself.
+  - **Checked** on 10-26 data with a stand-in model: the code before and after sent the same 25 requests and wrote identical files in batch mode, and with `per_listing_rerank` on, the same 280 requests, an identical shortlist and an identical score cache. The client's tests moved to `tests/test_ollama_client.py`.
+- **Settings come from one place:** ingest no longer falls back to `EMAIL_IMAP_HOST` and `EMAIL_IMAP_PORT` when the config lacks `imap_host` or `imap_port`; only the credentials come from the environment. Board fetch reads `pay_floor` as a number at startup, so a typo is a config mistake rather than a failure on every board.
+- **Tests:** 198.
 
 ## 2026-10-25
 - **The stability baseline is in:** the 10-24 and 10-25 scheduled runs used one prompt and model. On the 372 listings they shared, unchanged both days, title-only scores moved 2.7 points on average (11 of 309 by 20 or more), and re-scored ones 9.5 (7 of 57). The score cache should bring both to 0.

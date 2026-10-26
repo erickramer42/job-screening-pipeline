@@ -40,7 +40,7 @@ The goal is a focused daily application routine (~10 highest-quality matches per
 ### Recent changes
 
 The full history, with the measurements behind each change, is in [docs/CHANGELOG.md](docs/CHANGELOG.md). The last few days:
-- **2026-10-26:** pass 2 can re-score every posting in its own request, through a score cache (`per_listing_rerank`, built and off until it's switched on). Each pass logs how much of the model's context it used. A whole-project review fixed seven smaller problems, among them a verdict that could be dropped without a warning.
+- **2026-10-26:** pass 2 can re-score every posting in its own request, through a score cache (`per_listing_rerank`, built and off until it's switched on). Each pass logs how much of the model's context it used. A whole-project review fixed seven smaller problems, among them a verdict that could be dropped without a warning, and split the screener's model client and output writers into modules of their own.
 - **2026-10-25:** the first pair of daily runs under one prompt gave the stability baseline. The ranking prompt's candidate profile is now weighted by how recent each skill is.
 - **2026-10-24:** listings ranked on their title alone get their own "Needs lookup" section, and a "no" verdict holds a listing down on later days.
 - **2026-10-23:** board files follow edits to their posting; the scheduled runs recover from a restart or a stopped Ollama on their own; the test suite and end-to-end exit-code tests.
@@ -68,6 +68,8 @@ jobScreensApplications/
 │                                #   remote/US check, pay floor
 ├── jobs_screen.py               # Parser + recency/hard filters + two-pass
 │                                #   LLM ranker -> out/
+├── ollama_client.py             # Model requests; validates and repairs answers
+├── shortlist.py                 # Writes the shortlist and the verdict template
 ├── html_text.py                 # Shared HTML-to-text conversion (ingest + boards)
 ├── location_filter.py           # Shared search-area rule (boards + digest filter)
 ├── pipeline_common.py           # Shared config loading, description marker,
@@ -176,7 +178,7 @@ The wrappers are gitignored; `run_ingest.bat.example` and `run_screen.bat.exampl
 
 ### Prerequisites for unattended runs
 1. The IMAP server must be reachable; if it runs locally, set it to auto-start with Windows
-2. Ollama service must be running — set Ollama to launch at login or install as a service. The screening wrapper also starts the Ollama app before a retry, from its default install folder.
+2. Ollama service must be running — set Ollama to launch at login or install as a service. The screening wrapper also starts the Ollama app before a retry, from its default install folder. Nothing else should be using Ollama at 06:00: another project's model swaps in and out with the screener's, and on 10-25 that made a 36-minute run take 3 h 20 min.
 3. `EMAIL_USER` and `EMAIL_PASSWORD` must be set as Windows user environment variables (see below)
 4. Check Task Scheduler's **Last Run Result** and `logs/` after the first automated nights:
    - `logs/errors.log` gets one timestamped line per failed step (`ingest FAILED`, `board fetch FAILED`, `screen FAILED`), after retries.

@@ -51,7 +51,10 @@ The scripts share three small modules:
 - `location_filter.py`: the search-area rule, used by board fetch and the screener.
 - `pipeline_common.py`: config loading, the description marker in board files, email date parsing, and atomic writes, used by all three scripts.
 
-The screener keeps per-listing pass-2 scores with `score_cache.py`.
+The screener has three modules of its own:
+- `ollama_client.py`: requests to the model, and the checks and repairs on its answers (see [When something fails](#when-something-fails)).
+- `shortlist.py`: the Markdown shortlist and the verdict template.
+- `score_cache.py`: per-listing pass-2 scores kept between runs.
 
 `verdicts.py` reads your verdicts on shortlist rows and scores a run against them (see [Reviewing the shortlist](#reviewing-the-shortlist)).
 

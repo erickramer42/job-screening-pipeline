@@ -498,5 +498,11 @@ class Configure(unittest.TestCase):
         bf.configure({**CONFIG, "included_title_patterns": []})
         self.assertTrue(bf.TITLE_RE.search("Anything"))
 
+    def test_a_pay_floor_that_isnt_a_number_stops_at_startup(self):
+        with self.assertRaises(ValueError):
+            bf.configure({**CONFIG, "pay_floor": "100k"})
+        bf.configure({**CONFIG, "pay_floor": None})
+        self.assertEqual(bf.PAY_FLOOR, 0)
+
 if __name__ == "__main__":
     unittest.main()
