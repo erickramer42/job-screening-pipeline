@@ -53,18 +53,20 @@ Board fetch applies these to postings, using the platforms' structured remote an
 |-----|---------|---------|
 | `recency_days` | Ingest leaves out digests that arrived more than this many days ago, plus one day, since its IMAP search counts arrival dates in whole days. The screener cuts digests older than this many days by their Date header. A listing still present in a newer digest stays. Board postings are exempt, because closed postings are archived instead. Digests with an unreadable date are kept, with a warning. `0` or missing disables the window. | `0` |
 | `pass1_batch` | Listings per pass-1 request. Lower it only if responses come back truncated. | `30` |
-| `rerank_top_n` | How many of the top pass-1 listings that have a description get re-scored in pass 2. Only those can fill the shortlist's main section. `0` turns pass 2 off, which leaves that section empty. | `15` |
-| `rerank_batch` | Listings per pass-2 request. | `5` |
+| `per_listing_rerank` | Pass 2 re-scores every listing that has a description, each in its own request, and keeps the scores in a cache. See [Per-listing pass 2](#per-listing-pass-2) below. | `false` |
+| `score_cache_days` | With `per_listing_rerank` on: a cache entry no run has used for this many days is dropped. `0` keeps every entry. | `30` |
+| `rerank_top_n` | How many of the top pass-1 listings that have a description get re-scored in pass 2. Only those can fill the shortlist's main section. `0` turns pass 2 off, which leaves that section empty. Unused with `per_listing_rerank`, which re-scores them all. | `15` |
+| `rerank_batch` | Listings per pass-2 request. Unused with `per_listing_rerank`. | `5` |
 | `excerpt_chars` | Maximum length of the posting excerpt sent per listing in pass 2. | `1500` |
 | `model_thinking` | Let a thinking model reason before it answers. See [Model thinking](#model-thinking) below. | `false` |
-| `num_ctx` | The model's context window per request, in tokens. It must hold the prompt, the batch and the response. | `8192` |
+| `num_ctx` | The model's context window per request, in tokens. It must hold the prompt, the batch and the response. Each pass logs its peak use against it. | `8192` |
 | `score_caps` | Upper score limits applied in code after each pass, for example `[{"employers": ["Acme Staffing"], "max_score": 50}]`. Optional. See [Score caps](#score-caps). | `[]` |
 | `shortlist_size` | Rows in the shortlist's main section: the top listings pass 2 re-scored against their posting text. | `15` |
 | `lookup_size` | Rows in the "Needs lookup" section: the top listings with a title-only score (digest rows, and board postings pass 2 didn't re-score), ranked on their own. `0` leaves the section empty. | `10` |
 | `shortlist_per_employer` | At most this many shortlist rows from one employer, across both sections, for example `3`; the rest are counted under the tables and stay in the JSON. `0` or missing means no limit. | `0` |
 | `no_verdict_cap` | The highest score for a listing whose latest verdict in `feedback/` is `n`. At that score it ranks below the listings you haven't judged. It's applied after both passes, so it doesn't change what pass 2 re-scores. `null` turns it off. | `50` |
 
-`rerank_top_n`, `shortlist_size`, `lookup_size` and `shortlist_per_employer` can't be negative: a negative value stops the run as a config mistake.
+`rerank_top_n`, `shortlist_size`, `lookup_size`, `shortlist_per_employer` and `score_cache_days` can't be negative: a negative value stops the run as a config mistake.
 
 The pass-2 excerpt starts at the posting's role section: a heading such as "What you'll do", "Responsibilities" or "Job description". Failing that, it starts at a similar phrase in the first half of the description. Mentions inside closing EEO or pay text are ignored. It's cut at a sentence or line end.
 
@@ -78,6 +80,19 @@ The pass-2 excerpt starts at the posting's role section: a heading such as "What
   - About 4× slower, and scores vary from run to run.
   - Long reasoning can overflow the context into empty or truncated responses, which are retried.
   - Greedy decoding isn't used, because the reasoning doesn't terminate.
+
+### Per-listing pass 2
+
+Pass 1 is always batched. It reads only title, employer and location, and the other listings in a batch give the model something to compare against: scored alone, most title-only listings got the same stock score.
+
+- **`false` (the default):** pass 2 re-scores the top `rerank_top_n` listings with posting text, `rerank_batch` per request. A pass-2 score moves about 9 points with the other listings in its request, and a listing below the cut is never read against its posting.
+- **`true`:** pass 2 re-scores every listing with posting text, each in its own request, through a score cache.
+  - The request text is the one a batch of one would send. Alone, a request repeats exactly, so its score can be kept.
+  - A request that has been sent before isn't sent again: its score comes from `out/score_cache.json`. The cache is keyed by a hash of the whole request: the model, `model_thinking`, `num_ctx`, the ranking prompt plus the pass-2 addendum, and the request text, which holds the title, employer, location and posting excerpt. So anything that changes what the model would see re-scores that listing, and nothing else does.
+  - The cache holds the model's own score. `score_caps` and `no_verdict_cap` are applied afterwards, so changing a cap re-scores nothing.
+  - **Cost:** about 3.2 s per request with the default model. The first run re-scores every posting, about 15 minutes for 270, on top of pass 1's 4 minutes. After that, a day re-scores only its new or changed postings.
+  - `python jobs_screen.py --rescore` sends every pass-2 request again and replaces its cache entry, for example after an Ollama update that could change the model's output.
+  - Entries no run has used for `score_cache_days` (30) are dropped when the cache is saved. An unreadable cache file is renamed to `score_cache.json.bad`, and every posting is re-scored.
 
 ## Score caps
 

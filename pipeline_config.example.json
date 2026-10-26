@@ -21,6 +21,8 @@
   "excerpt_chars": 1500,
   "model_thinking": false,
   "num_ctx": 8192,
+  "per_listing_rerank": false,
+  "score_cache_days": 30,
   "shortlist_size": 15,
   "lookup_size": 10,
   "shortlist_per_employer": 2,

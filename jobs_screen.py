@@ -26,6 +26,7 @@ import urllib.request
 from datetime import date, datetime, timezone
 from pathlib import Path
 
+import score_cache
 import verdicts
 from location_filter import location_matcher
 from pipeline_common import (DESC_MARKER, configure_from_file,
@@ -42,6 +43,9 @@ OUT_DIR = Path("out")
 # A scratch run points this and OUT_DIR elsewhere, and still reads the
 # applied verdicts from verdicts.FEEDBACK_DIR
 TEMPLATE_DIR = None
+# per_listing_rerank's score cache; None means OUT_DIR /
+# "score_cache.json", so a scratch run gets a cache of its own
+CACHE_PATH = None
 OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434")
 MODEL = os.getenv("SCREEN_MODEL", "gemma4:12b")
 
@@ -131,6 +135,7 @@ def configure(cfg):
     global SHORTLIST_SIZE, LOOKUP_SIZE, NO_VERDICT_CAP
     global EXCLUDED_EMPLOYER_RE, EXCLUDE_TITLE_RES, location_ok
     global SCORE_CAPS, SCORE_CAPS_SHA, APPLIED_PATH, MODEL_THINKING, NUM_CTX
+    global PER_LISTING, SCORE_CACHE_DAYS
     PROMPT_PATH = Path(cfg.get("prompt_path", "screening_prompt.txt"))
     # Digest rows from files whose Date header is older than this many
     # days are rejected as stale before ranking. Board postings are
@@ -197,6 +202,15 @@ def configure(cfg):
     # prompt, the batch, and the response (and with thinking on, the
     # reasoning, which is what used to overflow it)
     NUM_CTX = int(cfg.get("num_ctx", 8192))
+    # Pass 2 over every listing with posting text, each in its own
+    # request, through the score cache (rerank_top_n and rerank_batch are
+    # then unused). In a batch, a score moves ~9 points with its
+    # batch-mates; alone, a request repeats exactly, so its score can be
+    # kept. See rerank_per_listing
+    PER_LISTING = bool(cfg.get("per_listing_rerank", False))
+    # Cache entries no run has used for this many days are dropped (0:
+    # never)
+    SCORE_CACHE_DAYS = count_setting(cfg, "score_cache_days", 30)
 
 # Until main() configures it, the module runs as for an empty config
 configure({"excluded_employers": [], "excluded_title_patterns": [],
@@ -513,11 +527,19 @@ def sampling_options(attempt):
         return {"temperature": 0, "seed": SEED}
     return {"seed": SEED + attempt - 1}
 
+# The most context one request has used since run_batches last reset
+# it: prompt tokens plus response tokens. Ollama's prompt_eval_count
+# counts the whole prompt, the system prompt included, even when the
+# prefix was cached (checked 2026-10-25). It cuts an over-long prompt
+# without an error, so use near num_ctx is the only sign of that
+CONTEXT_USED = 0
+
 def ollama_chat(system, user, attempt=1):
     """One chat completion; returns the model's content string.
     Raises TRANSPORT_ERRORS on connection failure or a 5xx answer,
     RequestRejected on a 4xx, and ValueError when the body isn't a chat
-    response."""
+    response. Records the request's context use in CONTEXT_USED."""
+    global CONTEXT_USED
     payload = {
         "model": MODEL,
         "messages": [
@@ -545,6 +567,9 @@ def ollama_chat(system, user, attempt=1):
         if isinstance(data, dict) else None
     if not isinstance(content, str):
         raise ValueError("Ollama response has no message content")
+    used = sum(n for n in (data.get("prompt_eval_count"),
+                           data.get("eval_count")) if isinstance(n, int))
+    CONTEXT_USED = max(CONTEXT_USED, used)
     return content
 
 def model_available(tags, model):
@@ -681,18 +706,20 @@ def batch_order(job):
     key = "|".join(verdicts.listing_key(job["title"], job["employer"]))
     return hashlib.sha1(key.encode()).hexdigest()
 
-def score_batch(batch):
-    """Pass 1: blind triage on title/employer/location."""
+def pass1_request(batch):
+    """Pass 1's (system, user) messages: blind triage on
+    title/employer/location."""
     listing = "\n".join(
         f'{i}: {j["title"]} | {j["employer"]} | {j["location"]}'
         for i, j in enumerate(batch)
     )
     user = (f"Score every job below for fit. {RESPONSE_FORMAT}\n\n"
             f"Jobs:\n{listing}")
-    return request_scores(SYSTEM_PROMPT, user, batch)
+    return SYSTEM_PROMPT, user
 
-def score_rerank(batch):
-    """Pass 2: re-score with posting-text excerpts."""
+def rerank_request(batch):
+    """Pass 2's (system, user) messages: re-scoring with posting-text
+    excerpts."""
     blocks = []
     for i, j in enumerate(batch):
         ex = role_excerpt(j["description"], EXCERPT_CHARS)
@@ -700,9 +727,20 @@ def score_rerank(batch):
                       f'{j["location"]}\nPOSTING: {ex}')
     user = (f"Re-score every job below for fit using the posting text. "
             f"{RESPONSE_FORMAT}\n\nJobs:\n" + "\n---\n".join(blocks))
-    return request_scores(SYSTEM_PROMPT + RERANK_ADDENDUM, user, batch)
+    return SYSTEM_PROMPT + RERANK_ADDENDUM, user
 
-def run_batches(label, batches, scorer, apply):
+def score_batch(batch):
+    """Pass 1: blind triage on title/employer/location."""
+    return request_scores(*pass1_request(batch), batch)
+
+def score_rerank(batch):
+    """Pass 2: re-score with posting-text excerpts."""
+    return request_scores(*rerank_request(batch), batch)
+
+# Peak context use per pass, by run_batches label, for the run record
+CONTEXT_PEAKS = {}
+
+def run_batches(label, batches, scorer, apply, report_every=1):
     """Score batches in order with scorer(batch) and hand usable
     results to apply(batch, scores). A batch whose request fails
     (TRANSPORT_ERRORS) or yields no usable scores is left as-is and
@@ -710,7 +748,22 @@ def run_batches(label, batches, scorer, apply):
     failures in a row, or at once when Ollama rejects a request, since
     it would reject them all. Returns (ok, failed, aborted), where
     aborted is None, "failures" or "rejected"; batches never attempted
-    after an abort count as failed."""
+    after an abort count as failed. Every report_every-th success is
+    logged, and the last; every failure is. The pass's peak context use
+    goes in CONTEXT_PEAKS and the log."""
+    global CONTEXT_USED
+    CONTEXT_USED = 0
+    try:
+        return _run_batches(label, batches, scorer, apply, report_every)
+    finally:
+        if CONTEXT_USED:
+            CONTEXT_PEAKS[label] = CONTEXT_USED
+            near = (" [WARN] at the limit: Ollama may have cut a prompt; "
+                    "raise num_ctx" if CONTEXT_USED >= NUM_CTX else "")
+            print(f"  Peak context per {label}: {CONTEXT_USED} of {NUM_CTX} "
+                  f"tokens{near}")
+
+def _run_batches(label, batches, scorer, apply, report_every):
     ok = streak = 0
     for n, batch in enumerate(batches, 1):
         try:
@@ -733,7 +786,8 @@ def run_batches(label, batches, scorer, apply):
         apply(batch, scores)
         tag = ("" if len(scores) == len(batch)
                else f" (partial after {MAX_ATTEMPTS} attempts)")
-        print(f"  {label} {n}: {len(scores)}/{len(batch)} scored{tag}")
+        if tag or n % report_every == 0 or n == len(batches):
+            print(f"  {label} {n}: {len(scores)}/{len(batch)} scored{tag}")
         ok += 1
         streak = 0
     return ok, len(batches) - ok, None
@@ -822,7 +876,136 @@ def run_record(started):
             "recency_days": RECENCY_DAYS,
             "no_verdict_cap": NO_VERDICT_CAP,
             "shortlist_size": SHORTLIST_SIZE, "lookup_size": LOOKUP_SIZE,
-            "shortlist_per_employer": SHORTLIST_PER_EMPLOYER}
+            "shortlist_per_employer": SHORTLIST_PER_EMPLOYER,
+            "per_listing_rerank": PER_LISTING,
+            "score_cache_days": SCORE_CACHE_DAYS,
+            "peak_context": dict(CONTEXT_PEAKS)}
+
+def exit_unscored(aborted, what):
+    """Stop a run in which no listing got a pass-1 score, writing
+    nothing. what names the unit that failed, for the message."""
+    if aborted == "rejected":
+        # 1: a retry would send the same request
+        print("[ERROR] Ollama rejected the scoring request, and a "
+              "retry can't fix that: check model_thinking, num_ctx "
+              "and SCREEN_MODEL. No shortlist written.")
+        sys.exit(1)
+    print(f"[ERROR] No {what} scored. Is Ollama running at {OLLAMA_URL} "
+          f"with {MODEL} pulled? No shortlist written.")
+    # 2, not 1: nothing was written, so run_screen.bat can safely
+    # retry (Ollama often just hasn't started yet)
+    sys.exit(2)
+
+def score_pass1(kept):
+    """Pass 1 over every listing, PASS1_BATCH per request. Returns
+    (batches failed, of how many, aborted); exits, writing nothing, when
+    no batch scored. Not cached: a batched score depends on its
+    batch-mates, and a cache would freeze that in. Scored alone, a
+    title-only listing mostly gets a stock score (35 for 62 of 107 on
+    2026-10-25 data), and ranked the owner's verdicts worse."""
+    if kept:
+        ollama_preflight()
+    kept.sort(key=batch_order)
+    batches = [kept[s:s + PASS1_BATCH]
+               for s in range(0, len(kept), PASS1_BATCH)]
+    n_batches = len(batches)
+    print(f"Pass 1: scoring {len(kept)} listings with {MODEL} "
+          f"({n_batches} batches)...")
+    ok, failed, aborted = run_batches("batch", batches, score_batch,
+                                      apply_pass1)
+    if n_batches and not ok:
+        exit_unscored(aborted, "batch")
+    kept.sort(key=lambda j: j["score"], reverse=True)
+    return failed, n_batches, aborted
+
+def rerank_in_batches(kept, aborted):
+    """Pass 2 over the top RERANK_TOP_N rows with posting text,
+    RERANK_BATCH per request, skipped when pass 1 aborted. Returns how
+    many batches failed or were skipped."""
+    # Failed re-score batches keep their pass-1 scores
+    rerank_failed = 0
+    cand = [j for j in kept if j.get("description")][:RERANK_TOP_N]
+    if cand:
+        chunks = [cand[s:s + RERANK_BATCH]
+                  for s in range(0, len(cand), RERANK_BATCH)]
+        if aborted:
+            # Pass 1 gave up on a dead or wedged Ollama; each re-score
+            # request would only sit out its own timeout
+            print(f"Pass 2 skipped: pass 1 aborted. {len(chunks)} "
+                  f"re-score batches not attempted.")
+            rerank_failed = len(chunks)
+        else:
+            print(f"Pass 2: re-scoring top {len(cand)} description-bearing "
+                  f"rows with posting text ({len(chunks)} batches)...")
+            _, rerank_failed, _ = run_batches("rerank batch", chunks,
+                                              score_rerank, apply_rerank)
+    return rerank_failed
+
+# Per-listing pass 2 logs every this many-th request, and every failure
+REPORT_EVERY = 25
+
+def cache_path():
+    return CACHE_PATH or OUT_DIR / "score_cache.json"
+
+def rerank_per_listing(kept, aborted, rescore=False):
+    """Pass 2 over every listing with posting text, one per request,
+    through the score cache. A listing whose request is in the cache
+    isn't sent again; rescore sends every one and replaces its entry.
+    Alone, a request repeats exactly, so its score can be kept. When
+    pass 1 aborted, the cached scores still apply and only the requests
+    are skipped. Returns (requests failed or skipped, cache counts for
+    the JSON)."""
+    cache = score_cache.load(cache_path())
+    today = date.today()
+    keys, todo = {}, []
+    for j in kept:
+        if not j.get("description"):
+            continue
+        key = score_cache.request_key(MODEL, MODEL_THINKING, NUM_CTX,
+                                      *rerank_request([j]))
+        entry = None if rescore else score_cache.lookup(cache, key, today)
+        if entry is None:
+            keys[id(j)] = key
+            todo.append([j])
+        else:
+            apply_rerank([j], {0: entry})
+    cached = sum(1 for j in kept if j.get("description")) - len(todo)
+    stored = 0
+
+    def apply_and_store(batch, scores):
+        nonlocal stored
+        apply_rerank(batch, scores)
+        j, s = batch[0], scores[0]
+        score_cache.store(cache, keys[id(j)], s["score"], s["reason"], today,
+                          title=j["title"], employer=j["employer"],
+                          location=j["location"],
+                          prompt_sha=fingerprint(SYSTEM_PROMPT))
+        stored += 1
+        # A first run takes about 15 minutes: keep what's done
+        if stored % REPORT_EVERY == 0:
+            score_cache.save(cache_path(), cache)
+
+    if aborted and todo:
+        # Pass 1 gave up on a dead or wedged Ollama; each re-score
+        # request would only sit out its own timeout
+        print(f"Pass 2 skipped: pass 1 aborted. {len(todo)} re-score "
+              f"requests not attempted; {cached} came from the score cache.")
+        rerank_failed = len(todo)
+    else:
+        print(f"Pass 2: {cached} of {cached + len(todo)} listings with "
+              f"posting text from the score cache; re-scoring {len(todo)}, "
+              f"one per request...")
+        _, rerank_failed, _ = run_batches(
+            "re-score", todo, score_rerank, apply_and_store,
+            report_every=REPORT_EVERY)
+
+    dropped = score_cache.prune(cache, today, SCORE_CACHE_DAYS)
+    score_cache.save(cache_path(), cache)
+    print(f"Score cache: {len(cache)} entries, {dropped} unused for "
+          f"{SCORE_CACHE_DAYS} days dropped ({cache_path()})")
+    return rerank_failed, {"cached": cached, "scored": stored,
+                           "failed": rerank_failed, "entries": len(cache),
+                           "dropped": dropped, "rescore": rescore}
 
 def without_text(rows):
     """Rows for the ranked JSON, without the posting text. It made up 88%
@@ -918,8 +1101,25 @@ def write_verdict_template(path, stamp, rows):
          *added]) + eol, newline="")
     return f"{len(added)} row(s) new to the list appended"
 
-def main():
+USAGE = """usage: python jobs_screen.py [--rescore]
+
+  --rescore  with per_listing_rerank on, re-score every listing with
+             posting text and replace its score cache entry, instead of
+             reusing it"""
+
+def main(argv=()):
+    """argv: the command-line arguments, which the scheduled wrapper
+    never passes."""
     started = datetime.now()
+    if {"-h", "--help"} & set(argv):
+        print(USAGE)
+        sys.exit(0)
+    if set(argv) - {"--rescore"}:
+        print(USAGE)
+        # 1, not 2: a retry would pass the same arguments
+        sys.exit(1)
+    rescore = "--rescore" in argv
+    CONTEXT_PEAKS.clear()
     configure_from_file(configure)
     load_inputs()
     jobs, unparsed = parse_jobs()
@@ -963,50 +1163,21 @@ def main():
         j["score"] = 0
         j["reason"] = "unscored"
 
-    if kept:
-        ollama_preflight()
-    kept.sort(key=batch_order)
-    batches = [kept[s:s + PASS1_BATCH]
-               for s in range(0, len(kept), PASS1_BATCH)]
-    n_batches = len(batches)
-    print(f"Pass 1: scoring {len(kept)} listings with {MODEL} "
-          f"({n_batches} batches)...")
-    ok, failed, aborted = run_batches("batch", batches, score_batch,
-                                      apply_pass1)
-    if n_batches and not ok:
-        if aborted == "rejected":
-            # 1: a retry would send the same request
-            print("[ERROR] Ollama rejected the scoring request, and a "
-                  "retry can't fix that: check model_thinking, num_ctx "
-                  "and SCREEN_MODEL. No shortlist written.")
-            sys.exit(1)
-        print(f"[ERROR] No batch scored. Is Ollama running at {OLLAMA_URL} "
-              f"with {MODEL} pulled? No shortlist written.")
-        # 2, not 1: nothing was written, so run_screen.bat can safely
-        # retry (Ollama often just hasn't started yet)
-        sys.exit(2)
-
+    failed, n_batches, aborted = score_pass1(kept)
+    # What a pass-2 failure count counts: batches, or single-listing
+    # requests
+    if PER_LISTING:
+        rerank_failed, cache_counts = rerank_per_listing(kept, aborted,
+                                                         rescore)
+        re_units = "request(s)"
+    else:
+        if rescore:
+            print("[WARN] --rescore ignored: per_listing_rerank is off, "
+                  "so nothing is cached.")
+        rerank_failed = rerank_in_batches(kept, aborted)
+        cache_counts = None
+        re_units = "batch(es)"
     kept.sort(key=lambda j: j["score"], reverse=True)
-
-    # ---- Pass 2: re-score top description-bearing rows ----
-    # Failed re-score batches keep their pass-1 scores
-    rerank_failed = 0
-    cand = [j for j in kept if j.get("description")][:RERANK_TOP_N]
-    if cand:
-        chunks = [cand[s:s + RERANK_BATCH]
-                  for s in range(0, len(cand), RERANK_BATCH)]
-        if aborted:
-            # Pass 1 gave up on a dead or wedged Ollama; each re-score
-            # request would only sit out its own timeout
-            print(f"Pass 2 skipped: pass 1 aborted. {len(chunks)} "
-                  f"re-score batches not attempted.")
-            rerank_failed = len(chunks)
-        else:
-            print(f"Pass 2: re-scoring top {len(cand)} description-bearing "
-                  f"rows with posting text ({len(chunks)} batches)...")
-            _, rerank_failed, _ = run_batches("rerank batch", chunks,
-                                              score_rerank, apply_rerank)
-            kept.sort(key=lambda j: j["score"], reverse=True)
 
     capped = sum("capped_from" in j for j in kept)
     if capped:
@@ -1036,10 +1207,13 @@ def main():
     OUT_DIR.mkdir(exist_ok=True)
     stamp = date.today().isoformat()
     json_path = OUT_DIR / f"ranked_{stamp}.json"
-    write_atomic(json_path, json.dumps(
-        {"run": run_record(started), "ranked": without_text(kept),
-         "rejected": without_text(rejected), "failed_batches": failed,
-         "rerank_failed_batches": rerank_failed}, indent=2))
+    # With per_listing_rerank, rerank_failed_batches counts requests
+    record = {"run": run_record(started), "ranked": without_text(kept),
+              "rejected": without_text(rejected), "failed_batches": failed,
+              "rerank_failed_batches": rerank_failed}
+    if cache_counts is not None:
+        record["score_cache"] = cache_counts
+    write_atomic(json_path, json.dumps(record, indent=2))
 
     md_path = OUT_DIR / f"shortlist_{stamp}.md"
     md = [f"# Daily Shortlist — {stamp}\n\n"]
@@ -1047,7 +1221,7 @@ def main():
         md.append(f"**WARNING: {failed} of {n_batches} pass-1 batches "
                   f"failed; those listings are ranked as 0/unscored.**\n\n")
     if rerank_failed:
-        md.append(f"**NOTE: {rerank_failed} re-scoring batch(es) failed "
+        md.append(f"**NOTE: {rerank_failed} re-scoring {re_units} failed "
                   f"or were skipped; those rows kept their pass-1 "
                   f"score.**\n\n")
     if unparsed:
@@ -1105,11 +1279,11 @@ def main():
         print(f"[ERROR] {failed} of {n_batches} batches failed; "
               f"shortlist is incomplete.")
     if rerank_failed:
-        print(f"[ERROR] {rerank_failed} re-scoring batch(es) failed or were "
+        print(f"[ERROR] {rerank_failed} re-scoring {re_units} failed or were "
               f"skipped; those rows are ranked on their pass-1 scores.")
     if failed or rerank_failed:
         sys.exit(1)
 
 if __name__ == "__main__":
-    main()
+    main(sys.argv[1:])
     

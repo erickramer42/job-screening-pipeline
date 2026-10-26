@@ -42,13 +42,16 @@ jobs_screen.py   raw/ + raw_boards/     ->  recency + hard filters -> pass 1 -> 
      - A rule can carry a flag, such as "clearance", which the shortlist shows.
    - **Already applied:** listings in `applied.txt`, or marked `a` in a feedback file, are cut before ranking and listed in their own shortlist section. A board row marked `a` is matched by its posting URL too, so it stays cut if the employer edits the title.
    - **Pass 2:** re-scores the top `rerank_top_n` listings that have a description, in small batches. Each one comes with an excerpt from the posting's role section.
+   - **Per-listing pass 2** (`per_listing_rerank`, off by default): pass 2 re-scores every listing that has a description, each in its own request. Scores are kept in `out/score_cache.json`, so a posting is sent again only when its request would change: a new title, location or excerpt, another prompt or model. See [Per-listing pass 2](CONFIGURATION.md#per-listing-pass-2).
    - **"No" verdicts:** after both passes, a listing whose latest verdict is `n` is held at `no_verdict_cap` (50) and flagged `judged no`. It stays in the ranking, below the listings you haven't ruled out, including those the model scored at the cap itself. A board row is matched by its posting URL too. The cap comes after pass 2, so it doesn't change which listings pass 2 re-scores, or any model score.
-   - **Two shortlist sections:** the listings pass 2 scored against their posting text fill the main section (`shortlist_size`, 15). The rest have only a title-only score and go in a "Needs lookup" section (`lookup_size`, 10). That's every digest row, plus any board posting pass 2 didn't re-score: one below the top `rerank_top_n`, one without a description, or one whose batch failed. Each section is ranked on its own, since a title-only score rests on far less evidence.
+   - **Two shortlist sections:** the listings pass 2 scored against their posting text fill the main section (`shortlist_size`, 15). The rest have only a title-only score and go in a "Needs lookup" section (`lookup_size`, 10). That's every digest row, plus any board posting pass 2 didn't re-score: one below the top `rerank_top_n` (batch scoring only), one without a description, or one whose request failed. Each section is ranked on its own, since a title-only score rests on far less evidence.
 
 The scripts share three small modules:
 - `html_text.py`: the HTML-to-text conversion, used by ingest and board fetch.
 - `location_filter.py`: the search-area rule, used by board fetch and the screener.
 - `pipeline_common.py`: config loading, the description marker in board files, email date parsing, and atomic writes, used by all three scripts.
+
+The screener keeps per-listing pass-2 scores with `score_cache.py`.
 
 `verdicts.py` reads your verdicts on shortlist rows and scores a run against them (see [Reviewing the shortlist](#reviewing-the-shortlist)).
 
@@ -109,9 +112,12 @@ python jobs_screen.py    # filter, rank, and write out/
 python -m unittest       # run the tests
 ```
 
+With `per_listing_rerank` on, `python jobs_screen.py --rescore` re-scores every posting instead of reusing the score cache.
+
 The tests use the standard library's `unittest` and live in `tests/`. They cover:
 - listing identity (deduplication, applied jobs, batch order), score caps, the per-employer limit, and the verdict files;
-- the model requests and responses, and the pass-2 excerpt;
+- the model requests and responses, the pass-2 excerpt, and context use;
+- the score cache: what changes its key, entry ages, the file, and per-listing pass-2 runs end to end;
 - the screener's exit codes, with `main()` run end to end and a stand-in for the model;
 - the board-file layout and when a file is rewritten or archived;
 - email decoding, digest file names, and an ingest run against a stand-in mailbox, which may only examine and peek;
@@ -135,7 +141,7 @@ They write their fixtures to a temporary folder, mock the network, and need no p
   - `feedback/<date>.md` is written alongside, ready for your verdicts. Rows flagged `judged no` are left out of it, so you aren't asked again.
   - Board rows link straight to the posting. Digest rows have no link, so open the digest email to find them.
 - `out/ranked_<date>.json` holds:
-  - **What produced the run** (`run`): when it started, the model and whether thinking was on, 12-character fingerprints of the ranking prompt (`prompt_sha`), the pass-2 addendum and the `score_caps` rules, and the settings that affect scores. Two runs with the same `prompt_sha` used the same prompt.
+  - **What produced the run** (`run`): when it started, the model and whether thinking was on, 12-character fingerprints of the ranking prompt (`prompt_sha`), the pass-2 addendum and the `score_caps` rules, and the settings that affect scores. Two runs with the same `prompt_sha` used the same prompt. `peak_context` gives each pass's largest request, in tokens, to compare with `num_ctx`.
   - **Every ranked listing**, with its score and reason, plus these fields where they apply:
     - re-scored listings: `pass1_score`, `rescored`, and the `excerpt` pass 2 sent, plus `pass1_capped_from` when a cap lowered the pass-1 score;
     - listings that match a cap rule: `score_cap` and `flags`, plus `capped_from` if the cap lowered the score;
@@ -143,9 +149,11 @@ They write their fixtures to a temporary folder, mock the network, and need no p
     - shortlisted listings: `shortlist_rank`; listings `shortlist_per_employer` kept off the shortlist: `employer_limited`;
     - board listings: `posted`, when the board gives a date.
   - **Every cut listing**, with its `reject_reason`: `applied`, `excluded employer`, `excluded title pattern`, `outside area`, or `stale digest`.
-  - `failed_batches` and `rerank_failed_batches`.
+  - `failed_batches` and `rerank_failed_batches`. With `per_listing_rerank`, the second counts requests, one per listing.
+  - With `per_listing_rerank`, `score_cache`: how many postings pass 2 took from the cache, re-scored, or failed to re-score, the cache's size, and how many old entries were dropped.
 
   The posting text isn't copied into the JSON: it's in each row's `source_file`.
+- `out/score_cache.json` holds the per-listing pass-2 scores (see [Per-listing pass 2](CONFIGURATION.md#per-listing-pass-2)). Deleting it is safe: the next run re-scores every posting.
 - `out/FAILED_<date>.md` appears when a scheduled screening run fails (see [Scheduled runs](#scheduled-runs-windows)).
 
 ## When something fails
@@ -170,6 +178,10 @@ They write their fixtures to a temporary folder, mock the network, and need no p
   - Every output file is written through a temporary file, so a run killed mid-write leaves the previous file or the complete new one. Ingest and board fetch write the same way.
   - **Some pass-1 batches failed:** still writes the shortlist with a warning at the top, then exits 1.
   - **Pass 2 fails or is skipped** (it's skipped when pass 1 had to stop): those listings keep their pass-1 scores, with a note in the shortlist, and the run exits 1.
+  - **With `per_listing_rerank`,** each pass-2 request is one listing, and the same rules apply to requests. Pass 1 and its exit codes are unchanged.
+    - A failed request isn't cached, so the next run tries that posting again.
+    - When pass 1 has to stop, pass 2 still takes its cached scores; only its requests are skipped.
+    - The cache is saved every 25 new scores and at the end, so a run that stops partway keeps what it scored. The exit-2 path writes nothing, the cache included.
   - **A recent digest yields no listings** though it has text: the shortlist names the file in a warning, since the digest's format has probably changed. The exit code doesn't change.
 - **Board fetch** reports a failed board and moves on to the next one.
   - A malformed `boards.json` entry (no slug, unknown platform) is reported and skipped the same way.
@@ -214,7 +226,7 @@ A short daily loop keeps the ranking honest, and gives it something to be measur
      - Point `jobs_screen.OUT_DIR` and `jobs_screen.TEMPLATE_DIR` (where the verdict template goes) at a scratch folder.
      - Call `jobs_screen.main()`.
 
-     A scratch run still reads your `a` verdicts from `feedback/`, so applied jobs are cut as in a real run.
+     A scratch run still reads your `a` verdicts from `feedback/`, so applied jobs are cut as in a real run. With `per_listing_rerank`, its score cache is in the scratch folder too, so its first run re-scores every posting.
 
 ## Scheduled runs (Windows)
 

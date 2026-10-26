@@ -641,11 +641,9 @@ class FakeModel:
 def pass1(user):
     return user.startswith("Score")
 
-class MainRun(SourceFiles):
+class MainRunBase(SourceFiles):
     """main() end to end in a temporary folder, with FakeModel for
-    Ollama. Pins the exit codes run_screen.bat relies on: 2 means
-    nothing was written, so a retry is safe; 1 a partial run, or a
-    problem a retry can't fix; 0 success."""
+    Ollama."""
     def setUp(self):
         super().setUp()
         prompt = self.root / "prompt.txt"
@@ -679,7 +677,13 @@ class MainRun(SourceFiles):
                 "About the role\nBuild things.", posted=f"2026-09-0{n}"))
         self.stamp = date.today().isoformat()
 
-    def run_main(self, model, preflight=True):
+    def set_config(self, **settings):
+        config = json.loads(pipeline_common.CONFIG_FILE.read_text(
+            encoding="utf-8"))
+        pipeline_common.CONFIG_FILE.write_text(json.dumps(
+            {**config, **settings}), encoding="utf-8")
+
+    def run_main(self, model, preflight=True, argv=()):
         """main()'s exit code and what it printed; preflight=False runs
         the real Ollama check."""
         out = io.StringIO()
@@ -689,7 +693,7 @@ class MainRun(SourceFiles):
                 stack.enter_context(mock.patch.object(js, "ollama_preflight"))
             stack.enter_context(contextlib.redirect_stdout(out))
             try:
-                js.main()
+                js.main(argv)
                 code = 0
             except SystemExit as e:
                 code = e.code
@@ -708,6 +712,10 @@ class MainRun(SourceFiles):
         return json.loads((self.out / f"ranked_{self.stamp}.json")
                           .read_text(encoding="utf-8"))
 
+class MainRun(MainRunBase):
+    """Batch scoring. Pins the exit codes run_screen.bat relies on: 2
+    means nothing was written, so a retry is safe; 1 a partial run, or a
+    problem a retry can't fix; 0 success."""
     def test_everything_scores(self):
         model = FakeModel()
         self.assertEqual(self.run_main(model)[0], 0)
@@ -879,6 +887,257 @@ class MainRun(SourceFiles):
         self.assertEqual(self.run_main(FakeModel())[0], 0)
         self.assertIn("**WARNING: 1 recent digest file(s) have text but no "
                       "listings (job_uid_2.txt)", self.shortlist())
+
+    def test_an_unknown_argument_stops_the_run(self):
+        code, printed = self.run_main(FakeModel(), argv=["--rescor"])
+        # 1, not 2: a retry would pass the same argument
+        self.assertEqual(code, 1)
+        self.assertIn("usage:", printed)
+        self.assertEqual(self.written(), [])
+
+    def test_rescore_does_nothing_in_batch_mode(self):
+        code, printed = self.run_main(FakeModel(), argv=["--rescore"])
+        self.assertEqual(code, 0)
+        self.assertIn("--rescore ignored", printed)
+        self.assertNotIn("out/score_cache.json", self.written())
+
+class ScoreByText(FakeModel):
+    """FakeModel whose scores differ by request, so that an unchanged
+    score means the same request, or the cache."""
+    def __call__(self, system, user, attempt=1):
+        self.requests.append(user)
+        if self.error and self.when(user):
+            raise self.error
+        lines = re.findall(r"^(\d+): (.*)$", user, re.M)
+        whole = user if len(lines) == 1 else ""
+        scores = [int(hashlib.sha256((system + line + whole).encode())
+                      .hexdigest(), 16) % 101 for _, line in lines]
+        return json.dumps({"scores": [
+            {"index": int(i), "score": s, "reason": f"r{s}"}
+            for (i, _), s in zip(lines, scores)]})
+
+class PerListingRerank(MainRunBase):
+    """per_listing_rerank: pass 1 in batches as before, then pass 2 over
+    every board row with posting text, one per request, through the
+    score cache. The exit codes keep their meaning; a pass-2 failure
+    count is of requests."""
+    def setUp(self):
+        super().setUp()
+        # rerank_top_n is unused: every board row is re-scored
+        self.set_config(per_listing_rerank=True, rerank_top_n=1)
+
+    def scores(self):
+        return {j["title"]: (j["score"], j.get("capped_from"), j["reason"])
+                for j in self.ranked()["ranked"] if j.get("rescored")}
+
+    def rescored(self, model):
+        """The titles pass 2 sent, in order."""
+        return sorted(re.search(r"^0: (.*?) \|", u, re.M).group(1)
+                      for u in model.requests if not pass1(u))
+
+    def test_every_posting_is_rescored_in_its_own_request(self):
+        model = FakeModel()
+        self.assertEqual(self.run_main(model)[0], 0)
+        # Pass 1: 2 batches of 2, as in batch scoring
+        self.assertEqual(sum(map(pass1, model.requests)), 2)
+        self.assertEqual(self.rescored(model),
+                         ["Backend Engineer", "Senior Engineer"])
+        for user in model.requests:
+            if not pass1(user):
+                self.assertEqual(len(re.findall(r"^\d+: ", user, re.M)), 1)
+        data = self.ranked()
+        self.assertEqual(sum("rescored" in j for j in data["ranked"]), 2)
+        self.assertTrue(data["run"]["per_listing_rerank"])
+        self.assertEqual(data["score_cache"],
+                         {"cached": 0, "scored": 2, "failed": 0,
+                          "entries": 2, "dropped": 0, "rescore": False})
+        self.assertIn("out/score_cache.json", self.written())
+        self.assertNotIn("WARNING", self.shortlist())
+
+    def test_a_request_is_the_one_batch_scoring_sends_for_one_listing(self):
+        model = FakeModel()
+        self.assertEqual(self.run_main(model)[0], 0)
+        job = {"title": "Senior Engineer", "employer": "Acme",
+               "location": "Springfield",
+               "description": "About the role\nBuild things."}
+        self.assertIn(js.rerank_request([job])[1], model.requests)
+
+    def test_a_second_run_rescores_nothing_and_keeps_the_scores(self):
+        self.assertEqual(self.run_main(ScoreByText())[0], 0)
+        first = self.scores()
+        model = ScoreByText()
+        code, printed = self.run_main(model)
+        self.assertEqual(code, 0)
+        self.assertEqual(self.rescored(model), [])
+        self.assertEqual(self.scores(), first)
+        self.assertEqual(self.ranked()["score_cache"]["cached"], 2)
+        self.assertIn("2 of 2 listings with posting text from the score "
+                      "cache", printed)
+
+    def test_an_edited_posting_alone_is_rescored(self):
+        self.assertEqual(self.run_main(ScoreByText())[0], 0)
+        self.write(self.boards, "greenhouse_1.txt", board_text(
+            "Senior Engineer", "Acme", "Springfield", "https://example.com/1",
+            "About the role\nBuild other things.", posted="2026-09-01"))
+        model = ScoreByText()
+        self.assertEqual(self.run_main(model)[0], 0)
+        self.assertEqual(self.rescored(model), ["Senior Engineer"])
+        # And a new location, or a new title
+        self.write(self.boards, "greenhouse_2.txt", board_text(
+            "Backend Engineer", "Delta", "Remote", "https://example.com/2",
+            "About the role\nBuild things.", posted="2026-09-02"))
+        self.write(self.boards, "greenhouse_1.txt", board_text(
+            "Senior Engineer II", "Acme", "Springfield",
+            "https://example.com/1", "About the role\nBuild other things.",
+            posted="2026-09-01"))
+        model = ScoreByText()
+        self.assertEqual(self.run_main(model)[0], 0)
+        self.assertEqual(self.rescored(model),
+                         ["Backend Engineer", "Senior Engineer II"])
+
+    def test_a_prompt_change_rescores_everything(self):
+        self.assertEqual(self.run_main(FakeModel())[0], 0)
+        (self.root / "prompt.txt").write_text("Rank jobs strictly.",
+                                              encoding="utf-8")
+        model = FakeModel()
+        self.assertEqual(self.run_main(model)[0], 0)
+        self.assertEqual(len(self.rescored(model)), 2)
+
+    def test_a_cap_change_applies_without_a_rescore(self):
+        self.set_config(score_caps=[{"employers": ["Acme"], "max_score": 50}])
+        self.assertEqual(self.run_main(FakeModel())[0], 0)
+        self.assertEqual(self.scores()["Senior Engineer"][:2], (50, 60))
+        self.set_config(score_caps=[{"employers": ["Acme"], "max_score": 30}])
+        model = FakeModel()
+        self.assertEqual(self.run_main(model)[0], 0)
+        self.assertEqual(self.rescored(model), [])
+        # The cache holds the model's own score, 60, not the old cap's 50
+        self.assertEqual(self.scores()["Senior Engineer"][:2], (30, 60))
+
+    def test_rescore_sends_every_request_again(self):
+        self.assertEqual(self.run_main(FakeModel())[0], 0)
+        model = FakeModel()
+        self.assertEqual(self.run_main(model, argv=["--rescore"])[0], 0)
+        self.assertEqual(len(self.rescored(model)), 2)
+        self.assertTrue(self.ranked()["score_cache"]["rescore"])
+
+    def test_ollama_unreachable_writes_nothing(self):
+        with mock.patch("urllib.request.urlopen",
+                        side_effect=urllib.error.URLError("refused")):
+            code, _ = self.run_main(FakeModel(), preflight=False)
+        self.assertEqual(code, 2)
+        self.assertEqual(self.written(), [])
+
+    def test_every_pass1_batch_failing_writes_nothing(self):
+        self.assertEqual(self.run_main(FakeModel())[0], 0)
+        for p in self.out.iterdir():
+            if p.name != "score_cache.json":
+                p.unlink()
+        before = (self.out / "score_cache.json").read_bytes()
+        code, _ = self.run_main(FakeModel(ConnectionResetError()))
+        self.assertEqual(code, 2)
+        # Not even the cache: the exit-2 path writes nothing
+        self.assertEqual([p.name for p in self.out.iterdir()],
+                         ["score_cache.json"])
+        self.assertEqual((self.out / "score_cache.json").read_bytes(), before)
+
+    def test_a_failed_request_is_a_partial_run_and_isnt_cached(self):
+        model = FakeModel(TimeoutError(),
+                          when=lambda u: not pass1(u) and "Acme" in u)
+        code, printed = self.run_main(model)
+        self.assertEqual(code, 1)
+        self.assertIn("**NOTE: 1 re-scoring request(s) failed",
+                      self.shortlist())
+        self.assertIn("[ERROR] 1 re-scoring request(s) failed", printed)
+        main, lookup = self.shortlist().split("## Needs lookup")
+        self.assertIn("| Senior Engineer |", lookup)
+        model = FakeModel()
+        self.assertEqual(self.run_main(model)[0], 0)
+        self.assertEqual(self.rescored(model), ["Senior Engineer"])
+
+    def test_cached_scores_apply_when_pass1_aborted(self):
+        self.assertEqual(self.run_main(FakeModel())[0], 0)
+        jobs = [{"title": t, "employer": e, "location": "Springfield",
+                 "description": d, "score": 40, "reason": "pass 1"}
+                for t, e, d in (("Senior Engineer", "Acme",
+                                 "About the role\nBuild things."),
+                                ("Senior Engineer", "Zeta",
+                                 "About the role\nNew."))]
+        model = FakeModel()
+        with mock.patch.object(js, "ollama_chat", model), \
+                mock.patch("builtins.print"):
+            failed, counts = js.rerank_per_listing(jobs, aborted="failures")
+        self.assertEqual(model.requests, [])
+        self.assertEqual((failed, counts["cached"]), (1, 1))
+        self.assertEqual((jobs[0]["score"], jobs[0].get("rescored")),
+                         (60, True))
+        self.assertEqual((jobs[1]["score"], jobs[1].get("rescored")),
+                         (40, None))
+
+    def test_entries_unused_for_score_cache_days_are_dropped(self):
+        self.assertEqual(self.run_main(FakeModel())[0], 0)
+        path = self.out / "score_cache.json"
+        data = json.loads(path.read_text(encoding="utf-8"))
+        data["entries"]["stale"] = {"score": 1, "reason": "",
+                                    "scored": "2020-01-01",
+                                    "used": "2020-01-01"}
+        path.write_text(json.dumps(data), encoding="utf-8")
+        self.assertEqual(self.run_main(FakeModel())[0], 0)
+        self.assertNotIn("stale", json.loads(
+            path.read_text(encoding="utf-8"))["entries"])
+        self.assertEqual(self.ranked()["score_cache"]["dropped"], 1)
+
+class ContextUse(unittest.TestCase):
+    def setUp(self):
+        js.configure(CONFIG)
+
+    def test_a_request_records_its_prompt_and_response_tokens(self):
+        body = json.dumps({"message": {"content": "{}"},
+                           "prompt_eval_count": 2118, "eval_count": 46})
+        with mock.patch.object(js, "CONTEXT_USED", 0), \
+                mock.patch("urllib.request.urlopen",
+                           return_value=io.BytesIO(body.encode())):
+            js.ollama_chat("s", "u")
+            self.assertEqual(js.CONTEXT_USED, 2164)
+
+    def test_a_response_without_counts_records_nothing(self):
+        body = json.dumps({"message": {"content": "{}"}})
+        with mock.patch.object(js, "CONTEXT_USED", 0), \
+                mock.patch("urllib.request.urlopen",
+                           return_value=io.BytesIO(body.encode())):
+            js.ollama_chat("s", "u")
+            self.assertEqual(js.CONTEXT_USED, 0)
+
+    def run_pass(self, used):
+        def scorer(batch):
+            js.CONTEXT_USED = max(js.CONTEXT_USED, batch[0]["used"])
+            return {0: {"score": 1, "reason": ""}}
+        out = io.StringIO()
+        with mock.patch.dict(js.CONTEXT_PEAKS, clear=True), \
+                contextlib.redirect_stdout(out):
+            js.run_batches("batch", [[{"used": n}] for n in used], scorer,
+                           lambda batch, scores: None)
+            peaks = dict(js.CONTEXT_PEAKS)
+        return peaks, out.getvalue()
+
+    def test_each_pass_logs_its_peak(self):
+        peaks, printed = self.run_pass([3000, 3676, 2500])
+        self.assertEqual(peaks, {"batch": 3676})
+        self.assertIn("Peak context per batch: 3676 of 8192 tokens\n",
+                      printed)
+
+    def test_a_peak_at_num_ctx_is_a_warning(self):
+        _, printed = self.run_pass([8192])
+        self.assertIn("[WARN] at the limit", printed)
+
+    def test_successes_can_be_logged_every_nth(self):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            js.run_batches("listing", [[{}]] * 5,
+                           lambda batch: {0: {"score": 1, "reason": ""}},
+                           lambda batch, scores: None, report_every=2)
+        self.assertEqual(re.findall(r"listing (\d+):", out.getvalue()),
+                         ["2", "4", "5"])
 
 if __name__ == "__main__":
     unittest.main()

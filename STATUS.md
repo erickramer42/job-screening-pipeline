@@ -37,6 +37,20 @@ The goal is a focused daily application routine (~10 highest-quality matches per
 | Output generation | ✅ Operational | Produces `out/shortlist_YYYY-MM-DD.md` and JSON. The shortlist has two sections, each ranked on its own: listings pass 2 read against their posting text, and a "Needs lookup" section for those with a title-only score. Board rows include direct posting links and their posted date; ▲ marks pass-2 scores. A listing judged "no" is held at 50 on later days, below the listings not yet judged, and isn't put in the verdict template again. The JSON records the model, prompt and settings behind the run. |
 | Scheduled runs | ✅ Operational | Task Scheduler runs ingest at 01:00 and 05:00, and board fetch + screening at 06:00. Tasks wake the computer, run after a missed start, and the wrappers retry (see [Automation](#automation)). Verified across 2026-10-09 to 10-23, with two misses. On 10-14 no task ran: a Windows Update restart at 00:33 left no one signed in until 08:52, and the missed-start catch-up didn't run the tasks after sign-in. On 10-22 screening failed all 3 attempts because Ollama wasn't running. Since 2026-10-23 both tasks also start at log on, the screening wrapper starts Ollama before a retry, and a failed morning leaves `out/FAILED_<date>.md`. |
 
+### Recent Changes (2026-10-26)
+- **Per-listing pass 2 with a score cache** (milestone 3), built and off by default (`per_listing_rerank`). Pass 1 stays batched. Pass 2 re-scores every listing with posting text, each in its own request, and keeps the model's score in `out/score_cache.json`, keyed by a hash of the whole request: model, settings, prompt and request text. Caps apply on read. `--rescore` re-scores everything, and unused entries expire after `score_cache_days` (30).
+  - **Why not per-listing pass 1 too,** as first planned: a scratch run scored every listing alone. Listings with posting text ranked the verdicts better than batched (board-vs-board pairs 60% → 66%), but title-only listings mostly got the same stock score (35 for 62 of 107), and digest-vs-digest pairs fell from 67% to 33% (44 pairs). So pass 1 keeps its batches, whose neighbours give a title-only score something to compare against.
+  - **Measured** on 10-26 data against that morning's scheduled run, same prompt:
+    - ordering agreement 67.9% → 67.5%, the same within pass-2 noise; board-vs-board pairs 67% → 66%;
+    - 267 postings read against their text instead of 60, and judged-"no" rows in the main section 6 → 4;
+    - a day with no changed posting takes 4.5 minutes; the first run adds about 15 minutes of pass-2 requests.
+  - **Timing:** 3.2 s per single-listing request. Warm repeats are exact (20 listings, three rounds); the first request after the model loads can differ.
+  - **Batch mode is unchanged:** on 10-25 data with a stand-in model, the committed and new code sent the same 25 requests and wrote identical files, apart from new fields in the JSON's `run` record. The 10-26 scheduled run already used the new code in batch mode.
+  - **Long runs stall while the PC idles:** the all-listings scratch run took 3 h 20 min for 36 minutes of requests. Ollama was idle through every pause, so the script itself stopped. Sleep is off; the cause isn't confirmed.
+- **Context use is logged** (review P1): each pass logs its largest request against `num_ctx`, warns at the limit, and the JSON's `run.peak_context` records it. Ollama's `prompt_eval_count` counts the whole prompt, even a cached prefix. On 10-26: 4,032 tokens per pass-1 batch and 4,065 per pass-2 batch, of 8,192; a single-listing request uses 2,700 at most.
+- **`jobs_screen.py --rescore`**, and an unknown argument stops the run with exit 1.
+- **Tests:** 186, up from 158.
+
 ### Recent Changes (2026-10-25)
 - **The stability baseline is in:** the 10-24 and 10-25 scheduled runs used one prompt and model. On the 372 listings they shared, unchanged both days, title-only scores moved 2.7 points on average (11 of 309 by 20 or more), and re-scored ones 9.5 (7 of 57). The score cache should bring both to 0.
 - **The ranking prompt's profile is tiered by recency and weight** (the parked `screening_prompt.recency-pending.txt`, now live; the old one is `screening_prompt.before-recency.txt`). C++ is older professional work plus side projects, not core stack: a role requiring years of it is a reach, and one that accepts it among several languages isn't lowered.
@@ -337,9 +351,8 @@ Quick fixes and score stabilization from a code review.
 ### Pending / Known Issues
 | Issue | Priority | Impact | Planned Fix |
 |-------|----------|--------|-------------|
-| Every run re-scores everything in the recency window | Medium | Each day re-scores all digest listings from the last `recency_days` plus every live board posting, though ~97% were scored the day before. The 10-23 scheduled run took 4 min 41 s; runs took ~25 min before 2026-10-22. | Score cache keyed by listing |
-| Scores depend on batch-mates | Medium | The same listing scored in a different batch of 30 moves ~6 points on average (8% move 20+), against ~1.2 for a repeat of the same batch. The per-batch quota is gone (2026-10-22), but the model still grades partly against the other listings in its request. | Score each new listing in its own request, together with the score cache |
-| Pass 2 reads only the top `rerank_top_n` description rows | Medium | Listings already judged "no" still take pass-2 slots, though they'll be held at 50: any in the pass-1 top 60 costs a slot a "yes" just below the cut could have had. Only re-scored rows fill the main section, so it's only as wide as the employers among them: 12 of 15 rows on 10-24 data, and on 10-25 data 8 of 15 were listings already judged "no". | Re-score every board posting (milestone 3). If that slips, leave judged rows out of pass 2; the baseline that held this back is in |
+| Pass-2 scores move with their batch-mates, and every run re-scores them | Medium | A re-scored listing moves ~9 points from day to day with nothing changed (10-24 → 10-25). Pass 1 repeats exactly on identical input, but moves ~2.7 points when other listings come and go. | `per_listing_rerank`, built 2026-10-26 and off until switched on: pass-2 scores then come from the cache and don't move. Pass 1 stays batched (see Recent Changes) |
+| Pass 2 reads only the top `rerank_top_n` description rows | Medium | Listings already judged "no" still take pass-2 slots, though they'll be held at 50: any in the pass-1 top 60 costs a slot a "yes" just below the cut could have had. Only re-scored rows fill the main section, so it's only as wide as the employers among them: 12 of 15 rows on 10-24 data, and on 10-25 data 8 of 15 were listings already judged "no". | `per_listing_rerank` re-scores every posting: on 10-26 data, judged-"no" rows in the main section went from 6 to 4 |
 | Mobile-heavy roles aren't discounted | Low | The prompt doesn't mention mobile work. With the recency profile, a mobile-heavy "no" scored 82 on 10-25 input. | A prompt change, measured on its own after the recency profile has a few days of verdicts |
 | Dedup key ignores location | Low | Same title+employer in another city is dropped. The kept copy is the board row when there is one, otherwise the newest digest. On 10-23 this hid 1 of 360 listings: a board posting with two locations in the area. | Add location to the key where the location strings are comparable; it's also listing identity, so it would reshuffle batches and orphan verdicts |
 | `slug_probe.py` "VERIFIED" only means the slug has jobs, on Ashby and Lever | Low | A generic name (e.g. "Acme") can match a different company's board. Greenhouse and SmartRecruiters boards now show their own name, and a different one is marked CHECK; Ashby and Lever don't name the company. | Open an Ashby or Lever board before adding it to `boards.json` |
@@ -362,6 +375,8 @@ jobScreensApplications/
 ├── pipeline_common.py           # Shared config loading, description marker,
 │                                #   email dates, atomic writes
 ├── verdicts.py                  # Reads shortlist verdicts; scores a run against them
+├── score_cache.py               # Per-listing pass-2 scores kept between runs
+│                                #   (out/score_cache.json)
 ├── slug_probe.py                # Finds board slugs for company names
 │                                #   (python slug_probe.py targets.txt)
 ├── wrapper_helper.py            # Date decisions for the wrappers: whether
@@ -516,14 +531,14 @@ IMAP host, port, STARTTLS, and folder live in `pipeline_config.json`, along with
 - **Boards:** edit `boards.json`; use `slug_probe.py` to find slugs
 - **Ranking prompt:** edit the file at `prompt_path` (default `screening_prompt.txt`). The pass-2 addendum (`RERANK_ADDENDUM` in `jobs_screen.py`) is appended to it for re-scoring.
 - **Recency window:** `recency_days` in `pipeline_config.json` (ingest and screener both read it; `0` disables)
-- **Pass 2:** `rerank_top_n` (`0` disables), `rerank_batch`, and `excerpt_chars` in `pipeline_config.json`. Excerpt selection uses `ROLE_MARKERS` and `FOOTER_MARKERS` in `jobs_screen.py`.
+- **Pass 2:** `rerank_top_n` (`0` disables), `rerank_batch`, and `excerpt_chars` in `pipeline_config.json`; or `per_listing_rerank`, which re-scores every posting through the score cache (`score_cache_days`). Excerpt selection uses `ROLE_MARKERS` and `FOOTER_MARKERS` in `jobs_screen.py`.
 - **Batch size:** lower `pass1_batch` (30) in `pipeline_config.json` to 20 or 15 if pass-1 responses come back truncated
 - **Model choice:** swap `SCREEN_MODEL` for a smaller model (speed) or larger one (quality)
 - **Board file format:** bump `FILE_FORMAT` in `board_fetch.py` after changing what it writes; every live posting is rewritten on the next run.
 - **Model thinking:** `model_thinking` in `pipeline_config.json`. Off (the default) is fast and repeatable. On is about 4× slower, varies from run to run, and can overflow the context. See [docs/CONFIGURATION.md](docs/CONFIGURATION.md#model-thinking).
 - **Score caps:** `score_caps` in `pipeline_config.json` enforces the prompt's hard limits after each pass, by employer, title, or posting text, and flags the rows it matches.
 - **Shortlist crowding:** `shortlist_per_employer` in `pipeline_config.json`.
-- **Cost control:** with a 30-day window, the data on disk on 2026-10-22 parsed to 353 unique listings, with 78 cut and 275 ranked (10 pass-1 batches plus 12 pass-2 batches, 9.4 min). A score cache would cut daily scoring to new listings (see Known Issues).
+- **Cost control:** with a 30-day window, the data on disk on 2026-10-22 parsed to 353 unique listings, with 78 cut and 275 ranked (10 pass-1 batches plus 12 pass-2 batches, 9.4 min). On 10-26 data, a batch run took about 6 minutes; with `per_listing_rerank` and nothing changed, 4.5 minutes, nearly all of it pass 1.
 
 ---
 
@@ -550,7 +565,7 @@ Agreed 2026-10-22, in this order:
 
 1. **Collect verdicts for a few days.** Fill in `feedback/<date>.md` each morning. Today's verdicts shaped today's changes, so only later days' verdicts can judge the next change, or the looser absolute-rubric scores, out of sample.
 2. **Tests for what the score cache will rely on:** listing identity, the cache key, and score-cap application. A stale or mis-keyed cache fails silently by serving old scores. Done 2026-10-23 for listing identity and score caps, with config loading moved out of import time; the cache-key tests come with the cache. Board files now follow edits to their posting, which the cache's keys depend on.
-3. **Score cache plus per-listing scoring, built together:**
+3. **Score cache plus per-listing scoring, built together.** Built 2026-10-26 for pass 2 only, the owner's choice after measuring both (see Recent Changes), and off until switched on. Switch it on (`per_listing_rerank: true`) once the recency-tiered prompt has a couple of days of verdicts on its own, around 10-27 or 10-28, so each change gets its own read. The plan as written:
    - A cache filled from batches of 30 would freeze the ~6-point batch-mate effect into every cached score.
    - Per-listing scoring without a cache would mean ~270 requests every morning.
    - Together, the first run scores everything once, one request per listing. After that, a day scores only its new listings.
@@ -568,4 +583,4 @@ The automation items (the 10-14 and 10-22 misses, a visible failure marker) and 
 
 Success metric for automation: zero manual intervention; shortlist present in `out/` by 7:00 AM each weekday.
 
-*Last updated: October 25, 2026*
+*Last updated: October 26, 2026*

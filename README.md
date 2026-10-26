@@ -80,7 +80,8 @@ Each of these was measured before and after the change. [STATUS.md](STATUS.md) h
 - **Scores that depend on their batch-mates.**
   - Scored next to different listings, the same listing moves about 6 points on average.
   - Replacing a per-batch quota with an absolute rubric barely changed that (6.8 → 6.3 points).
-  - The next step is to score each listing on its own, with a score cache so that only new listings cost a request.
+  - Pass 2 can now score each posting in its own request, with a score cache, so only new or changed postings cost a request and an unchanged one keeps its score exactly. It reads every posting against its text, not just the top 60, in 4.5 minutes a day.
+  - Pass 1 stays batched. Scored alone, title-only listings mostly got the same stock score, and ranked the owner's verdicts worse.
 - **Stored postings drifting from the live ones.** A read-only comparison found that 22% of stored postings had changed since they were saved. Board files now follow their posting, and every file is written atomically.
 - **Unverified TLS.** Python's `imaplib` doesn't verify server certificates unless it's given an SSL context. Ingest always passes one, and accepts turning verification off only for a loopback host.
 - **Evaluation that guards against fooling itself.**
@@ -98,7 +99,7 @@ Each of these was measured before and after the change. [STATUS.md](STATUS.md) h
   - A partial run, in either pass, still writes the shortlist, flagged at the top, and exits 1.
   - A preflight check tells an Ollama outage apart from a model that isn't installed, and a request Ollama rejects stops the run with its reason instead of being retried.
 - **Atomic writes.** Every file is written through a temporary file, so a killed run never leaves a truncated one.
-- **158 `unittest` tests**, which need no network and no personal config. They include the contracts between stages:
+- **186 `unittest` tests**, which need no network and no personal config. They include the contracts between stages:
   - what ingest and board fetch write must parse in the screener;
   - the board-file layout is pinned byte for byte;
   - each exit code, with the screener run end to end against a stand-in model.
@@ -128,6 +129,7 @@ Email ingest (`python job_ingest.py`) also needs IMAP credentials in environment
 | `board_fetch.py` | Fetches postings from the public board APIs |
 | `jobs_screen.py` | Parsing, filters, two-pass LLM ranking, and the shortlist |
 | `verdicts.py` | Reads the owner's verdicts and scores a run against them |
+| `score_cache.py` | Keeps per-listing pass-2 scores between runs |
 | `html_text.py`, `location_filter.py`, `pipeline_common.py` | Shared code: HTML to text, the search-area rule, config loading and atomic writes |
 | `slug_probe.py` | Finds a company's board on the four platforms |
 | `run_*.bat.example`, `wrapper_helper.py` | The scheduled-run wrappers, and the date decisions they leave to Python |
