@@ -1,6 +1,6 @@
 # Usage
 
-How to set up and run the pipeline day to day. The [README](../README.md) gives the overview. [CONFIGURATION.md](CONFIGURATION.md) lists every setting, and [STATUS.md](../STATUS.md) covers current state and planned work.
+How to set up and run the pipeline day to day. The [README](../README.md) gives the overview. [CONFIGURATION.md](CONFIGURATION.md) lists every setting, [STATUS.md](../STATUS.md) covers current state and planned work, and [CHANGELOG.md](CHANGELOG.md) records what changed and why.
 
 ## How a run works
 
@@ -99,7 +99,7 @@ Run every command from the repository root; the scripts use relative paths.
 Your personal files are gitignored:
 - `pipeline_config.json`, `boards.json`, `screening_prompt.txt`, `targets.txt` and `applied.txt`;
 - any `.bat` wrappers;
-- the `raw/`, `raw_boards/`, `out/`, `logs/`, `feedback/`, and `processed/` folders.
+- the `raw/`, `raw_boards/`, `out/`, `logs/`, and `feedback/` folders.
 
 The `.example` files are the only config that gets committed, so keep them free of real values.
 

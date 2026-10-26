@@ -5,10 +5,12 @@ raw_boards/, apply hard filters and a digest recency window, rank with
 a local LLM (Ollama) in two passes, write a daily shortlist.
 
 Pass 1: all listings, title/employer/location only (blind triage).
-Pass 2 (rerank): the top N description-bearing rows re-scored with a
+Pass 2 (rerank): description-bearing rows re-scored with a
 role-marker excerpt from the stored posting text, so blind-pass
 ambiguity (opaque titles, non-tech employers) can be resolved with
-actual requirements. Pass-1 score is preserved as pass1_score.
+actual requirements: the top rerank_top_n in batches, or with
+per_listing_rerank every one, alone and through the score cache.
+Pass-1 score is preserved as pass1_score.
 
 The shortlist has two sections, each ranked on its own: listings with
 posting text, and listings without it ("Needs lookup"), whose scores
@@ -32,8 +34,9 @@ from location_filter import location_matcher
 from pipeline_common import (DESC_MARKER, configure_from_file,
                              parse_email_date, write_atomic)
 
-# Glob pattern per source dir: digests are job_uid_<UID>.txt; board
-# postings are <platform>_<id>.txt (greenhouse_123, ashby_abc, ...)
+# Glob pattern per source dir: digests are job_uv<UIDVALIDITY>_uid<UID>.txt
+# (job_uid_<UID>.txt before 2026-10-23); board postings are
+# <platform>_<id>.txt (greenhouse_123, ashby_abc, ...)
 SOURCE_DIRS = [
     (Path("raw"), "job_*.txt"),
     (Path("raw_boards"), "*.txt"),

@@ -5,8 +5,8 @@ A daily pipeline that collects job listings from two sources and removes clear m
 It was built for one candidate's job search and has run on a daily schedule since October 2026. It's plain Python standard library plus a local model served by [Ollama](https://ollama.com). There are no third-party packages.
 
 On a typical day:
-- it parses about 360 unique listings and ranks about 280 of them;
-- it finishes in under 5 minutes on a local 12B-parameter model.
+- it parses about 470 unique listings and ranks about 375 of them;
+- it finishes in about 6 minutes on a local 12B-parameter model.
 
 ## How it works
 
@@ -66,7 +66,7 @@ The rows are placeholders, laid out in the real shortlist's format:
 
 ## Problems found and fixed
 
-Each of these was measured before and after the change. [STATUS.md](STATUS.md) has the details.
+Each of these was measured before and after the change. [docs/CHANGELOG.md](docs/CHANGELOG.md) has the details.
 
 - **A thinking model whose answers came back empty.**
   - The default model reasons before it answers, and Ollama turns that on by default. The hidden reasoning filled the 8k-token context, which caused empty or truncated responses on 9 of 11 logged runs.
@@ -80,7 +80,7 @@ Each of these was measured before and after the change. [STATUS.md](STATUS.md) h
 - **Scores that depend on their batch-mates.**
   - Scored next to different listings, the same listing moves about 6 points on average.
   - Replacing a per-batch quota with an absolute rubric barely changed that (6.8 → 6.3 points).
-  - Pass 2 can now score each posting in its own request, with a score cache, so only new or changed postings cost a request and an unchanged one keeps its score exactly. It reads every posting against its text, not just the top 60, in 4.5 minutes a day.
+  - Pass 2 can now score each posting in its own request, with a score cache, so only new or changed postings cost a request and an unchanged one keeps its score exactly. It reads every posting against its text, not just the top 60, in 4.5 minutes a day. It's built and measured, and switched on once the latest prompt change has its own few days of verdicts.
   - Pass 1 stays batched. Scored alone, title-only listings mostly got the same stock score, and ranked the owner's verdicts worse.
 - **Stored postings drifting from the live ones.** A read-only comparison found that 22% of stored postings had changed since they were saved. Board files now follow their posting, and every file is written atomically.
 - **Unverified TLS.** Python's `imaplib` doesn't verify server certificates unless it's given an SSL context. Ingest always passes one, and accepts turning verification off only for a loopback host.
@@ -140,4 +140,5 @@ Email ingest (`python job_ingest.py`) also needs IMAP credentials in environment
 
 - [docs/USAGE.md](docs/USAGE.md): setup, running, outputs, failure behavior, the review loop, scheduling, and writing the ranking prompt.
 - [docs/CONFIGURATION.md](docs/CONFIGURATION.md): every setting in `pipeline_config.json`, and the environment variables.
-- [STATUS.md](STATUS.md): current state, the change history with measurements, known issues, and the roadmap.
+- [STATUS.md](STATUS.md): current state, known issues, the schedule, and the roadmap.
+- [docs/CHANGELOG.md](docs/CHANGELOG.md): what changed, day by day, with the measurements behind each change.

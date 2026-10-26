@@ -1,0 +1,316 @@
+# Changelog
+
+What changed, day by day, newest first, with the measurements behind each change. [STATUS.md](../STATUS.md) has the current state and the plan; [USAGE.md](USAGE.md) and [CONFIGURATION.md](CONFIGURATION.md) describe how things work now.
+
+Ordering-agreement figures labelled "in-sample" were measured against the very verdicts that shaped the change, so they overstate it; later days' verdicts are the out-of-sample check. 50% is random ordering, and 100% is the owner's own.
+
+## 2026-10-26
+- **Per-listing pass 2 with a score cache** ([milestone 3](../STATUS.md#next-milestones)), built and off by default (`per_listing_rerank`). Pass 1 stays batched. Pass 2 re-scores every listing with posting text, each in its own request, and keeps the model's score in `out/score_cache.json`, keyed by a hash of the whole request: model, settings, prompt and request text. Caps apply on read. `--rescore` re-scores everything, and unused entries expire after `score_cache_days` (30).
+  - **Why not per-listing pass 1 too,** as first planned: a scratch run scored every listing alone. Listings with posting text ranked the verdicts better than batched (board-vs-board pairs 60% → 66%), but title-only listings mostly got the same stock score (35 for 62 of 107), and digest-vs-digest pairs fell from 67% to 33% (44 pairs). So pass 1 keeps its batches, whose neighbours give a title-only score something to compare against.
+  - **Measured** on 10-26 data against that morning's scheduled run, same prompt:
+    - ordering agreement 67.9% → 67.5%, the same within pass-2 noise; board-vs-board pairs 67% → 66%;
+    - 267 postings read against their text instead of 60, and judged-"no" rows in the main section 6 → 4;
+    - a day with no changed posting takes 4.5 minutes; the first run adds about 15 minutes of pass-2 requests.
+  - **Timing:** 3.2 s per single-listing request. Warm repeats are exact (20 listings, three rounds); the first request after the model loads can differ.
+  - **Batch mode is unchanged:** on 10-25 data with a stand-in model, the committed and new code sent the same 25 requests and wrote identical files, apart from new fields in the JSON's `run` record. The 10-26 scheduled run already used the new code in batch mode.
+  - **Long runs stall while the PC idles:** the all-listings scratch run took 3 h 20 min for 36 minutes of requests. Ollama was idle through every pause, so the script itself stopped. Sleep is off; the cause isn't confirmed.
+- **Context use is logged:** each pass logs its largest request against `num_ctx`, warns at the limit, and the JSON's `run.peak_context` records it. Ollama's `prompt_eval_count` counts the whole prompt, even a cached prefix. On 10-26: 4,032 tokens per pass-1 batch and 4,065 per pass-2 batch, of 8,192; a single-listing request uses 2,700 at most.
+- **`jobs_screen.py --rescore`**, and an unknown argument stops the run with exit 1.
+- **Tests:** 186, up from 158.
+
+## 2026-10-25
+- **The stability baseline is in:** the 10-24 and 10-25 scheduled runs used one prompt and model. On the 372 listings they shared, unchanged both days, title-only scores moved 2.7 points on average (11 of 309 by 20 or more), and re-scored ones 9.5 (7 of 57). The score cache should bring both to 0.
+- **The ranking prompt's profile is tiered by recency and weight** (the parked `screening_prompt.recency-pending.txt`, now live; the old one is `screening_prompt.before-recency.txt`). C++ is older professional work plus side projects, not core stack: a role requiring years of it is a reach, and one that accepts it among several languages isn't lowered.
+  - **Measured** in a scratch run on the 10-25 run's input, against that run:
+    - ordering agreement on the 10-25 verdicts, which didn't shape it: 76% → 78% of 80 pairs, within pass-2 noise; on all verdicts (10-22 to 10-24 in-sample): 59% → 66%;
+    - the two 10-25 "no" rows whose reasons leaned on C++ fell from 88 and 85 to 35 and 55, and six older C++- or Linux-centered "no" rows fell 20–48 points;
+    - misses: a "yes" developer-experience role fell 78 → 55, and a mobile-heavy "no" rose 58 → 82;
+    - title-only rows whose reasons don't mention C++ moved 5.3 points on average, so the change reaches beyond the C++ rows.
+  - From 10-26, runs use the new prompt, so day-to-day comparisons with earlier runs show its effect, not instability.
+- **Verdicts:** 10-25's are in. In the feedback file, a verdict line's title has to stay as written: a shortened title matches no listing, and the verdict is silently left out.
+
+## 2026-10-24
+- **Fixes from a code review of the change below.** One more finding, that pass 2 re-scores listings already judged "no", waits for milestone 3:
+  - **The main section holds only rows pass 2 re-scored.** A board row below `rerank_top_n`, or one whose pass-2 batch failed, has only a title-only score, and now goes under Needs lookup. When pass 2 fails or is skipped, the main section is empty.
+  - **A listing judged "no" ranks below unjudged listings at the same score.** Before, a row held at 50 kept its earlier place above rows the model or a `score_caps` rule had put at 50.
+  - **Judged-"no" rows aren't put in the verdict template again.** They still show on the shortlist. The other template lines keep their shortlist numbers.
+  - **The per-employer limit spans both sections,** and "More from" names each employer once. One employer could show twice the limit before.
+  - A negative `shortlist_size`, `lookup_size`, `shortlist_per_employer` or `rerank_top_n` stops the run as a config mistake. A negative section size used to list every row.
+  - **`verdicts.py`:** a missed row is said to be held out by the per-employer limit only when the limit actually skipped it (`employer_limited` in the JSON). With two sections, it used to be said of any row ranked above the last Needs-lookup row. A held-down row now shows the model's score and the score it was held at.
+  - **Checked:** `main()` replayed the 10-24 scheduled run's model scores into scratch folders, with the committed code and the new code.
+    - Main section: 15 rows, 4 of them title-only, became 12, all re-scored. The 60 re-scored rows came from 5 employers, so with the limit of 3, the section can't fill. Re-scoring every board posting (milestone 3) widens the pool.
+    - Judged-"no" rows on the shortlist: 8 → 4. Template lines: 25 → 18.
+    - Ordering agreement is unchanged at 59%, since no model score changed (in-sample: these verdicts include 10-24's own).
+  - **The 10-24 → 10-25 baseline is unaffected:** these changes all come after scoring. Leaving judged-"no" listings out of pass 2 would change pass 2's batches, so it waits for milestone 3.
+  - **Tests:** 158, up from 151.
+- **The shortlist has a "Needs lookup" section:**
+  - Listings with posting text fill the main section (`shortlist_size`, 15), and listings without it get their own (`lookup_size`, 10). Each section is ranked on its own. That's every digest row, plus any board posting whose description is missing.
+  - **Why:** on 10-24, two digest rows held #1 and #2 (82 and 78) on their title alone, and both were "no" once looked up. Across the verdicts so far, digest rows drew 0 "yes", 9 "maybe" and 6 "no", against 5, 9 and 28 for board rows.
+  - **A score cap was tried first** and set aside: capping digest rows at 60 changed which rows were listed on neither day, and ordering agreement by only 1–2 points (in-sample). A cap at 50 dropped the "maybe" digest rows too.
+  - The per-employer limit applies within each section. Rows are numbered on through both, as in the verdict template.
+- **A "no" verdict holds a listing down:**
+  - On later shortlists, a listing whose latest verdict is `n` is held at `no_verdict_cap` (50) and flagged `judged no`. It isn't cut, so it can still be applied to.
+  - The cap comes after both passes, so it changes no model score and not which rows pass 2 re-scores.
+  - The JSON keeps the model's score as `verdict_capped_from`. `verdicts.py` judges ordering on that, since the cap comes from the verdicts themselves.
+- **The 10-24 → 10-25 stability baseline is unaffected:** same prompt and caps, and the same model scores. Compare on `verdict_capped_from` where it's set.
+- **Checked:** `main()` ran on 10-24 data with a stand-in model returning the 10-24 run's model scores, into scratch folders.
+  - Pass 2 re-scored the same 60 rows as the real run.
+  - 15 scores were held at 50, and "no" rows on the shortlist went from 13 to 7, all at 50 at the bottom of their section (in-sample by construction).
+  - In the main section, those were the last 5 of 15 rows: after the per-employer limit, only 10 rows with posting text scored above 50.
+  - Ordering agreement: 63% → 62%. The difference is two listings newly marked applied, which leave the comparison.
+- **Digest employers on public boards:** `slug_probe.py` found no Greenhouse, Lever, Ashby or SmartRecruiters board for any of the nine digest employers with a listing scoring 50+ on 10-24. Their postings stay manual lookups.
+- **Tests:** 151, up from 143.
+
+## 2026-10-23
+- **Board fetch, from the review of the public-boards work:**
+  - **Multi-office locations are short and stable:** a Greenhouse location built from offices names the in-area ones first, then the rest by name, at most three, and counts the others (`; +4 more`). So the line no longer grows with every office or changes when the API reorders them. Which postings pass the filter is unchanged.
+  - **Remote-labeled offices** ("Remote <country>") are left out of a Hybrid or In-Office location, so a "Remote US" office can't pass a hybrid job as US remote. The 26 such offices on the live boards today are all outside the US, on postings the filter drops anyway.
+  - **A SmartRecruiters re-release** (only the published date changed) rewrites the file but keeps its description, instead of costing a detail request.
+  - **Pay:** Lever and Ashby share one pay reader. A Lever range whose top is 0 is read as its minimum, as Ashby's already was, instead of being cut by the pay floor. A malformed Lever `salaryRange`, Ashby pay tier or Greenhouse office no longer fails the whole board.
+  - **Lever headings** that already hold an entity (`&amp;`) are no longer escaped twice.
+  - **JSON:** `posted` is set only on rows with a date; digest rows no longer carry `"posted": ""`.
+  - **Docs:** a Lever row's Posted date is the creation date, and a "Distributed" posting is kept only when an office names a metro city or the US.
+  - **Tests:** 143, up from 141. The board-file contract test checks the Posted date too, and the screener tests build board files with board fetch's own `record_text`.
+  - **Checked** against the live APIs, on copies of `raw_boards/`:
+    - The committed and new board fetch gave the same counts on every board. 258 of 281 files were identical; the other 23 differed only in the location line, which went from at most 264 characters to 124 and names a subset of the old offices.
+    - A second run of the new code rewrote nothing.
+    - With a stand-in model, the screener sent the same 25 requests, with 22 pass-1 lines changed, in their location only.
+    - The next scheduled run rewrites those files once, with the format-3 rewrite already due, so the 10-24 → 10-25 stability baseline isn't affected.
+- **Board postings whose location is only "Hybrid", "In-Office" or "Distributed" are no longer lost:**
+  - One configured Greenhouse board puts the work arrangement in the location field and the city only in the posting's offices. None of its 216 title-matching postings passed the area filter, so the board counted as having "none in the area".
+  - For such a location, board fetch now adds the office locations (`Hybrid: <city>`), and "Distributed" counts as remote. Every other location is unchanged.
+  - On the live boards, 101 postings from that board are now kept. No other board's postings changed. The daily run gains three pass-1 batches, about a minute.
+- **Lever postings carry their description and pay:** the description is built from the body, the bulleted lists under their headings, and the closing text. Pay comes from `salaryRange`, in USD per year or per hour, so `pay_floor` applies. The schema was checked on live Lever boards. No Lever board is configured yet.
+- **The shortlist shows when each board posting was published** (Posted column, and `posted` in the JSON). Board postings are exempt from `recency_days`, so a posting open for months used to look like a new one. Digest rows show `-`.
+- **Board file format 3:** a `Posted:` line, and no `Title:` or `Pay:` lines, which nothing read. Every board file is rewritten once by the next run, and the SmartRecruiters descriptions are fetched once more.
+- **Tests:** 141, up from 133.
+- **Checked:** against the live APIs, the committed and new board fetch ran on copies of `raw_boards/`.
+  - All 181 existing files kept identical listing lines and descriptions. Only their metadata changed, as described.
+  - The 101 new files all come from that one board. Nothing more was archived.
+  - With a stand-in model, the screener sent all 272 earlier pass-1 lines unchanged, plus 99 new ones; 2 of the new postings were duplicates or hard-filtered.
+- **Scheduled runs recover on their own:**
+  - **An update restart no longer costs a morning:** both tasks also start at log on, ingest after 5 minutes and screening after 15. Screening skips a start before 06:00, since the daily run comes then, and a day whose shortlist is already written.
+  - **Ollama down:** before each retry, the screening wrapper starts the Ollama app if it isn't running. Ollama already starts at login, but was down at 06:00 on 10-22.
+  - **A failed morning shows in `out/`:** after the last failed attempt, the wrapper writes `out/FAILED_<date>.md` with what the exit code means and the log's error lines. A later run that day removes it.
+  - The date logic is in the new `wrapper_helper.py`, since `cmd`'s `%date%` and `%time%` follow the locale.
+  - The wrappers' logic is versioned: `run_ingest.bat.example` and `run_screen.bat.example` are committed copies.
+  - **Checked:** a copy of the wrapper ran five scenarios with stub scripts. Both tasks kept their daily triggers and settings; their old definitions are saved in `logs/`.
+- **A same-day rerun updates `feedback/<date>.md`:** while it's still the untouched template, it's rewritten for the rerun's rows. Once anything is filled in, only the rows new to the list are appended, under a comment, and nothing already there changes.
+- **The ranked JSON:**
+  - It records what produced the run: the model, fingerprints of the prompt, the pass-2 addendum and the `score_caps` rules, and the settings that affect scores. So the 10-24 and 10-25 runs, the stability baseline, can show they used one prompt.
+  - It no longer copies each posting's text, which stays in the row's source file. A re-scored row keeps the excerpt pass 2 sent instead. 1.35 MB → 0.22 MB on 10-23 data.
+- **Ingest searches with SINCE**, so the server leaves digests older than `recency_days` out, instead of a header fetch per message. Checked read-only against the mailbox: with a day of margin it missed no message at windows of 1 to 10 days.
+- **City names in `metro_cities` are plain text, matched as whole words.** They used to be joined into a regular expression. No match changed among 837 locations on disk and on the live boards.
+- **`slug_probe.py`** prints what a Greenhouse or SmartRecruiters board calls itself next to each VERIFIED line, and CHECK when the name differs. No configured board differed.
+- **`boards.json`:** the board that returned no postings was removed. No supported platform has postings for that company.
+- **Checked, and closed without a change:** remote-by-timezone locations (none among 1,773 title-passing postings), near-duplicate variants on the shortlist (mostly different roles; a title rule would merge different jobs), and cross-source dedup (the sources still don't overlap). The dedup key ignoring location affects 1 of 360 listings, so it's now Low.
+- **Tests:** 133, up from 116.
+- **Checked:** on today's data with a stand-in model, the committed and new screener sent the same 22 requests and wrote an identical shortlist and verdict template, and the JSON changed only as described. Board fetch left identical folders against the live APIs.
+- **Exit codes pinned before the scoring rewrite:**
+  - Tests now run the screener end to end with a stand-in model, one for each exit code the wrapper relies on.
+  - **A failed or skipped pass 2 now exits 1.** It used to exit 0, with only a note in the shortlist, so it never reached `errors.log`. The wrapper still doesn't retry it.
+  - **A request Ollama rejects** (an HTTP 4xx, such as a model that can't think while `model_thinking` is on) stops the run at once with exit 1, and `screen.log` shows Ollama's reason. Before, it failed every batch and exited 2, so the wrapper retried it three times, 15 minutes apart. Server errors (5xx) still count as an outage, now with their reason logged too.
+  - A retry whose connection fails keeps the scores of the attempt before it, instead of losing the whole batch.
+- **Applied jobs and verdicts follow board postings by URL:**
+  - A feedback file's run holds each board row's posting URL. So a job marked applied stays cut, and its verdict still counts, after the employer edits the title.
+  - Verdict files are read as written.
+  - On the real files, all 8 applied jobs got a URL, and so did every board verdict.
+- **`verdicts.py`:**
+  - A later line updates a verdict instead of replacing it. `[a]` alone keeps the earlier y/m/n, an empty note keeps the earlier note, and "applied" stays set.
+  - Rows on the shortlist show their position on it. A row the per-employer limit held out says so.
+- **Digest files carry UIDVALIDITY:**
+  - Ingest writes `raw/job_uv<UIDVALIDITY>_uid<UID>.txt`. If the server resets UIDVALIDITY, the window is ingested again, instead of new digests being skipped as duplicates.
+  - Ingest stops if the server doesn't report UIDVALIDITY.
+  - The next ingest renames the 38 existing files once. Checked first, read-only against the mailbox: all 38 match the server's current UIDs.
+- **Parser canary:** a recent digest with text but no listings gets a WARNING in the shortlist, as the sign of a changed digest format. All digests on disk have listings today.
+- **Board fetch:**
+  - Each board's log line starts with how many postings the API returned. One board returns none at all, which suggests a stale slug. Three others return postings, but none in the area. (For one of the three, that was the location format, fixed above.)
+  - The files of a board removed from `boards.json` are archived.
+- **Smaller fixes:**
+  - An `applied.txt` line that can never match is reported.
+  - `slug_probe.py` stops when its file is missing, instead of probing other names.
+  - The three scripts report config mistakes the same way, in one line naming `pipeline_config.json`. A JSON syntax error used to give a traceback in board fetch.
+- **Tests:** 116, up from 87.
+- **Checked:**
+  - On today's data with a stand-in model, the committed and new screener sent the same 22 requests and wrote identical files.
+  - Against the live APIs, board fetch left identical folders.
+  - `verdicts.py` gave the same figures for the 10-22 and 10-23 runs.
+- **Ranking prompt, from the 10-23 shortlist review:** Node.js no longer counts as part of the candidate's stack. The model had cited it as a core-stack match on three shortlist rows.
+  - A required Node.js backend is now one gap. A full-stack role that otherwise fits stays in the 60–74 band, below 75+.
+  - A backend role built mainly on Node.js is plausible but flawed. Node.js listed only as a plus doesn't lower a score.
+  - **Measured** in a scratch run on the same input:
+    - The three rows fell from 78–88 to 62–68 and stayed on the shortlist, and no reason credits Node.js as the candidate's skill any more.
+    - A first wording called the requirement a "stretch". It pushed two "yes" rows to 54–55 and off the list, because the prompt uses that word for its 30–54 band.
+    - Ordering agreement with the 10-23 verdicts went from 64% to 61%, and "no" rows on the list from 11 to 7. Both moves are within the noise of re-batching pass 2: listings that don't mention Node.js moved 8.5 points on average there, against 2.3 in pass 1.
+- **First out-of-sample verdicts:**
+  - The 10-23 shortlist was the first scheduled run with the 10-22 changes. It drew 3 "yes", 10 "maybe", 11 "no" and 1 applied.
+  - Ordering agreement was 64%, against 84% in-sample on the 10-22 verdicts.
+  - Most "no" notes name a requirement in the posting text: years of a specialist tool, a required framework, or a niche domain.
+- **Board files follow the posting:**
+  - Board fetch used to write a posting's file once and rewrite it only after a `FILE_FORMAT` bump. On 10-23, 40 of 182 live files no longer matched their posting: 8 titles, 3 locations, 2 pay ranges and 32 descriptions had changed since Oct 10.
+  - Now a file is rewritten whenever its text would change. SmartRecruiters descriptions, which cost a request per posting, are fetched again only when the listing lines change.
+  - Files are written through a temporary file, so an interrupted run can't leave a truncated one.
+  - **Checked** on a scratch copy against the live APIs: the first run rewrote exactly those 40 files (plus 1 new posting) and left the rest byte-identical; a second run rewrote nothing.
+- **Tests:** `python -m unittest` runs a stdlib suite in `tests/`: deduplication, applied jobs, batch order, hard filters, score caps, the per-employer limit, and the verdict files. It needs no personal config.
+- **Screener:**
+  - Config, prompt and applied-list loading moved from import time into `main()`, so the module can be imported and tested without personal files.
+  - Checked: with a stand-in model on today's data, the old and new code sent the same 22 requests and wrote byte-identical outputs.
+  - A scratch run now points `OUT_DIR` and the new `TEMPLATE_DIR` at a scratch folder, and still reads the `a` verdicts from `feedback/`.
+  - A missing required config key, a `score_caps` rule with no matcher or no `max_score`, and an invalid `excluded_title_patterns` regex now stop the run at startup with a message naming the problem.
+  - Listing identity is defined once, in `verdicts.py`. An `applied.txt` line whose title contains a pipe used to be split at the first pipe, so that listing was never cut; it's now split like a verdict line, at the last one.
+  - The per-employer limit's "More from" note groups employers regardless of case, as the limit already did.
+- **`verdicts.py`:** ordering agreement compares scores, with equal scores counting half. It used to compare list positions, which break score ties in an arbitrary order. On the same verdicts, the 10-23 run's figure moved by 1 point.
+- **No script reads files at import any more:**
+  - Board fetch and ingest load config in `main()`, like the screener. Settings errors stop the run with the same messages and exit codes as before.
+  - The new `pipeline_common.py` holds config loading, the description marker, email date parsing, and atomic writes.
+- **Atomic writes everywhere:** digests, the ranked JSON, the shortlist and the verdict template are written through a temporary file, as board files already were. A killed run used to leave a truncated digest that was skipped forever as a duplicate.
+- **Ingest:**
+  - Email bodies are decoded with the charset they declare, and the two bare `except:` clauses are gone.
+  - Checked against all 38 messages in the folder, read-only: the new code reproduces every digest file on disk byte for byte, apart from the `Job_ID` line retired on 10-22. All 38 are single-part UTF-8 HTML, so nothing changes today.
+  - A message with no text part is saved without listings, so it isn't downloaded again on every run.
+- **Ollama preflight:**
+  - Before scoring, the screener checks Ollama. If it can't be reached, the run exits 2 and writes nothing; the wrapper retries that, as before.
+  - If Ollama is running without the model, the run exits 1 at once, instead of three attempts 15 minutes apart.
+- **Config:** pass 1's batch size (`pass1_batch`, 30) and the context window (`num_ctx`, 8192) moved from code into config, with the same defaults.
+- **JSON:** a re-scored row that was capped in pass 1 keeps the model's own pass-1 score as `pass1_capped_from`.
+- **`slug_probe.py`:** a network failure is reported as a failed lookup, and the script exits 1. It used to report "no board found" for every company. The `boards.json` lines it prints are now valid JSON even for a name with quotes.
+- **Tests:** 87 now, up from 26 at the start of the day. Added: model-response handling, the pass-2 excerpt, the board-file layout and rewrite rules, email decoding, the slug probe, combined verdict flags, and the contract that what ingest and board fetch write parses in the screener.
+- **Checked:**
+  - The committed and new code ran on the same data, the screener with a stand-in model and board fetch against the live APIs.
+  - The screener sent the same 22 requests and wrote identical outputs, apart from the new field. Board fetch left identical board folders.
+- **The 10-14 scheduling miss, explained:**
+  - Windows restarted for an update at 00:31–00:33, and no one signed in until 08:52.
+  - The tasks run only while the user is signed in, so the 01:00, 05:00 and 06:00 starts couldn't happen, and the catch-up didn't run them after sign-in. That day's files came from manual runs.
+  - Fixing it means changing Windows or Task Scheduler settings. Done later on 10-23: both tasks also start at log on.
+- **Verdict flags combine:**
+  - A feedback row can now say `[m,a]`: a verdict plus "applied". `[a]` alone still works.
+  - The old parser expected a single letter, so it silently skipped the first combined rows. The 7 jobs applied to on 10-23 would have reappeared on the next shortlist.
+  - A row whose flags can't be read is now reported with its file and line number, instead of being skipped.
+  - `verdicts.py` leaves a listing cut as applied out of its figures. A "yes" you applied to isn't counted as ranked last.
+- **`.gitignore`** also covers `pipeline_config.before-*.json`, the backups of the personal config taken before a rule change.
+- **Docs:** README.md is now a short project overview. Its setup and operating guide moved to `docs/USAGE.md`, and its settings reference to `docs/CONFIGURATION.md`.
+- **Tuning notes from the 10-23 review:**
+  - **Ranking prompt:** the profile's core is the backend stack. TypeScript/React is secondary, and the technologies the candidate lacks are named.
+    - A posting that requires one of those technologies is a real gap, and so is a front-end-led role.
+    - A full-stack role with a Node.js backend that otherwise fits stays in 60–74.
+  - **`score_caps`:** five new rules cap a required skill the candidate lacks: Spark/Databricks, Rails, C#/.NET and production AWS at 50, Node.js at 65.
+    - A rule matches a posting line that names the skill with years or strong wording, doesn't call it optional, and isn't a list of alternatives. [docs/CONFIGURATION.md](docs/CONFIGURATION.md#score-caps) shows the pattern.
+    - On 10-23 data they caught 8 of the 11 "no" rows on the shortlist, and no "maybe" row.
+  - **Two flags, no cap:** `fde` for Forward Deployed titles, and `perm` for labor-certification-style requirements ("at least N years of prior work experience in each of the following").
+  - **"Re-check postings are still open":** already done for board rows, since board fetch runs right before screening and archives closed postings. The posting that closed on 10-23 was still open at 06:00 and closed later that day. Digest rows have no link to check.
+  - **Measured** in two scratch runs on the same input (in-sample, since these verdicts shaped the change):
+    - ordering agreement 57% → 77%;
+    - "no" rows on the shortlist 11 of 21 → 5 of 21, and "yes" 0 of 2 → 1 of 2, with "maybe" unchanged at 6 of 10;
+    - digest rows on the shortlist 7 → 10;
+    - pass-1 scores of listings the change doesn't touch moved 2.3 points on average.
+
+## 2026-10-22
+Quick fixes and score stabilization from a code review.
+- **Ingest:**
+  - IMAP TLS certificates are now verified. `imaplib` doesn't verify them unless it's given a context.
+  - `imap_tls_verify: false` turns verification off for a local bridge with a self-signed certificate. It's refused for any host that isn't loopback.
+  - `imap_cafile` trusts a specific certificate instead of the system store.
+  - Ingest no longer writes the unused `Job_ID` line or creates the unused `processed/` folder.
+- **Board fetch:** a malformed `boards.json` entry, or a board whose response doesn't have the expected shape, is reported and skipped instead of stopping the run. A failed board's files aren't archived. The script exits 1 when any board failed.
+- **Screener:**
+  - Every shortlist cell is escaped, so a `|` in a location ("United States | Remote") no longer breaks the table row.
+  - A row's link is read only from the file's metadata block.
+  - The ranking prompt now explains the pay range in parentheses on board locations.
+- **Slug discovery:**
+  - Auto mode reads the latest dated `ranked_<date>.json`. It had been picking an older `ranked_v1_…` file, which sorts last.
+  - Probes start with the plain company name, and only whole corporate words are stripped. Before, "Cisco" was probed as `cis` first.
+- **Scoring stability:**
+  - **Thinking off:** model thinking is now off for every request (`model_thinking`, default `false`).
+    - With thinking on, the default model reasoned past the 8k context and returned nothing. That caused the "empty"/"truncated response" retries on 9 of 11 runs.
+    - With it off, a pass-1 batch takes ~18 s instead of 60–90 s.
+  - **Greedy first attempt:** the first request for each batch is greedy (temperature 0, seed 42), and retries sample with a seed per attempt. On the same input, two runs now differ by 1.2 points on average; day to day it used to be 6.0.
+  - **Score caps:** with thinking off, the model follows the prompt's caps less reliably. The new `score_caps` (first added as employer-only `employer_score_caps`) enforces the mechanical ones in code, and `capped_from` keeps the model's own score.
+  - **Area filter:** digest listings outside the search area are cut before ranking (`outside area`), with the same rule board fetch uses, now shared as `location_filter.py`. On Oct 22 data that's 62 rows, which the model had been scoring 0.
+  - **Mixed batches:** pass-1 batches are cut in a fixed hash order, so one employer's listings no longer fill a batch. The largest single-employer cluster in a batch went from 26 to 10.
+  - **Runtime:** a full screening run on Oct 22 data took 9.4 min, down from ~25.
+- **Shortlist feedback (first review, on the 10-22 list):**
+  - **Ranking prompt:**
+    - Side-project AI work is no longer treated as professional experience.
+    - Getting hired quickly is the stated priority.
+    - Some role types are named as stretches.
+    - Security-clearance requirements and notoriously hard interview loops are discounted.
+  - **`score_caps`** replaces the employer-only caps. A rule can match employer, title, or posting text, and can carry a flag shown in a new Flags column. New rules: required clearance (flag `clearance`), staff/principal titles, and reach employers (flag `reach`).
+  - **`shortlist_per_employer`** limits the rows from one employer, with a "More from" count under the table.
+  - **`applied.txt`:** listed jobs are skipped when ranking and shown in an "Already applied, still posted" section.
+  - **`feedback/`** (gitignored) holds per-day notes.
+  - **Measured** on the same data:
+    - 15 of the 16 listings the feedback named moved as intended. The exception is a "decent" listing that fell behind two near-identical postings from the same employer.
+    - In the top 25, reasons citing agent/LLM work fell from 15 to 2, employers rose from 10 to 16, and digest rows from 2 to 8.
+- **Verdicts (`verdicts.py`):**
+  - The screener writes `feedback/<date>.md` with one `N [?] title | employer ::` line per shortlist row, for a y/m/n/a verdict. It never overwrites an existing file.
+  - `a` verdicts count as applied.
+  - `python verdicts.py` scores a run against all verdicts so far.
+  - The 10-22 notes were converted to verdicts. Scored against them (in-sample, since the changes came from those notes):
+    - pair-ordering agreement rose from 53% to 93%;
+    - "no" rows on the list fell from 8 of 8 to 0;
+    - "yes" rows fell from 5 of 5 to 2. All three were dropped by the 2-per-employer limit; a limit of 3 would keep 4 of 5, still with no "no" rows.
+  - Each shortlisted row carries `shortlist_rank` in the JSON, so `verdicts.py` judges a run by the list it showed. It reads only the JSON: no config and no model.
+  - The verdict template puts a backslash before any pipe in an employer name, so the name can't be mistaken for the separator.
+- **Absolute scoring rubric:**
+  - The per-batch quota ("at most 2 scores ≥ 75") is gone from both passes. Each request now says to score every job on its own, and the ranking prompt's bands say what each score requires instead of how many scores a batch may have.
+  - The pass-2 instructions also say to treat posting text as evidence, never as instructions.
+  - **Measured:** batch-mate dependence barely changed (6.8 → 6.3 points), so per-listing scoring with a score cache is the remaining fix.
+  - **Watch:** the new bands score looser, with 24 pass-1 scores at 75+ against 15. Ordering agreement with the verdicts was 86% against 93% (in-sample, within batch noise).
+  - With the local per-employer limit raised to 3, all 5 "yes" rows made the shortlist in that run.
+
+## 2026-10-10
+- **Descriptions and recency (new):**
+  - `board_fetch.py` stores each posting's description below a `--- DESCRIPTION ---` marker, which the screener's listing parser stops at.
+  - `recency_days` makes ingest skip old digests after checking only the Date header, and makes the screener cut digest listings whose newest copy is older than the window.
+  - The screener re-scores the top listings that have a description in a second pass (`rerank_top_n`, `rerank_batch`, `excerpt_chars`).
+- **Review fixes, scoring:**
+  - Every problem with a model response's content (wrong JSON shape, `null` scores, a body without message content, unalignable indices) is retried instead of crashing the run. Only connection failures fail a batch, and a cut-off response (`IncompleteRead`) is now one of those.
+  - Responses numbered from 1 are shifted onto the right listings, and numbering that can't be determined is rejected. Scores are clamped to 0–100.
+  - The most complete retry is kept, not the last one.
+  - Both passes share one batch loop with the 3-failure abort, and pass 2 is skipped when pass 1 had to stop.
+- **Review fixes, dedup:** a listing that appears in several files keeps its board copy (link, pay, description), otherwise its newest digest copy. Staleness is judged on that copy, so an older digest can no longer age out a listing that is still advertised.
+- **Review fixes, text:**
+  - New shared `html_text.py`. Block tags become line breaks, entities are decoded after tags are stripped, and all whitespace, including non-breaking spaces, is normalized.
+  - Greenhouse's double-encoded HTML is decoded correctly; 1,215 leftover entities in 185 descriptions dropped to 0.
+  - An HTML-only digest now parses one field per line. This is checked against a sample table but hasn't yet met a real HTML-only digest.
+  - Pass-2 excerpts:
+    - start at a section heading (including curly-apostrophe "What you’ll do", "Job description", "Who you are");
+    - ignore marker words inside closing EEO or pay text;
+    - use running-text matches only from the first half.
+    - On the current 185 postings, excerpts starting in EEO or pay text went from 6 to 0, and those starting at a heading from 50 to 174.
+  - Board files carry a `Format:` line; older files are rewritten on the next run, and a failed SmartRecruiters description fetch is retried.
+- **Review fixes, ingest:** header and body fetches find the message bytes even when the server sends an unsolicited FETCH line or a non-literal field first.
+- **Cleanup:**
+  - Removed dead error handlers and a duplicated abort block.
+  - Fixed a missing space in the pass-1 instructions (">= 75.Include").
+  - Board fetch converts descriptions only for postings it writes.
+  - The bare `hardware`, `electrical`, `civil` and `mechanical` title patterns are anchored with `\b`, so `civil` no longer matches "Civilian".
+
+## 2026-10-09
+- **Ingest:**
+  - IMAP UIDs replace sequence numbers in filenames (one-time re-ingest done).
+  - `Job_ID` now hashes the Date header too.
+  - Mail access is read-only: emails are no longer marked read, and nothing can be expunged.
+  - Exits 1 on folder, search, or fetch errors.
+  - IMAP host, port, and STARTTLS are config settings instead of being inferred from the host name.
+  - Credentials come from environment variables named in the config (`email_user_env`, `email_password_env`). Ingest refuses a value that isn't a variable name, without printing it.
+  - IMAP connections time out after 60 seconds, so an unresponsive server fails the run instead of hanging it.
+- **Screener:**
+  - No shortlist is written if no batch scores (e.g. Ollama down). It exits 2 in that case, so the scheduled wrapper can retry safely.
+  - Partial failures write the shortlist with a WARNING banner and `failed_batches` in the JSON, and exit 1.
+  - The ranking prompt is loaded from the file at `prompt_path`.
+  - Employer exclusions match whole words, so a short name can't cut an unrelated employer whose name contains it.
+- **Board fetch (new):**
+  - Ashby pay is read from `compensation.summaryComponents` (USD salary only; hourly rates ×2080).
+  - Title blocks are word-bounded, so "Internal Tools" and "Sales Platform" roles survive.
+  - Location uses the platforms' structured remote/country fields; cities outside `metro_cities` and non-US remote are dropped.
+  - SmartRecruiters fetches every page and links to the posting page, not the API.
+  - Postings that close are moved to the archive.
+- **Configuration:**
+  - Every personal setting moved out of code into gitignored `pipeline_config.json`: mail settings, metro cities, remote regions, pay floor, title and employer filters, digest noise lines, and the prompt path.
+  - `boards.json` is gitignored too. `pipeline_config.example.json` and `boards.example.json` hold placeholders to start from.
+- **Automation:**
+  - Task Scheduler tasks with `cmd` wrappers; credentials moved to Windows user environment variables.
+  - The tasks wake the computer, run after a missed start, and can start on battery. They have time limits (2 h ingest, 8 h screening), and a 05:00 catch-up ingest picks up late digests.
+  - The wrappers retry and set UTF-8 output. They log unbuffered, so progress shows while a run is going, and each trims only its own logs.
+- **Docs:** README.md added.
