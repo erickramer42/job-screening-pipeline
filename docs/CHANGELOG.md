@@ -4,6 +4,17 @@ What changed, day by day, newest first, with the measurements behind each change
 
 Ordering-agreement figures labelled "in-sample" were measured against the very verdicts that shaped the change, so they overstate it; later days' verdicts are the out-of-sample check. 50% is random ordering, and 100% is the owner's own.
 
+## 2026-10-28
+- **Verdicts:** 10-26's, 10-27's and 10-28's are in. All three runs used one prompt and one set of caps, the recency-tiered profile of 10-25, so each day is out of sample for it.
+  - Each run against its own day's verdicts: 71% of 98 pairs (10-26), 77% of 59 (10-27), 95% of 101 (10-28). Every "yes" of those days was on that day's shortlist.
+  - The 10-28 run against the three days' verdicts together (the latest verdict wins): 78% of 331 pairs.
+  - Day-to-day movement in batch mode, on listings in both runs: 4.0 points on average from 10-26 to 10-27 (18 of 370 by 20 or more), and 4.1 from 10-27 to 10-28 (21 of 365). One "yes" posting scored 75, 35 and 72 on the three days, and on the middle day it missed pass 2 and the shortlist. That's the batch-mate effect the score cache removes.
+- **Title rules from the notes,** in `pipeline_config.json` (the previous config is backed up):
+  - `excluded_title_patterns`: a title that ends in a dash and a year, the form of early-career cohort hiring.
+  - `score_caps`: manager titles at 40 (flag `manager`), QA and quality-engineer titles at 45 (`qa`), and site-reliability titles at 45 (`sre`). Every listing these match so far was judged "no"; test-engineering titles, judged "maybe", aren't matched.
+  - **Measured** offline, the new rules applied to the 10-28 run's model scores: 4 of 375 ranked rows change, all of them "no" rows that were on the shortlist. Ordering agreement on the 10-26 to 10-28 verdicts went from 77.6% to 80.2%, in-sample. It's an approximation: in a real run, pass 2's picks follow the pass-1 caps.
+- **Per-listing pass 2 stays off one more day,** at the owner's choice, so the 10-29 verdicts are collected under batch mode first.
+
 ## 2026-10-26
 - **Per-listing pass 2 with a score cache** ([milestone 3](../STATUS.md#next-milestones)), built and off by default (`per_listing_rerank`). Pass 1 stays batched. Pass 2 re-scores every listing with posting text, each in its own request, and keeps the model's score in `out/score_cache.json`, keyed by a hash of the whole request: model, settings, prompt and request text. Caps apply on read. `--rescore` re-scores everything, and unused entries expire after `score_cache_days` (30).
   - **Why not per-listing pass 1 too,** as first planned: a scratch run scored every listing alone. Listings with posting text ranked the verdicts better than batched (board-vs-board pairs 60% → 66%), but title-only listings mostly got the same stock score (35 for 62 of 107), and digest-vs-digest pairs fell from 67% to 33% (44 pairs). So pass 1 keeps its batches, whose neighbours give a title-only score something to compare against.

@@ -40,11 +40,11 @@ The goal is a focused daily application routine (~10 highest-quality matches per
 ### Recent changes
 
 The full history, with the measurements behind each change, is in [docs/CHANGELOG.md](docs/CHANGELOG.md). The last few days:
+- **2026-10-28:** three days of verdicts on the recency-tiered prompt, all out of sample: 71%, 77% and 95% ordering agreement. New title rules from the notes: cohort-hiring titles are cut, and manager, QA and site-reliability titles are capped. Per-listing pass 2 waits for one more day of verdicts.
 - **2026-10-26:** pass 2 can re-score every posting in its own request, through a score cache (`per_listing_rerank`, built and off until it's switched on). Each pass logs how much of the model's context it used. A whole-project review fixed seven smaller problems, among them a verdict that could be dropped without a warning, and split the screener's model client and output writers into modules of their own.
 - **2026-10-25:** the first pair of daily runs under one prompt gave the stability baseline. The ranking prompt's candidate profile is now weighted by how recent each skill is.
 - **2026-10-24:** listings ranked on their title alone get their own "Needs lookup" section, and a "no" verdict holds a listing down on later days.
 - **2026-10-23:** board files follow edits to their posting; the scheduled runs recover from a restart or a stopped Ollama on their own; the test suite and end-to-end exit-code tests.
-- **2026-10-22:** verified TLS for mail, repeatable scoring (thinking off, greedy first attempt), score caps enforced in code, and the verdict loop.
 
 ### Pending / Known Issues
 | Issue | Priority | Impact | Planned Fix |
@@ -266,7 +266,7 @@ Agreed 2026-10-22, in this order:
 
 1. **Collect verdicts for a few days.** Fill in `feedback/<date>.md` each morning. Today's verdicts shaped today's changes, so only later days' verdicts can judge the next change, or the looser absolute-rubric scores, out of sample.
 2. **Tests for what the score cache will rely on:** listing identity, the cache key, and score-cap application. A stale or mis-keyed cache fails silently by serving old scores. Done 2026-10-23 for listing identity and score caps, with config loading moved out of import time; the cache-key tests come with the cache. Board files now follow edits to their posting, which the cache's keys depend on.
-3. **Score cache plus per-listing scoring, built together.** Built 2026-10-26 for pass 2 only, the owner's choice after measuring both (see Recent Changes), and off until switched on. Switch it on (`per_listing_rerank: true`) once the recency-tiered prompt has a couple of days of verdicts on its own, around 10-27 or 10-28, so each change gets its own read. The plan as written:
+3. **Score cache plus per-listing scoring, built together.** Built 2026-10-26 for pass 2 only, the owner's choice after measuring both (see Recent Changes), and off until switched on. Switch it on (`per_listing_rerank: true`) once the recency-tiered prompt has a few days of verdicts on its own, so each change gets its own read: after the 10-29 verdicts (10-26 to 10-28 gave 71%, 77% and 95%). The plan as written:
    - A cache filled from batches of 30 would freeze the ~6-point batch-mate effect into every cached score.
    - Per-listing scoring without a cache would mean ~270 requests every morning.
    - Together, the first run scores everything once, one request per listing. After that, a day scores only its new listings.
@@ -284,4 +284,4 @@ The automation items (the 10-14 and 10-22 misses, a visible failure marker) and 
 
 Success metric for automation: zero manual intervention; shortlist present in `out/` by 7:00 AM each weekday.
 
-*Last updated: October 26, 2026*
+*Last updated: October 28, 2026*
